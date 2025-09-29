@@ -22,16 +22,34 @@ class BinanceService:
     async def initialize(self):
         """Initialize connection and validate API keys"""
         try:
-            # Test connectivity
+            # Test connectivity first (no auth needed)
             status = self.client.get_system_status()
+            logger.info(f"🌐 Binance {'Testnet' if settings.binance_testnet else 'Live'} network: {status}")
+            
+            # Test authentication
             account = self.client.get_account()
             self.is_connected = True
-            logger.info(
-                f"✅ Binance {'Testnet' if settings.binance_testnet else 'Live'} connected successfully"
-            )
+            logger.info(f"✅ Binance {'Testnet' if settings.binance_testnet else 'Live'} connected successfully")
+            logger.info(f"📊 Account permissions - Can Trade: {account.get('canTrade', False)}")
             return True
+            
         except Exception as e:
             logger.error(f"❌ Binance connection failed: {e}")
+            
+            # Provide detailed error information
+            error_str = str(e)
+            if "-2015" in error_str:
+                logger.error("💡 Error -2015 means: Invalid API key, IP restriction, or insufficient permissions")
+                logger.error("🔧 Solutions:")
+                logger.error("   1. Check API key is correct (no extra spaces)")
+                logger.error("   2. Check secret key is correct (no extra spaces)")
+                logger.error("   3. Verify API permissions include 'Enable Reading' and 'Enable Spot & Margin Trading'")
+                logger.error("   4. Check IP restrictions (disable for testing)")
+                logger.error(f"   5. Ensure using {'TESTNET' if settings.binance_testnet else 'MAINNET'} keys")
+                logger.error("   6. Try regenerating your API keys")
+            elif "connectivity" in error_str.lower() or "network" in error_str.lower():
+                logger.error("💡 Network connectivity issue - check your internet connection")
+            
             return False
 
     def get_account_balance(self) -> Dict:

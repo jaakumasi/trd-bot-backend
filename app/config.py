@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     default_trading_pair: str = Field(default="BTCUSDT")
     trading_active_hours_start: str = Field(default="08:00")
     trading_active_hours_end: str = Field(default="16:00")
+    use_mock_binance: bool = Field(default=False)  # Set to True to use mock mode
     
     # CORS - accepts both string and list
     cors_origins: Union[str, List[str]] = Field(

@@ -11,8 +11,14 @@ logger = logging.getLogger(__name__)
 
 class AIAnalyzer:
     def __init__(self):
-        genai.configure(api_key=settings.gemini_api_key)
-        self.model = genai.GenerativeModel("gemini-pro")
+        try:
+            genai.configure(api_key=settings.gemini_api_key)
+            # Updated to use the latest available Gemini model 
+            self.model = genai.GenerativeModel("models/gemini-2.5-flash")
+            logger.info("✅ AI Analyzer initialized with Gemini 2.5 Flash model")
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize AI Analyzer: {e}")
+            self.model = None
 
     def calculate_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """Calculate technical indicators for analysis"""
@@ -52,6 +58,15 @@ class AIAnalyzer:
     async def analyze_market_data(self, symbol: str, df: pd.DataFrame) -> Dict:
         """Use Gemini AI to analyze market data and provide trading signals"""
         try:
+            # Check if model is available
+            if self.model is None:
+                logger.warning("🤖 AI model not available, using fallback analysis")
+                return {
+                    "signal": "hold",
+                    "confidence": 0,
+                    "reasoning": "AI model unavailable - using safe default",
+                }
+                
             if df.empty or len(df) < 20:
                 return {
                     "signal": "hold",
@@ -167,18 +182,50 @@ class AIAnalyzer:
             - Bollinger Band squeeze/expansion
             - Price action relative to moving averages
 
-            Return only valid JSON format.
+            IMPORTANT: Return ONLY valid JSON without markdown code blocks or any other formatting.
+            Example format:
+            {{"signal": "buy", "confidence": 75, "reasoning": "Strong bullish momentum", "entry_price": 50000, "stop_loss": 49750, "take_profit": 50150}}
             """
 
-            response = await self.model.generate_content_async(prompt)
-
             try:
+                response = await self.model.generate_content_async(prompt)
+                
+                # Log full response for debugging
+                logger.info(f"🤖 Gemini Full Response: {response.text}")
+
+                # Extract JSON from markdown code blocks if present
+                response_text = response.text.strip()
+                if response_text.startswith("```json"):
+                    # Remove markdown code block markers
+                    response_text = response_text[7:]  # Remove ```json
+                    if response_text.endswith("```"):
+                        response_text = response_text[:-3]  # Remove ```
+                elif response_text.startswith("```"):
+                    # Handle generic code blocks
+                    lines = response_text.split('\n')
+                    response_text = '\n'.join(lines[1:-1])  # Remove first and last lines
+                
+                response_text = response_text.strip()
+                logger.info(f"🔍 Cleaned JSON for parsing: {response_text}")
+
                 # Parse AI response
-                ai_analysis = json.loads(response.text)
+                try:
+                    ai_analysis = json.loads(response_text)
+                    logger.info(f"✅ Successfully parsed AI response: {ai_analysis}")
+                except json.JSONDecodeError as json_error:
+                    logger.error(f"❌ JSON Parse Error: {json_error}")
+                    logger.error(f"❌ Raw response text: {repr(response_text)}")
+                    return {
+                        "signal": "hold",
+                        "confidence": 0,
+                        "reasoning": "AI response parsing failed - invalid JSON format",
+                        "technical_score": 0,
+                    }
 
                 # Validate and sanitize response
                 valid_signals = ["buy", "sell", "hold"]
                 if ai_analysis.get("signal") not in valid_signals:
+                    logger.warning(f"⚠️ Invalid signal '{ai_analysis.get('signal')}', defaulting to 'hold'")
                     ai_analysis["signal"] = "hold"
 
                 ai_analysis["confidence"] = max(
@@ -192,14 +239,16 @@ class AIAnalyzer:
                     ai_analysis["confidence"], technical_score
                 )
 
+                logger.info(f"🎯 Final AI Analysis: {ai_analysis}")
                 return ai_analysis
 
-            except json.JSONDecodeError:
-                logger.error(f"Failed to parse AI response: {response.text}")
+            except Exception as gemini_error:
+                logger.error(f"❌ Gemini API Error: {gemini_error}")
+                # Return fallback analysis if Gemini fails
                 return {
                     "signal": "hold",
                     "confidence": 0,
-                    "reasoning": "AI analysis parsing failed",
+                    "reasoning": f"AI analysis failed: {str(gemini_error)[:100]}",
                     "technical_score": 0,
                 }
 
