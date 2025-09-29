@@ -105,7 +105,7 @@ class BinanceService:
         """Place a market order"""
         try:
             if test_mode:
-                # Simulate order for testing
+                # Simulate order for testing (No real money)
                 price = self.get_symbol_price(symbol)
                 return {
                     "symbol": symbol,

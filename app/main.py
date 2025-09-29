@@ -1,7 +1,6 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-import uvicorn
 import asyncio
 import json
 from typing import List
@@ -10,6 +9,9 @@ from .database import engine, Base
 from .api import trading, portfolio, auth
 from .services.trading_bot import TradingBot
 from .services.websocket_manager import WebSocketManager
+from dotenv import load_dotenv
+
+load_dotenv("../.env")
 
 # Create FastAPI app
 app = FastAPI(
@@ -44,8 +46,8 @@ async def startup_event():
     global trading_bot
     trading_bot = TradingBot(ws_manager)
 
-    print("🤖 Crypto Trading Bot API Started Successfully!")
-    print(f"📊 Database: Connected to Neon PostgreSQL")
+    print("🤖 Trd Bot API Started Successfully!")
+    print(f"📊 Database: Connected to PostgreSQL db")
     print(f"🔗 CORS Origins: {settings.cors_origins}")
     print(f"🧪 Test Mode: {settings.binance_testnet}")
 
@@ -115,6 +117,6 @@ async def root():
 
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "app.main:app", host="0.0.0.0", port=8000, reload=True, log_level="info"
-    )
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)

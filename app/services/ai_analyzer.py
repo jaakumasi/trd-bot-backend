@@ -185,7 +185,7 @@ class AIAnalyzer:
                     0, min(100, int(ai_analysis.get("confidence", 0)))
                 )
 
-                # Add technical confirmation
+                # Add technical confirmation to validate AI analysis
                 technical_score = self._calculate_technical_score(latest)
                 ai_analysis["technical_score"] = technical_score
                 ai_analysis["final_confidence"] = min(
