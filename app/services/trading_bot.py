@@ -1,11 +1,13 @@
 import asyncio
 import logging
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from typing import Dict, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from ..database import get_db
-from ..models.trade import TradingConfig, Trade
+from sqlalchemy import select
+from ..database import get_db, get_async_session
+from ..models.trade import TradingConfig, Trade, OpenPosition
 from ..models.user import User
+from ..models.portfolio import Portfolio
 from .binance_service import BinanceService
 from .mock_binance_service import MockBinanceService
 from .ai_analyzer import AIAnalyzer
@@ -52,6 +54,10 @@ class TradingBot:
             logger.info("✅ AI Analyzer ready")
             
             logger.info("🛡️  Initializing Risk Manager...")
+            
+            # Load open positions from database
+            await self._load_open_positions_from_db()
+            
             logger.info("✅ Risk Manager ready")
             
             logger.info("🌐 WebSocket Manager ready")
@@ -166,13 +172,19 @@ class TradingBot:
                         try:
                             processed_users += 1
                             logger.debug(f"📈 Processing user {config.user_id} ({processed_users}/{total_active_users}) - {config.trading_pair}")
+                            
+                            # Check for positions to close first
+                            await self._check_position_exits(db, config)
+                            
+                            # Then process new trading signals
                             await self._process_user_trading(db, config)
                         except Exception as e:
                             logger.error(f"❌ Error processing user {config.user_id}: {e}")
 
                     cycle_duration = (datetime.now() - cycle_start_time).total_seconds()
-                    logger.info(f"✅ Trading cycle #{cycle_count} completed in {cycle_duration:.2f}s")
-                    metrics_logger.info(f"CYCLE_{cycle_count}_COMPLETED | DURATION={cycle_duration:.2f}s | PROCESSED_USERS={processed_users}")
+                    
+                    # Log cycle summary with position overview
+                    self._log_cycle_summary(cycle_count, cycle_duration, processed_users)
                     
                     break  # Exit the db session loop
 
@@ -247,7 +259,7 @@ class TradingBot:
                     "signal": signal,
                     "confidence": confidence,
                     "reasoning": reasoning,
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 },
             )
 
@@ -278,7 +290,7 @@ class TradingBot:
                     {
                         "type": "trade_rejected",
                         "reason": message,
-                        "timestamp": datetime.now().isoformat(),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
                     },
                 )
                 return
@@ -293,11 +305,131 @@ class TradingBot:
             logger.error(f"❌ [User {user_id}] Error in trading process: {e}")
             metrics_logger.info(f"TRADING_ERROR | USER={user_id} | ERROR={str(e)}")
 
+    async def _check_position_exits(self, db: AsyncSession, config: TradingConfig):
+        """Check if any open positions should be closed"""
+        try:
+            user_id = config.user_id
+            symbol = config.trading_pair
+            
+            # Get current open positions for debugging
+            current_positions = self.risk_manager.get_open_positions(user_id)
+            if current_positions:
+                logger.debug(f"🔍 [User {user_id}] Checking {len(current_positions)} open positions for exits")
+            
+            # Get current price
+            current_price = self.binance.get_symbol_price(symbol)
+            if not current_price or current_price <= 0.0:
+                logger.debug(f"❌ [User {user_id}] Invalid current price: {current_price}")
+                return
+            
+            logger.debug(f"💰 [User {user_id}] Current {symbol} price: ${current_price:.4f}")
+            
+            # Check for positions that should be closed
+            positions_to_close = self.risk_manager.check_exit_conditions(user_id, current_price, symbol)
+            
+            if positions_to_close:
+                logger.info(f"🚨 [User {user_id}] Found {len(positions_to_close)} positions ready to close!")
+            else:
+                logger.debug(f"✅ [User {user_id}] No positions ready to close at current price ${current_price:.4f}")
+            
+            for position_info in positions_to_close:
+                position = position_info['position']
+                exit_reason = position_info['exit_reason']
+                
+                logger.info(f"🚨 [User {user_id}] CLOSING POSITION: {exit_reason}")
+                logger.info(f"   📊 Position: {position['side'].upper()} {position['amount']:.6f} {symbol}")
+                logger.info(f"   💰 Entry: ${position['entry_price']:.4f} → Exit: ${current_price:.4f}")
+                
+                # Execute closing order (opposite side)
+                close_side = "SELL" if position['side'].upper() == "BUY" else "BUY"
+                
+                close_order_result = self.binance.place_market_order(
+                    symbol=symbol,
+                    side=close_side,
+                    quantity=position['amount'],
+                    test_mode=config.is_test_mode,
+                )
+                
+                if close_order_result:
+                    # Extract closing order details
+                    executed_qty = float(close_order_result["executedQty"])
+                    exit_price = float(close_order_result["fills"][0]["price"])
+                    exit_commission = float(close_order_result["fills"][0]["commission"])
+                    
+                    # Close the position and calculate P&L
+                    closed_position = self.risk_manager.close_position(
+                        user_id, position['trade_id'], exit_price, exit_reason, exit_commission
+                    )
+                    
+                    if closed_position:
+                        # Log comprehensive exit summary
+                        duration = closed_position['duration_seconds']
+                        duration_str = f"{int(duration//60)}m {int(duration%60)}s" if duration > 60 else f"{duration:.1f}s"
+                        
+                        logger.info(f"🎯 [User {user_id}] POSITION CLOSED SUMMARY:")
+                        logger.info(f"   📈 Trade: {position['side'].upper()} → {close_side}")
+                        logger.info(f"   💰 Entry: ${position['entry_price']:.4f} → Exit: ${exit_price:.4f}")
+                        logger.info(f"   📊 Quantity: {executed_qty:.6f} {symbol}")
+                        logger.info(f"   ⏱️  Duration: {duration_str}")
+                        logger.info(f"   💸 Total Fees: ${closed_position['total_fees']:.4f}")
+                        logger.info(f"   💵 P&L: ${closed_position['net_pnl']:+.2f} ({closed_position['pnl_percentage']:+.2f}%)")
+                        logger.info(f"   🏦 New Balance: ${self.risk_manager.get_account_balance(user_id):.2f}")
+                        
+                        # Log to metrics
+                        profit_loss = "PROFIT" if closed_position['net_pnl'] > 0 else "LOSS"
+                        metrics_logger.info(f"POSITION_CLOSED | USER={user_id} | SYMBOL={symbol} | REASON={exit_reason} | PNL=${closed_position['net_pnl']:+.2f} | PCT={closed_position['pnl_percentage']:+.2f}% | DURATION={duration:.0f}s | RESULT={profit_loss}")
+                        
+                        # Record closing trade in database
+                        close_trade = Trade(
+                            user_id=user_id,
+                            trade_id=str(close_order_result["orderId"]),
+                            symbol=symbol,
+                            side=close_side.lower(),
+                            amount=float(executed_qty),
+                            price=float(exit_price),
+                            total_value=float(executed_qty * exit_price),
+                            fee=float(exit_commission),
+                            status="filled",
+                            is_test_trade=config.is_test_mode,
+                            strategy_used="scalping_ai_exit",
+                            ai_signal_confidence=0.0,  # This is a system-generated exit
+                        )
+                        
+                        db.add(close_trade)
+                        await db.commit()
+                        
+                        # Remove open position from database
+                        position_query = select(OpenPosition).where(
+                            OpenPosition.trade_id == position['trade_id']
+                        )
+                        db_position = await db.execute(position_query)
+                        db_position_obj = db_position.scalar_one_or_none()
+                        
+                        if db_position_obj:
+                            await db.delete(db_position_obj)
+                            await db.commit()
+                            logger.debug(f"✅ [User {user_id}] Open position removed from database")
+                        
+                        # Send notification
+                        await self.ws_manager.send_to_user(
+                            user_id,
+                            {
+                                "type": "position_closed",
+                                "position": closed_position,
+                                "exit_reason": exit_reason,
+                                "new_balance": self.risk_manager.get_account_balance(user_id),
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                            },
+                        )
+                
+        except Exception as e:
+            logger.error(f"❌ [User {user_id}] Error checking position exits: {e}")
+
     async def _execute_trade(
         self, db: AsyncSession, config: TradingConfig, signal: Dict, params: Dict
     ):
         """Execute a trade based on the signal"""
-        trade_start_time = datetime.now()
+        trade_start_time = datetime.now(timezone.utc)
         user_id = config.user_id
         symbol = config.trading_pair
         side = signal["signal"].upper()  # BUY or SELL
@@ -341,40 +473,82 @@ class TradingBot:
             logger.debug(f"💾 [User {user_id}] Recording trade in database...")
             trade = Trade(
                 user_id=user_id,
-                trade_id=order_id,
+                trade_id=str(order_id),
                 symbol=symbol,
                 side=side.lower(),
-                amount=executed_qty,
-                price=fill_price,
-                total_value=params["trade_value"],
-                fee=commission,
+                amount=float(executed_qty),
+                price=float(fill_price),
+                total_value=float(params["trade_value"]),
+                fee=float(commission),
                 status="filled",
                 is_test_trade=config.is_test_mode,
                 strategy_used="scalping_ai",
-                ai_signal_confidence=signal.get("final_confidence", signal.get("confidence", 0)),
+                ai_signal_confidence=float(signal.get("final_confidence", signal.get("confidence", 0))),
             )
 
             db.add(trade)
             await db.commit()
             logger.debug(f"✅ [User {user_id}] Trade recorded in database")
 
+            # Create open position in database
+            open_position = OpenPosition(
+                user_id=user_id,
+                symbol=symbol,
+                side=side.lower(),
+                amount=executed_qty,
+                entry_price=fill_price,
+                stop_loss=float(signal.get('stop_loss', 0)) if signal.get('stop_loss') else None,
+                take_profit=float(signal.get('take_profit', 0)) if signal.get('take_profit') else None,
+                trade_id=str(order_id),
+                entry_value=executed_qty * fill_price,
+                fees_paid=commission,
+                is_test_trade=config.is_test_mode
+            )
+            
+            db.add(open_position)
+            await db.commit()
+            logger.debug(f"✅ [User {user_id}] Open position saved to database")
+
+            # Add position to tracking system
+            position_data = {
+                'trade_id': str(order_id),
+                'symbol': symbol,
+                'side': side.lower(),
+                'amount': executed_qty,
+                'entry_price': fill_price,
+                'stop_loss': float(signal.get('stop_loss', 0)),
+                'take_profit': float(signal.get('take_profit', 0)),
+                'entry_time': trade_start_time,
+                'entry_value': executed_qty * fill_price,
+                'fees_paid': commission
+            }
+            
+            self.risk_manager.add_open_position(user_id, position_data)
+            
             # Update risk manager
             self.risk_manager.record_trade(user_id)
-            logger.debug(f"📊 [User {user_id}] Risk manager updated")
 
             # Calculate trade metrics
             total_cost = executed_qty * fill_price + commission
             trade_duration = (datetime.now() - trade_start_time).total_seconds()
             
-            # Log comprehensive trade metrics
-            logger.info(f"📈 [User {user_id}] TRADE COMPLETED:")
+            # Get current account balance
+            current_balance = self.risk_manager.get_account_balance(user_id)
+            
+            # Log comprehensive trade entry with structured format
+            logger.info(f"� [User {user_id}] POSITION OPENED:")
+            logger.info(f"   📊 Trade: {side} {executed_qty:.6f} {symbol}")
+            logger.info(f"   💰 Entry Price: ${fill_price:.4f}")
+            logger.info(f"   🎯 Take Profit: ${signal.get('take_profit', 0):.4f}")
+            logger.info(f"   � Stop Loss: ${signal.get('stop_loss', 0):.4f}")
+            logger.info(f"   💵 Position Value: ${total_cost:.2f}")
+            logger.info(f"   � Entry Fee: ${commission:.4f}")
             logger.info(f"   ⏱️  Execution Time: {trade_duration:.2f}s")
-            logger.info(f"   💰 Total Cost: ${total_cost:.2f}")
-            logger.info(f"   📊 Effective Price: ${fill_price:.4f}")
-            logger.info(f"   💸 Fee %: {(commission/total_cost)*100:.3f}%")
+            logger.info(f"   🏦 Account Balance: ${current_balance:.2f}")
+            logger.info(f"   🧠 AI Confidence: {signal.get('final_confidence', signal.get('confidence', 0)):.1f}%")
 
             # Log to metrics file for analysis
-            metrics_logger.info(f"TRADE_EXECUTED | USER={user_id} | SYMBOL={symbol} | SIDE={side} | QTY={executed_qty:.6f} | PRICE={fill_price:.4f} | VALUE=${total_cost:.2f} | FEE=${commission:.4f} | CONFIDENCE={signal.get('final_confidence', signal.get('confidence', 0)):.1f} | TEST={config.is_test_mode} | DURATION={trade_duration:.2f}s")
+            metrics_logger.info(f"POSITION_OPENED | USER={user_id} | SYMBOL={symbol} | SIDE={side} | QTY={executed_qty:.6f} | ENTRY=${fill_price:.4f} | TP=${signal.get('take_profit', 0):.4f} | SL=${signal.get('stop_loss', 0):.4f} | VALUE=${total_cost:.2f} | FEE=${commission:.4f} | CONFIDENCE={signal.get('final_confidence', signal.get('confidence', 0)):.1f} | BALANCE=${current_balance:.2f} | TEST={config.is_test_mode}")
 
             # Send trade notification
             await self.ws_manager.send_to_user(
@@ -392,11 +566,15 @@ class TradingBot:
                         "order_id": order_id,
                         "commission": commission,
                     },
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 },
             )
 
-            logger.info(f"🎉 [User {user_id}] TRADE SUCCESS: {side} {executed_qty:.6f} {symbol} @ ${fill_price:.4f}")
+            # Show a summary of open positions
+            open_positions = self.risk_manager.get_open_positions(user_id)
+            logger.info(f"📋 [User {user_id}] Open Positions: {len(open_positions)} | Total Value: ${sum(p['entry_value'] for p in open_positions):.2f}")
+            
+            logger.info(f"✅ [User {user_id}] POSITION OPENED SUCCESSFULLY!")
 
         except Exception as e:
             trade_duration = (datetime.now() - trade_start_time).total_seconds()
@@ -411,7 +589,7 @@ class TradingBot:
                     "error": f"Trade execution failed: {str(e)}",
                     "symbol": symbol,
                     "side": side.lower(),
-                    "timestamp": datetime.now().isoformat(),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
                 },
             )
 
@@ -459,6 +637,34 @@ class TradingBot:
         result = await db.execute(query)
         return result.scalars().all()
 
+    async def _load_open_positions_from_db(self):
+        """Load open positions from database on startup"""
+        try:
+            async with get_async_session() as db:
+                result = await db.execute(select(OpenPosition))
+                open_positions = result.scalars().all()
+                
+                # Load positions into risk manager
+                for position in open_positions:
+                    position_data = {
+                        'trade_id': position.trade_id,
+                        'symbol': position.symbol,
+                        'side': position.side,
+                        'amount': float(position.amount),
+                        'entry_price': float(position.entry_price),
+                        'stop_loss': float(position.stop_loss) if position.stop_loss else None,
+                        'take_profit': float(position.take_profit) if position.take_profit else None,
+                        'entry_time': position.opened_at,
+                        'entry_value': float(position.entry_value),
+                        'fees_paid': float(position.fees_paid)
+                    }
+                    self.risk_manager.add_open_position(position.user_id, position_data)
+                
+                logger.info(f"📊 Loaded {len(open_positions)} open positions from database")
+                
+        except Exception as e:
+            logger.error(f"❌ Error loading open positions from database: {e}")
+
     async def daily_reset_task(self):
         """Reset daily counters at midnight"""
         while self.is_running:
@@ -486,3 +692,55 @@ class TradingBot:
             except Exception as e:
                 logger.error(f"❌ Error in daily reset task: {e}")
                 await asyncio.sleep(3600)  # Wait 1 hour before retry
+    
+    def _log_cycle_summary(self, cycle_count: int, duration: float, processed_users: int):
+        """Log a comprehensive summary of the trading cycle"""
+        try:
+            # Calculate total open positions and values across all users
+            total_positions = 0
+            total_position_value = 0.0
+
+            user_summaries = []
+            
+            # Get all user IDs that have open positions or are in risk manager
+            all_user_ids = set()
+            all_user_ids.update(self.risk_manager.open_positions.keys())
+            all_user_ids.update(self.risk_manager.account_balances.keys())
+            
+            for user_id in all_user_ids:
+                open_positions = self.risk_manager.get_open_positions(user_id)
+                balance = self.risk_manager.get_account_balance(user_id)
+                
+                if open_positions:
+                    user_position_value = sum(p['entry_value'] for p in open_positions)
+                    total_positions += len(open_positions)
+                    total_position_value += user_position_value
+                    
+                    user_summaries.append({
+                        'user_id': user_id,
+                        'positions': len(open_positions),
+                        'value': user_position_value,
+                        'balance': balance
+                    })
+            
+            # Log cycle completion
+            logger.info(f"✅ TRADING CYCLE #{cycle_count} COMPLETED:")
+            logger.info(f"   ⏱️  Duration: {duration:.2f}s | Processed Users: {processed_users}")
+            logger.info(f"   📊 System Status: {total_positions} open positions, ${total_position_value:.2f} total value")
+            
+            # Log individual user summaries if there are positions
+            if user_summaries:
+                logger.info("📋 USER POSITION SUMMARY:")
+                for summary in user_summaries:
+                    logger.info(f"   👤 User {summary['user_id']}: {summary['positions']} positions, ${summary['value']:.2f} invested, ${summary['balance']:.2f} balance")
+            else:
+                logger.info("📋 No open positions across all users")
+                
+            # Log to metrics
+            metrics_logger.info(f"CYCLE_{cycle_count}_COMPLETED | DURATION={duration:.2f}s | USERS={processed_users} | POSITIONS={total_positions} | VALUE=${total_position_value:.2f}")
+            
+        except Exception as e:
+            logger.error(f"❌ Error logging cycle summary: {e}")
+            # Fallback to simple logging
+            logger.info(f"✅ Trading cycle #{cycle_count} completed in {duration:.2f}s")
+            metrics_logger.info(f"CYCLE_{cycle_count}_COMPLETED | DURATION={duration:.2f}s | PROCESSED_USERS={processed_users}")

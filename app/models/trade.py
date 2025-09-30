@@ -41,4 +41,25 @@ class TradingConfig(Base):
     
     # Relationships
     user = relationship("User", back_populates="trading_configs")
+
+
+class OpenPosition(Base):
+    __tablename__ = "open_positions"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    trade_id = Column(String(100), unique=True, index=True, nullable=False)
+    symbol = Column(String(20), nullable=False, index=True)
+    side = Column(String(10), nullable=False)  # 'buy' or 'sell'
+    amount = Column(DECIMAL(20, 8), nullable=False)
+    entry_price = Column(DECIMAL(20, 8), nullable=False)
+    stop_loss = Column(DECIMAL(20, 8), nullable=True)
+    take_profit = Column(DECIMAL(20, 8), nullable=True)
+    entry_value = Column(DECIMAL(20, 8), nullable=False)
+    fees_paid = Column(DECIMAL(20, 8), default=0)
+    is_test_trade = Column(Boolean, default=True)
+    opened_at = Column(DateTime(timezone=True), server_default=func.now())
+    
+    # Relationships
+    user = relationship("User")
     

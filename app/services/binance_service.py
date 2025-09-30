@@ -6,6 +6,7 @@ import pandas as pd
 import numpy as np
 from ..config import settings
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,11 @@ class BinanceService:
             api_secret=settings.binance_secret_key,
             testnet=settings.binance_testnet,
         )
+        # Synchronize time to prevent timestamp errors
+        try:
+            self.client.get_server_time()
+        except Exception as e:
+            logger.warning(f"⚠️  Could not sync server time: {e}")
         self.is_connected = False
 
     async def initialize(self):
@@ -26,12 +32,28 @@ class BinanceService:
             status = self.client.get_system_status()
             logger.info(f"🌐 Binance {'Testnet' if settings.binance_testnet else 'Live'} network: {status}")
             
-            # Test authentication
-            account = self.client.get_account()
-            self.is_connected = True
-            logger.info(f"✅ Binance {'Testnet' if settings.binance_testnet else 'Live'} connected successfully")
-            logger.info(f"📊 Account permissions - Can Trade: {account.get('canTrade', False)}")
-            return True
+            # Get server time and adjust for timestamp sync
+            server_time = self.client.get_server_time()
+            local_time = int(time.time() * 1000)
+            time_offset = server_time['serverTime'] - local_time
+            logger.info(f"⏰ Time sync - Server: {server_time['serverTime']}, Local: {local_time}, Offset: {time_offset}ms")
+            
+            # Test authentication with retries
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    account = self.client.get_account()
+                    self.is_connected = True
+                    logger.info(f"✅ Binance {'Testnet' if settings.binance_testnet else 'Live'} connected successfully")
+                    logger.info(f"📊 Account permissions - Can Trade: {account.get('canTrade', False)}")
+                    return True
+                except Exception as retry_error:
+                    if attempt < max_retries - 1:
+                        wait_time = (attempt + 1) * 2
+                        logger.warning(f"⚠️  Connection attempt {attempt + 1} failed, retrying in {wait_time}s: {retry_error}")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        raise retry_error
             
         except Exception as e:
             logger.error(f"❌ Binance connection failed: {e}")
@@ -49,6 +71,12 @@ class BinanceService:
                 logger.error("   6. Try regenerating your API keys")
             elif "connectivity" in error_str.lower() or "network" in error_str.lower():
                 logger.error("💡 Network connectivity issue - check your internet connection")
+            elif "-1021" in error_str:
+                logger.error("💡 Error -1021 means: Timestamp for request was ahead of server time")
+                logger.error("🔧 Solutions:")
+                logger.error("   1. Check system clock is synchronized (Windows: w32tm /resync)")
+                logger.error("   2. Try restarting the application")
+                logger.error("   3. Check for network latency issues")
             
             return False
 

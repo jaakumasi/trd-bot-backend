@@ -167,13 +167,13 @@ class AIAnalyzer:
             - Trading timeframe: 1-5 minutes
             - Market session: High volume hours (8AM-4PM GMT)
 
-            Based on this data, provide a JSON response with:
-            1. "signal": "buy", "sell", or "hold"
+            Based on this data, provide a JSON response with ALL 6 required fields:
+            1. "signal": "buy", "sell", or "hold" 
             2. "confidence": integer from 0-100
             3. "reasoning": brief explanation (max 100 words)
-            4. "entry_price": suggested entry price if buy/sell signal
-            5. "stop_loss": suggested stop loss price
-            6. "take_profit": suggested take profit price
+            4. "entry_price": REQUIRED - suggested entry price (use current price {latest['close']:.2f} if unsure)
+            5. "stop_loss": REQUIRED - suggested stop loss price (0.5% from entry for scalping)
+            6. "take_profit": REQUIRED - suggested take profit price (0.3% from entry for scalping)
 
             Consider:
             - RSI overbought (>70) or oversold (<30) conditions
@@ -182,9 +182,11 @@ class AIAnalyzer:
             - Bollinger Band squeeze/expansion
             - Price action relative to moving averages
 
-            IMPORTANT: Return ONLY valid JSON without markdown code blocks or any other formatting.
-            Example format:
-            {{"signal": "buy", "confidence": 75, "reasoning": "Strong bullish momentum", "entry_price": 50000, "stop_loss": 49750, "take_profit": 50150}}
+            CRITICAL: You MUST include ALL 6 fields (signal, confidence, reasoning, entry_price, stop_loss, take_profit) in your response.
+            Return ONLY valid JSON without markdown code blocks or any other formatting.
+            
+            Example format with ALL required fields:
+            {{"signal": "buy", "confidence": 75, "reasoning": "Strong bullish momentum", "entry_price": {latest['close']:.2f}, "stop_loss": {latest['close'] * 0.995:.2f}, "take_profit": {latest['close'] * 1.003:.2f}}}
             """
 
             try:
@@ -220,6 +222,9 @@ class AIAnalyzer:
                         "confidence": 0,
                         "reasoning": "AI response parsing failed - invalid JSON format",
                         "technical_score": 0,
+                        "entry_price": latest["close"],
+                        "stop_loss": latest["close"] * 0.99,  # 1% stop loss
+                        "take_profit": latest["close"] * 1.01  # 1% take profit
                     }
 
                 # Validate and sanitize response
@@ -231,6 +236,35 @@ class AIAnalyzer:
                 ai_analysis["confidence"] = max(
                     0, min(100, int(ai_analysis.get("confidence", 0)))
                 )
+
+                # Ensure required price fields are present with fallback values
+                current_price = latest["close"]
+                signal = ai_analysis.get("signal", "hold")
+                
+                # Set entry price - use Gemini's suggestion or current price
+                if "entry_price" not in ai_analysis or not ai_analysis["entry_price"]:
+                    ai_analysis["entry_price"] = current_price
+                    logger.info(f"🔧 Added fallback entry_price: {current_price}")
+                
+                # Set stop loss based on signal direction
+                if "stop_loss" not in ai_analysis or not ai_analysis["stop_loss"]:
+                    if signal == "buy":
+                        ai_analysis["stop_loss"] = current_price * 0.995  # 0.5% stop loss for buy
+                    elif signal == "sell":
+                        ai_analysis["stop_loss"] = current_price * 1.005  # 0.5% stop loss for sell
+                    else:  # hold
+                        ai_analysis["stop_loss"] = current_price * 0.99   # 1% stop loss for hold
+                    logger.info(f"🔧 Added fallback stop_loss: {ai_analysis['stop_loss']} for {signal} signal")
+                
+                # Set take profit based on signal direction
+                if "take_profit" not in ai_analysis or not ai_analysis["take_profit"]:
+                    if signal == "buy":
+                        ai_analysis["take_profit"] = current_price * 1.01  # 1% take profit for buy
+                    elif signal == "sell":
+                        ai_analysis["take_profit"] = current_price * 0.99  # 1% take profit for sell
+                    else:  # hold
+                        ai_analysis["take_profit"] = current_price * 1.005 # 0.5% take profit for hold
+                    logger.info(f"🔧 Added fallback take_profit: {ai_analysis['take_profit']} for {signal} signal")
 
                 # Add technical confirmation to validate AI analysis
                 technical_score = self._calculate_technical_score(latest)
@@ -245,20 +279,36 @@ class AIAnalyzer:
             except Exception as gemini_error:
                 logger.error(f"❌ Gemini API Error: {gemini_error}")
                 # Return fallback analysis if Gemini fails
+                current_price = latest["close"]
                 return {
                     "signal": "hold",
                     "confidence": 0,
                     "reasoning": f"AI analysis failed: {str(gemini_error)[:100]}",
                     "technical_score": 0,
+                    "entry_price": current_price,
+                    "stop_loss": current_price * 0.99,  # 1% stop loss
+                    "take_profit": current_price * 1.01  # 1% take profit
                 }
 
         except Exception as e:
             logger.error(f"AI analysis error: {e}")
+            # Provide fallback values using a safe default price
+            fallback_price = 50000.0  # Default fallback price
+            try:
+                # Try to get the latest data for current price
+                if hasattr(self, '_latest_data') and self._latest_data is not None:
+                    fallback_price = self._latest_data.get("close", fallback_price)
+            except Exception:
+                pass
+            
             return {
                 "signal": "hold",
                 "confidence": 0,
                 "reasoning": f"Analysis error: {str(e)[:50]}",
                 "technical_score": 0,
+                "entry_price": fallback_price,
+                "stop_loss": fallback_price * 0.99,  # 1% stop loss
+                "take_profit": fallback_price * 1.01  # 1% take profit
             }
 
     def _calculate_technical_score(self, latest_data) -> int:

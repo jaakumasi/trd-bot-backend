@@ -10,6 +10,10 @@ from .api import trading, portfolio, auth
 from .services.trading_bot import TradingBot
 from .services.websocket_manager import WebSocketManager
 from .logging_config import setup_logging
+# Import all models to ensure they're registered with SQLAlchemy
+from .models.user import User
+from .models.trade import Trade, TradingConfig, OpenPosition
+from .models.portfolio import Portfolio
 from dotenv import load_dotenv
 import logging
 

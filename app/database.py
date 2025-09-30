@@ -21,4 +21,8 @@ async def get_db():
             raise
         finally:
             await session.close()
+
+# Context manager for direct database access
+def get_async_session():
+    return AsyncSessionLocal()
             
