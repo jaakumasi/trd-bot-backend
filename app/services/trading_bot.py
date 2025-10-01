@@ -85,7 +85,7 @@ class TradingBot:
         logger.info(f"⏰ Trading Hours: {settings.trading_active_hours_start} - {settings.trading_active_hours_end}")
         
         # Test current trading hours status
-        current_time = datetime.now().time()
+        current_time = datetime.now(timezone.utc).time()
         is_trading_time = self._is_trading_hours(current_time)
         logger.info(f"🕐 Current time: {current_time.strftime('%H:%M:%S')} | Trading active: {'✅ Yes' if is_trading_time else '❌ No'}")
 
@@ -134,12 +134,12 @@ class TradingBot:
         while self.is_running:
             try:
                 cycle_count += 1
-                cycle_start_time = datetime.now()
+                cycle_start_time = datetime.now(timezone.utc)
                 
                 logger.info(f"🔄 Starting trading cycle #{cycle_count} at {cycle_start_time.strftime('%H:%M:%S')}")
                 
                 # Check if we're in trading hours
-                current_time = datetime.now().time()
+                current_time = datetime.now(timezone.utc).time()
                 if not self._is_trading_hours(current_time):
                     logger.info(f"⏰ Outside trading hours ({current_time.strftime('%H:%M:%S')}). Next check in 1 minute.")
                     await asyncio.sleep(60)  # Check again in 1 minute
@@ -181,7 +181,7 @@ class TradingBot:
                         except Exception as e:
                             logger.error(f"❌ Error processing user {config.user_id}: {e}")
 
-                    cycle_duration = (datetime.now() - cycle_start_time).total_seconds()
+                    cycle_duration = (datetime.now(timezone.utc) - cycle_start_time).total_seconds()
                     
                     # Log cycle summary with position overview
                     self._log_cycle_summary(cycle_count, cycle_duration, processed_users)
@@ -530,7 +530,7 @@ class TradingBot:
 
             # Calculate trade metrics
             total_cost = executed_qty * fill_price + commission
-            trade_duration = (datetime.now() - trade_start_time).total_seconds()
+            trade_duration = (datetime.now(timezone.utc) - trade_start_time).total_seconds()
             
             # Get current account balance
             current_balance = self.risk_manager.get_account_balance(user_id)
@@ -577,7 +577,7 @@ class TradingBot:
             logger.info(f"✅ [User {user_id}] POSITION OPENED SUCCESSFULLY!")
 
         except Exception as e:
-            trade_duration = (datetime.now() - trade_start_time).total_seconds()
+            trade_duration = (datetime.now(timezone.utc) - trade_start_time).total_seconds()
             logger.error(f"❌ [User {user_id}] TRADE EXECUTION ERROR after {trade_duration:.2f}s: {e}")
             metrics_logger.info(f"TRADE_ERROR | USER={user_id} | SYMBOL={symbol} | SIDE={side} | ERROR={str(e)} | DURATION={trade_duration:.2f}s")
             
@@ -669,7 +669,7 @@ class TradingBot:
         """Reset daily counters at midnight"""
         while self.is_running:
             try:
-                now = datetime.now()
+                now = datetime.now(timezone.utc)
                 # Calculate seconds until midnight
                 tomorrow = now.replace(
                     hour=0, minute=0, second=0, microsecond=0
