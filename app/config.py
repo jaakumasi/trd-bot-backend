@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     gemini_api_key: str = Field(default="")
     
     # Security
-    jwt_secret: str = Field(default="your-secret-key-change-in-production")
+    jwt_secret: str = Field(default="")
     jwt_algorithm: str = Field(default="HS256")
     jwt_expiration: int = Field(default=3600)
     

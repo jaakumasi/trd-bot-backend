@@ -154,3 +154,141 @@ class MockBinanceService:
         except Exception as e:
             logger.error(f"Error simulating {side} order for {symbol}: {e}")
             return {}
+
+    def place_order_with_oco(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        take_profit_price: float,
+        stop_loss_price: float,
+        test_mode: bool = True,
+    ) -> Dict:
+        """
+        Simulate placing an OCO order (entry + TP/SL)
+        
+        In mock mode, this simulates:
+        1. Entry order execution
+        2. OCO order creation on "Binance" (simulated)
+        """
+        try:
+            # Step 1: Execute entry order (same as place_market_order)
+            price = self.get_symbol_price(symbol)
+            entry_order_id = int(random.random() * 1000000)
+            executed_qty = quantity * random.uniform(0.98, 1.0)
+            commission = executed_qty * price * 0.001
+            
+            # Update mock balances
+            if side.upper() == "BUY":
+                cost = executed_qty * price + commission
+                if "USDT" in self.mock_balances:
+                    self.mock_balances["USDT"]["free"] -= cost
+                    
+                base_asset = symbol.replace("USDT", "")
+                if base_asset not in self.mock_balances:
+                    self.mock_balances[base_asset] = {"free": 0, "locked": 0, "total": 0}
+                self.mock_balances[base_asset]["free"] += executed_qty
+                
+            elif side.upper() == "SELL":
+                base_asset = symbol.replace("USDT", "")
+                if base_asset in self.mock_balances:
+                    self.mock_balances[base_asset]["free"] -= executed_qty
+                    
+                revenue = executed_qty * price - commission
+                if "USDT" not in self.mock_balances:
+                    self.mock_balances["USDT"] = {"free": 0, "locked": 0, "total": 0}
+                self.mock_balances["USDT"]["free"] += revenue
+            
+            # Step 2: Create mock OCO order
+            oco_order_id = int(random.random() * 1000000)
+            exit_side = "SELL" if side.upper() == "BUY" else "BUY"
+            
+            entry_order = {
+                "symbol": symbol,
+                "orderId": entry_order_id,
+                "side": side.upper(),
+                "type": "MARKET",
+                "quantity": str(quantity),
+                "price": str(price),
+                "status": "FILLED",
+                "executedQty": str(executed_qty),
+                "fills": [
+                    {
+                        "price": str(price),
+                        "qty": str(executed_qty),
+                        "commission": str(commission),
+                        "commissionAsset": "USDT",
+                    }
+                ],
+            }
+            
+            oco_order = {
+                "orderListId": oco_order_id,
+                "symbol": symbol,
+                "listOrderStatus": "EXECUTING",
+                "orders": [
+                    {
+                        "symbol": symbol,
+                        "orderId": int(random.random() * 1000000),
+                        "side": exit_side,
+                        "type": "LIMIT_MAKER",
+                        "price": str(take_profit_price),
+                        "quantity": str(executed_qty),
+                        "status": "NEW",
+                    },
+                    {
+                        "symbol": symbol,
+                        "orderId": int(random.random() * 1000000),
+                        "side": exit_side,
+                        "type": "STOP_LOSS_LIMIT",
+                        "stopPrice": str(stop_loss_price),
+                        "price": str(stop_loss_price * 0.999 if exit_side == "SELL" else stop_loss_price * 1.001),
+                        "quantity": str(executed_qty),
+                        "status": "NEW",
+                    },
+                ],
+            }
+            
+            logger.info(f"🧪 MOCK OCO ORDER:")
+            logger.info(f"   📥 Entry: {side} {executed_qty:.6f} {symbol} @ ${price:.4f}")
+            logger.info(f"   🎯 Take Profit: {exit_side} @ ${take_profit_price:.4f}")
+            logger.info(f"   🛑 Stop Loss: {exit_side} @ ${stop_loss_price:.4f}")
+            logger.info(f"   🆔 OCO Order List ID: {oco_order_id}")
+            
+            return {
+                "entry_order": entry_order,
+                "oco_order": oco_order,
+                "take_profit_price": take_profit_price,
+                "stop_loss_price": stop_loss_price,
+            }
+            
+        except Exception as e:
+            logger.error(f"Error simulating OCO order for {symbol}: {e}")
+            return {}
+
+    def get_oco_order_status(self, order_list_id: str) -> Optional[Dict]:
+        """
+        Simulate checking OCO order status
+        
+        In mock mode, this will simulate the order as EXECUTING
+        (position monitoring will happen via price checks in mock mode)
+        """
+        try:
+            logger.debug(f"🧪 Checking mock OCO status: {order_list_id}")
+            return {
+                "orderListId": order_list_id,
+                "listOrderStatus": "EXECUTING",  # Always executing in mock
+                "orders": []
+            }
+        except Exception as e:
+            logger.error(f"Error getting mock OCO status: {e}")
+            return None
+
+    def cancel_oco_order(self, symbol: str, order_list_id: str) -> bool:
+        """Simulate cancelling an OCO order"""
+        try:
+            logger.info(f"🧪 MOCK: Cancelled OCO order {order_list_id} for {symbol}")
+            return True
+        except Exception as e:
+            logger.error(f"Error cancelling mock OCO order: {e}")
+            return False

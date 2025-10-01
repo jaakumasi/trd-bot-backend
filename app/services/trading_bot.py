@@ -173,7 +173,10 @@ class TradingBot:
                             processed_users += 1
                             logger.debug(f"📈 Processing user {config.user_id} ({processed_users}/{total_active_users}) - {config.trading_pair}")
                             
-                            # Check for positions to close first
+                            # Check OCO orders first (automatic TP/SL from Binance)
+                            await self._check_oco_orders(db)
+                            
+                            # Check for manual position exits (fallback if no OCO)
                             await self._check_position_exits(db, config)
                             
                             # Then process new trading signals
@@ -373,7 +376,11 @@ class TradingBot:
                         logger.info(f"   ⏱️  Duration: {duration_str}")
                         logger.info(f"   💸 Total Fees: ${closed_position['total_fees']:.4f}")
                         logger.info(f"   💵 P&L: ${closed_position['net_pnl']:+.2f} ({closed_position['pnl_percentage']:+.2f}%)")
-                        logger.info(f"   🏦 New Balance: ${self.risk_manager.get_account_balance(user_id):.2f}")
+                        
+                        # Get actual Binance balance for accurate reporting
+                        fresh_balances = self.binance.get_account_balance()
+                        actual_usdt_balance = fresh_balances.get("USDT", {}).get("free", 0.0)
+                        logger.info(f"   🏦 Binance USDT Balance: ${actual_usdt_balance:.2f}")
                         
                         # Log to metrics
                         profit_loss = "PROFIT" if closed_position['net_pnl'] > 0 else "LOSS"
@@ -410,20 +417,181 @@ class TradingBot:
                             await db.commit()
                             logger.debug(f"✅ [User {user_id}] Open position removed from database")
                         
-                        # Send notification
+                        #Send notification with actual Binance balance
                         await self.ws_manager.send_to_user(
                             user_id,
                             {
                                 "type": "position_closed",
                                 "position": closed_position,
                                 "exit_reason": exit_reason,
-                                "new_balance": self.risk_manager.get_account_balance(user_id),
+                                "new_balance": actual_usdt_balance,
                                 "timestamp": datetime.now(timezone.utc).isoformat(),
                             },
                         )
                 
         except Exception as e:
             logger.error(f"❌ [User {user_id}] Error checking position exits: {e}")
+
+    async def _check_oco_orders(self, db: AsyncSession):
+        """
+        Check status of all active OCO orders and update database when filled
+        This runs periodically to detect when Binance executes TP or SL
+        """
+        try:
+            # Query all open positions that have OCO orders
+            result = await db.execute(
+                select(OpenPosition).where(OpenPosition.oco_order_id.isnot(None))
+            )
+            positions_with_oco = result.scalars().all()
+            
+            if not positions_with_oco:
+                logger.debug("🔍 No OCO orders to check")
+                return
+            
+            logger.debug(f"🔍 Checking {len(positions_with_oco)} OCO orders...")
+            
+            for position in positions_with_oco:
+                try:
+                    user_id = position.user_id
+                    oco_order_id = position.oco_order_id
+                    symbol = position.symbol
+                    
+                    # Get OCO order status from Binance
+                    oco_status = self.binance.get_oco_order_status(oco_order_id)
+                    
+                    if not oco_status:
+                        logger.warning(f"⚠️  [User {user_id}] Could not get OCO status for {oco_order_id}")
+                        continue
+                    
+                    order_status = oco_status.get('listOrderStatus', 'UNKNOWN')
+                    
+                    # Check if OCO has been executed (one leg filled, other cancelled)
+                    if order_status == 'ALL_DONE':
+                        logger.info(f"🎯 [User {user_id}] OCO ORDER EXECUTED: {oco_order_id}")
+                        
+                        # Determine which leg was executed (TP or SL)
+                        orders = oco_status.get('orders', [])
+                        exit_reason = None
+                        exit_price = None
+                        
+                        for order in orders:
+                            order_status_detail = order.get('status', '')
+                            if order_status_detail == 'FILLED':
+                                order_type = order.get('type', '')
+                                exit_price = float(order.get('price', 0))
+                                
+                                # Determine if it was TP or SL
+                                if 'STOP' in order_type.upper():
+                                    exit_reason = 'STOP_LOSS'
+                                    logger.info(f"🛑 [User {user_id}] Stop Loss triggered at ${exit_price:.4f}")
+                                else:
+                                    exit_reason = 'TAKE_PROFIT'
+                                    logger.info(f"🎯 [User {user_id}] Take Profit triggered at ${exit_price:.4f}")
+                                break
+                        
+                        if not exit_reason or not exit_price:
+                            logger.warning(f"⚠️  [User {user_id}] Could not determine exit details for OCO {oco_order_id}")
+                            continue
+                        
+                        # Calculate P&L
+                        entry_price = float(position.entry_price)
+                        amount = float(position.amount)
+                        entry_fees = float(position.fees_paid)
+                        
+                        # Estimate exit fee (0.1% on Binance)
+                        exit_value = amount * exit_price
+                        exit_fee = exit_value * 0.001
+                        
+                        # Calculate P&L based on position side
+                        if position.side.upper() == 'BUY':
+                            profit_loss = (exit_price - entry_price) * amount - entry_fees - exit_fee
+                        else:  # SELL
+                            profit_loss = (entry_price - exit_price) * amount - entry_fees - exit_fee
+                        
+                        profit_loss_pct = (profit_loss / float(position.entry_value)) * 100
+                        duration = (datetime.now(timezone.utc) - position.opened_at).total_seconds()
+                        
+                        # Update the original trade record
+                        trade_query = select(Trade).where(Trade.trade_id == position.trade_id)
+                        trade_result = await db.execute(trade_query)
+                        trade_obj = trade_result.scalar_one_or_none()
+                        
+                        if trade_obj:
+                            trade_obj.closed_at = datetime.now(timezone.utc)
+                            trade_obj.exit_price = exit_price
+                            trade_obj.exit_fee = exit_fee
+                            trade_obj.exit_reason = exit_reason
+                            trade_obj.profit_loss = profit_loss
+                            trade_obj.profit_loss_percentage = profit_loss_pct
+                            trade_obj.duration_seconds = int(duration)
+                            trade_obj.status = 'closed'
+                            
+                            await db.commit()
+                            logger.debug(f"✅ [User {user_id}] Trade record updated in database")
+                        
+                        # Remove open position from database
+                        await db.delete(position)
+                        await db.commit()
+                        logger.debug(f"✅ [User {user_id}] Open position removed from database")
+                        
+                        # Remove from risk manager tracking
+                        self.risk_manager.close_position(
+                            user_id, 
+                            position.trade_id, 
+                            exit_price, 
+                            exit_reason,
+                            exit_fee
+                        )
+                        
+                        # Get fresh balance
+                        fresh_balances = self.binance.get_account_balance()
+                        actual_usdt_balance = fresh_balances.get("USDT", {}).get("free", 0.0)
+                        
+                        # Log comprehensive exit
+                        profit_emoji = "💰" if profit_loss > 0 else "📉"
+                        logger.info(f"{profit_emoji} [User {user_id}] POSITION CLOSED VIA OCO:")
+                        logger.info(f"   📊 {position.side.upper()} {amount:.6f} {symbol}")
+                        logger.info(f"   📈 Entry: ${entry_price:.4f} → Exit: ${exit_price:.4f}")
+                        logger.info(f"   🎯 Reason: {exit_reason}")
+                        logger.info(f"   💵 P&L: ${profit_loss:.2f} ({profit_loss_pct:+.2f}%)")
+                        logger.info(f"   💸 Total Fees: ${entry_fees + exit_fee:.4f}")
+                        logger.info(f"   ⏱️  Duration: {duration/60:.1f} minutes")
+                        logger.info(f"   🏦 Binance USDT Balance: ${actual_usdt_balance:.2f}")
+                        
+                        # Log to metrics
+                        metrics_logger.info(f"OCO_POSITION_CLOSED | USER={user_id} | SYMBOL={symbol} | REASON={exit_reason} | ENTRY=${entry_price:.4f} | EXIT=${exit_price:.4f} | PL=${profit_loss:.2f} | PL_PCT={profit_loss_pct:+.2f} | DURATION={duration:.0f}s | BALANCE=${actual_usdt_balance:.2f}")
+                        
+                        # Send WebSocket notification
+                        await self.ws_manager.send_to_user(
+                            user_id,
+                            {
+                                "type": "oco_position_closed",
+                                "position": {
+                                    "symbol": symbol,
+                                    "side": position.side,
+                                    "amount": amount,
+                                    "entry_price": entry_price,
+                                    "exit_price": exit_price,
+                                    "profit_loss": profit_loss,
+                                    "profit_loss_percentage": profit_loss_pct,
+                                },
+                                "exit_reason": exit_reason,
+                                "new_balance": actual_usdt_balance,
+                                "timestamp": datetime.now(timezone.utc).isoformat(),
+                            },
+                        )
+                        
+                    elif order_status == 'EXECUTING':
+                        logger.debug(f"⏳ [User {user_id}] OCO {oco_order_id} still active for {symbol}")
+                    else:
+                        logger.warning(f"⚠️  [User {user_id}] OCO {oco_order_id} has unexpected status: {order_status}")
+                        
+                except Exception as e:
+                    logger.error(f"❌ Error processing OCO order {position.oco_order_id}: {e}")
+                    continue
+                    
+        except Exception as e:
+            logger.error(f"❌ Error in _check_oco_orders: {e}")
 
     async def _execute_trade(
         self, db: AsyncSession, config: TradingConfig, signal: Dict, params: Dict
@@ -443,31 +611,51 @@ class TradingBot:
             logger.info(f"   🧪 Test Mode: {'Yes' if config.is_test_mode else 'No'}")
             logger.info(f"   🎯 AI Confidence: {signal.get('final_confidence', signal.get('confidence', 0)):.1f}%")
 
-            # Place order on Binance
-            logger.debug(f"📤 [User {user_id}] Placing {side} order on Binance...")
-            order_result = self.binance.place_market_order(
+            # Calculate take profit and stop loss prices from signal
+            current_price = self.binance.get_symbol_price(symbol)
+            take_profit_price = float(signal.get('take_profit', 0))
+            stop_loss_price = float(signal.get('stop_loss', 0))
+            
+            # Validate TP/SL prices
+            if not take_profit_price or not stop_loss_price:
+                logger.error(f"❌ [User {user_id}] Invalid TP/SL prices: TP={take_profit_price}, SL={stop_loss_price}")
+                return
+            
+            logger.info(f"🎯 [User {user_id}] Order prices: Entry=${current_price:.4f}, TP=${take_profit_price:.4f}, SL=${stop_loss_price:.4f}")
+
+            # Place order with OCO (entry + automatic TP/SL)
+            logger.debug(f"📤 [User {user_id}] Placing {side} order with OCO on Binance...")
+            oco_result = self.binance.place_order_with_oco(
                 symbol=symbol,
                 side=side,
                 quantity=params["position_size"],
+                take_profit_price=take_profit_price,
+                stop_loss_price=stop_loss_price,
                 test_mode=config.is_test_mode,
             )
 
-            if not order_result:
-                logger.error(f"❌ [User {user_id}] TRADE FAILED: Order placement failed")
-                metrics_logger.info(f"TRADE_FAILED | USER={user_id} | SYMBOL={symbol} | SIDE={side} | REASON=ORDER_PLACEMENT_FAILED")
+            if not oco_result or 'entry_order' not in oco_result:
+                logger.error(f"❌ [User {user_id}] TRADE FAILED: OCO order placement failed")
+                metrics_logger.info(f"TRADE_FAILED | USER={user_id} | SYMBOL={symbol} | SIDE={side} | REASON=OCO_ORDER_PLACEMENT_FAILED")
                 return
 
-            # Extract trade details
-            executed_qty = float(order_result["executedQty"])
-            fill_price = float(order_result["fills"][0]["price"])
-            commission = float(order_result["fills"][0]["commission"])
-            order_id = order_result["orderId"]
+            # Extract entry order details
+            entry_order = oco_result['entry_order']
+            oco_order = oco_result['oco_order']
+            executed_qty = float(entry_order["executedQty"])
+            fill_price = float(entry_order["fills"][0]["price"])
+            commission = float(entry_order["fills"][0]["commission"])
+            order_id = entry_order["orderId"]
+            oco_order_id = oco_order.get("orderListId", None)
             
             logger.info(f"✅ [User {user_id}] ORDER FILLED:")
             logger.info(f"   🆔 Order ID: {order_id}")
-            logger.info(f"   📊 Executed Qty: {executed_qty:.6f}")
+            logger.info(f"   � OCO Order ID: {oco_order_id}")
+            logger.info(f"   �📊 Executed Qty: {executed_qty:.6f}")
             logger.info(f"   💰 Fill Price: ${fill_price:.4f}")
             logger.info(f"   💸 Commission: ${commission:.4f}")
+            logger.info(f"   🎯 TP Order Active: ${take_profit_price:.4f}")
+            logger.info(f"   🛑 SL Order Active: ${stop_loss_price:.4f}")
 
             # Record trade in database
             logger.debug(f"💾 [User {user_id}] Recording trade in database...")
@@ -484,6 +672,7 @@ class TradingBot:
                 is_test_trade=config.is_test_mode,
                 strategy_used="scalping_ai",
                 ai_signal_confidence=float(signal.get("final_confidence", signal.get("confidence", 0))),
+                oco_order_id=str(oco_order_id) if oco_order_id else None,
             )
 
             db.add(trade)
@@ -497,12 +686,13 @@ class TradingBot:
                 side=side.lower(),
                 amount=executed_qty,
                 entry_price=fill_price,
-                stop_loss=float(signal.get('stop_loss', 0)) if signal.get('stop_loss') else None,
-                take_profit=float(signal.get('take_profit', 0)) if signal.get('take_profit') else None,
+                stop_loss=stop_loss_price,
+                take_profit=take_profit_price,
                 trade_id=str(order_id),
                 entry_value=executed_qty * fill_price,
                 fees_paid=commission,
-                is_test_trade=config.is_test_mode
+                is_test_trade=config.is_test_mode,
+                oco_order_id=str(oco_order_id) if oco_order_id else None,
             )
             
             db.add(open_position)
@@ -516,11 +706,12 @@ class TradingBot:
                 'side': side.lower(),
                 'amount': executed_qty,
                 'entry_price': fill_price,
-                'stop_loss': float(signal.get('stop_loss', 0)),
-                'take_profit': float(signal.get('take_profit', 0)),
+                'stop_loss': stop_loss_price,
+                'take_profit': take_profit_price,
                 'entry_time': trade_start_time,
                 'entry_value': executed_qty * fill_price,
-                'fees_paid': commission
+                'fees_paid': commission,
+                'oco_order_id': str(oco_order_id) if oco_order_id else None,
             }
             
             self.risk_manager.add_open_position(user_id, position_data)
@@ -532,23 +723,25 @@ class TradingBot:
             total_cost = executed_qty * fill_price + commission
             trade_duration = (datetime.now(timezone.utc) - trade_start_time).total_seconds()
             
-            # Get current account balance
-            current_balance = self.risk_manager.get_account_balance(user_id)
+            # Get current Binance account balance for accurate reporting
+            fresh_balances = self.binance.get_account_balance()
+            current_usdt_balance = fresh_balances.get("USDT", {}).get("free", 0.0)
             
             # Log comprehensive trade entry with structured format
-            logger.info(f"� [User {user_id}] POSITION OPENED:")
+            logger.info(f"📈 [User {user_id}] POSITION OPENED:")
             logger.info(f"   📊 Trade: {side} {executed_qty:.6f} {symbol}")
             logger.info(f"   💰 Entry Price: ${fill_price:.4f}")
-            logger.info(f"   🎯 Take Profit: ${signal.get('take_profit', 0):.4f}")
-            logger.info(f"   � Stop Loss: ${signal.get('stop_loss', 0):.4f}")
+            logger.info(f"   🎯 Take Profit: ${take_profit_price:.4f} (OCO Active)")
+            logger.info(f"   🛑 Stop Loss: ${stop_loss_price:.4f} (OCO Active)")
             logger.info(f"   💵 Position Value: ${total_cost:.2f}")
-            logger.info(f"   � Entry Fee: ${commission:.4f}")
+            logger.info(f"   💸 Entry Fee: ${commission:.4f}")
             logger.info(f"   ⏱️  Execution Time: {trade_duration:.2f}s")
-            logger.info(f"   🏦 Account Balance: ${current_balance:.2f}")
+            logger.info(f"   🏦 Binance USDT Balance: ${current_usdt_balance:.2f}")
             logger.info(f"   🧠 AI Confidence: {signal.get('final_confidence', signal.get('confidence', 0)):.1f}%")
+            logger.info(f"   🤖 OCO Order: {oco_order_id}")
 
             # Log to metrics file for analysis
-            metrics_logger.info(f"POSITION_OPENED | USER={user_id} | SYMBOL={symbol} | SIDE={side} | QTY={executed_qty:.6f} | ENTRY=${fill_price:.4f} | TP=${signal.get('take_profit', 0):.4f} | SL=${signal.get('stop_loss', 0):.4f} | VALUE=${total_cost:.2f} | FEE=${commission:.4f} | CONFIDENCE={signal.get('final_confidence', signal.get('confidence', 0)):.1f} | BALANCE=${current_balance:.2f} | TEST={config.is_test_mode}")
+            metrics_logger.info(f"POSITION_OPENED | USER={user_id} | SYMBOL={symbol} | SIDE={side} | QTY={executed_qty:.6f} | ENTRY=${fill_price:.4f} | TP=${take_profit_price:.4f} | SL=${stop_loss_price:.4f} | VALUE=${total_cost:.2f} | FEE=${commission:.4f} | CONFIDENCE={signal.get('final_confidence', signal.get('confidence', 0)):.1f} | BALANCE=${current_usdt_balance:.2f} | TEST={config.is_test_mode} | OCO={oco_order_id}")
 
             # Send trade notification
             await self.ws_manager.send_to_user(
@@ -656,11 +849,15 @@ class TradingBot:
                         'take_profit': float(position.take_profit) if position.take_profit else None,
                         'entry_time': position.opened_at,
                         'entry_value': float(position.entry_value),
-                        'fees_paid': float(position.fees_paid)
+                        'fees_paid': float(position.fees_paid),
+                        'oco_order_id': position.oco_order_id if position.oco_order_id else None,
                     }
                     self.risk_manager.add_open_position(position.user_id, position_data)
                 
                 logger.info(f"📊 Loaded {len(open_positions)} open positions from database")
+                if open_positions:
+                    oco_count = sum(1 for p in open_positions if p.oco_order_id)
+                    logger.info(f"   🤖 {oco_count} positions have active OCO orders")
                 
         except Exception as e:
             logger.error(f"❌ Error loading open positions from database: {e}")
@@ -702,14 +899,12 @@ class TradingBot:
 
             user_summaries = []
             
-            # Get all user IDs that have open positions or are in risk manager
+            # Get all user IDs that have open positions
             all_user_ids = set()
             all_user_ids.update(self.risk_manager.open_positions.keys())
-            all_user_ids.update(self.risk_manager.account_balances.keys())
             
             for user_id in all_user_ids:
                 open_positions = self.risk_manager.get_open_positions(user_id)
-                balance = self.risk_manager.get_account_balance(user_id)
                 
                 if open_positions:
                     user_position_value = sum(p['entry_value'] for p in open_positions)
@@ -719,8 +914,7 @@ class TradingBot:
                     user_summaries.append({
                         'user_id': user_id,
                         'positions': len(open_positions),
-                        'value': user_position_value,
-                        'balance': balance
+                        'value': user_position_value
                     })
             
             # Log cycle completion
@@ -732,7 +926,7 @@ class TradingBot:
             if user_summaries:
                 logger.info("📋 USER POSITION SUMMARY:")
                 for summary in user_summaries:
-                    logger.info(f"   👤 User {summary['user_id']}: {summary['positions']} positions, ${summary['value']:.2f} invested, ${summary['balance']:.2f} balance")
+                    logger.info(f"   👤 User {summary['user_id']}: {summary['positions']} positions, ${summary['value']:.2f} invested")
             else:
                 logger.info("📋 No open positions across all users")
                 

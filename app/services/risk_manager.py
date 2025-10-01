@@ -12,7 +12,6 @@ class RiskManager:
         self.max_daily_trades = {}
         self.daily_trade_count = {}
         self.open_positions = {}  # {user_id: [position_objects]}
-        self.account_balances = {}  # {user_id: balance}
 
     def calculate_position_size(
         self,
@@ -70,6 +69,16 @@ class RiskManager:
             # Check if trading is active
             if not config.get("is_active", False):
                 return False, "Trading bot is not active", {}
+
+            # CRITICAL: Check for existing open positions (ONE TRADE AT A TIME POLICY)
+            existing_positions = self.get_open_positions(user_id)
+            if existing_positions:
+                position_details = existing_positions[0]  # Get first position for details
+                return (
+                    False, 
+                    f"User already has {len(existing_positions)} open position(s) for {position_details['symbol']}. Only one trade allowed at a time.",
+                    {}
+                )
 
             # Check daily trade limit
             today_count = self.daily_trade_count.get(user_id, 0)
@@ -211,12 +220,6 @@ class RiskManager:
                 # Remove from open positions
                 self.open_positions[user_id].pop(i)
                 
-                # Update account balance
-                if user_id not in self.account_balances:
-                    self.account_balances[user_id] = 10000.0  # Default test balance
-                
-                self.account_balances[user_id] += net_pnl
-                
                 logger.info(f"💰 [User {user_id}] Position CLOSED: {net_pnl:+.2f} USD ({pnl_percentage:+.2f}%) - {exit_reason}")
                 
                 return closed_position
@@ -262,14 +265,6 @@ class RiskManager:
                 })
         
         return positions_to_close
-
-    def get_account_balance(self, user_id: int) -> float:
-        """Get current account balance for user"""
-        return self.account_balances.get(user_id, 10000.0)  # Default test balance
-    
-    def set_account_balance(self, user_id: int, balance: float):
-        """Set account balance for user"""
-        self.account_balances[user_id] = balance
 
     def reset_daily_counters(self):
         """Reset daily trade counters (called at midnight)"""
