@@ -99,9 +99,9 @@ class MockBinanceService:
             return pd.DataFrame()
 
     def place_market_order(
-        self, symbol: str, side: str, quantity: float, test_mode: bool = True
+        self, symbol: str, side: str, quantity: float
     ) -> Dict:
-        """Simulate placing a market order"""
+        """Simulate placing a market order (MockBinanceService always simulates)"""
         try:
             price = self.get_symbol_price(symbol)
             order_id = int(random.random() * 1000000)
@@ -162,12 +162,11 @@ class MockBinanceService:
         quantity: float,
         take_profit_price: float,
         stop_loss_price: float,
-        test_mode: bool = True,
     ) -> Dict:
         """
         Simulate placing an OCO order (entry + TP/SL)
         
-        In mock mode, this simulates:
+        MockBinanceService always simulates:
         1. Entry order execution
         2. OCO order creation on "Binance" (simulated)
         """

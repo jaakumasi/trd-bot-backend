@@ -215,7 +215,7 @@ class TradingBot:
                 logger.debug(f"⏱️  [User {user_id}] Rate limit active: {30 - time_since_last:.1f}s remaining")
                 return
 
-            logger.info(f"📊 [User {user_id}] ANALYZING {symbol} (Test: {'Yes' if config.is_test_mode else 'No'})")
+            logger.info(f"📊 [User {user_id}] ANALYZING {symbol} (Network: {'Testnet' if settings.binance_testnet else 'Mainnet'})")
 
             # Get market data
             logger.debug(f"📈 [User {user_id}] Fetching market data for {symbol}...")
@@ -350,7 +350,6 @@ class TradingBot:
                     symbol=symbol,
                     side=close_side,
                     quantity=position['amount'],
-                    test_mode=config.is_test_mode,
                 )
                 
                 if close_order_result:
@@ -608,7 +607,7 @@ class TradingBot:
             logger.info(f"   📈 Side: {side}")
             logger.info(f"   💰 Quantity: {params['position_size']:.6f}")
             logger.info(f"   💵 Trade Value: ${params.get('trade_value', 0):.2f}")
-            logger.info(f"   🧪 Test Mode: {'Yes' if config.is_test_mode else 'No'}")
+            logger.info(f"   🌐 Binance Network: {'Testnet' if settings.binance_testnet else 'Mainnet (REAL MONEY)'}")
             logger.info(f"   🎯 AI Confidence: {signal.get('final_confidence', signal.get('confidence', 0)):.1f}%")
 
             # Calculate take profit and stop loss prices from signal
@@ -631,7 +630,6 @@ class TradingBot:
                 quantity=params["position_size"],
                 take_profit_price=take_profit_price,
                 stop_loss_price=stop_loss_price,
-                test_mode=config.is_test_mode,
             )
 
             if not oco_result or 'entry_order' not in oco_result:
@@ -741,7 +739,7 @@ class TradingBot:
             logger.info(f"   🤖 OCO Order: {oco_order_id}")
 
             # Log to metrics file for analysis
-            metrics_logger.info(f"POSITION_OPENED | USER={user_id} | SYMBOL={symbol} | SIDE={side} | QTY={executed_qty:.6f} | ENTRY=${fill_price:.4f} | TP=${take_profit_price:.4f} | SL=${stop_loss_price:.4f} | VALUE=${total_cost:.2f} | FEE=${commission:.4f} | CONFIDENCE={signal.get('final_confidence', signal.get('confidence', 0)):.1f} | BALANCE=${current_usdt_balance:.2f} | TEST={config.is_test_mode} | OCO={oco_order_id}")
+            metrics_logger.info(f"POSITION_OPENED | USER={user_id} | SYMBOL={symbol} | SIDE={side} | QTY={executed_qty:.6f} | ENTRY=${fill_price:.4f} | TP=${take_profit_price:.4f} | SL=${stop_loss_price:.4f} | VALUE=${total_cost:.2f} | FEE=${commission:.4f} | CONFIDENCE={signal.get('final_confidence', signal.get('confidence', 0)):.1f} | BALANCE=${current_usdt_balance:.2f} | NETWORK={'TESTNET' if settings.binance_testnet else 'MAINNET'} | IS_TEST_TRADE={config.is_test_mode} | OCO={oco_order_id}")
 
             # Send trade notification
             await self.ws_manager.send_to_user(
@@ -755,7 +753,8 @@ class TradingBot:
                         "price": fill_price,
                         "total_value": total_cost,
                         "confidence": signal.get("final_confidence", signal.get("confidence", 0)),
-                        "test_mode": config.is_test_mode,
+                        "binance_testnet": settings.binance_testnet,
+                        "is_test_trade": config.is_test_mode,
                         "order_id": order_id,
                         "commission": commission,
                     },

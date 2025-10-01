@@ -146,35 +146,20 @@ class BinanceService:
             return pd.DataFrame()
 
     def place_market_order(
-        self, symbol: str, side: str, quantity: float, test_mode: bool = True
+        self, symbol: str, side: str, quantity: float
     ) -> Dict:
-        """Place a market order"""
+        """
+        Place a market order on Binance (Testnet or Mainnet based on settings)
+        
+        The binance_testnet setting determines which API to use:
+        - binance_testnet=True → Uses Binance Testnet (safe for testing)
+        - binance_testnet=False → Uses Binance Mainnet (real money)
+        """
         try:
-            if test_mode:
-                # Simulate order for testing (No real money)
-                price = self.get_symbol_price(symbol)
-                return {
-                    "symbol": symbol,
-                    "orderId": f"TEST_{asyncio.get_event_loop().time()}",
-                    "side": side,
-                    "type": "MARKET",
-                    "quantity": str(quantity),
-                    "price": str(price),
-                    "status": "FILLED",
-                    "executedQty": str(quantity),
-                    "fills": [
-                        {
-                            "price": str(price),
-                            "qty": str(quantity),
-                            "commission": str(quantity * price * 0.001),  # 0.1% fee
-                        }
-                    ],
-                }
-            else:
-                order = self.client.order_market(
-                    symbol=symbol, side=side.upper(), quantity=quantity
-                )
-                return order
+            order = self.client.order_market(
+                symbol=symbol, side=side.upper(), quantity=quantity
+            )
+            return order
         except Exception as e:
             logger.error(f"Error placing {side} order for {symbol}: {e}")
             return {}
@@ -186,10 +171,13 @@ class BinanceService:
         quantity: float,
         take_profit_price: float,
         stop_loss_price: float,
-        test_mode: bool = True,
     ) -> Dict:
         """
-        Place market entry order with OCO (One-Cancels-Other) exit
+        Place market entry order with OCO (One-Cancels-Other) exit on Binance
+        
+        The binance_testnet setting determines which API to use:
+        - binance_testnet=True → Uses Binance Testnet (safe for testing)
+        - binance_testnet=False → Uses Binance Mainnet (real money)
         
         This creates:
         1. Market order for entry (BUY/SELL)
@@ -200,91 +188,41 @@ class BinanceService:
         - If SL hits → position closes with loss, TP cancels
         """
         try:
-            if test_mode:
-                # Simulate OCO for testing
-                price = self.get_symbol_price(symbol)
-                entry_order_id = f"TEST_ENTRY_{asyncio.get_event_loop().time()}"
-                oco_order_id = f"TEST_OCO_{asyncio.get_event_loop().time()}"
-                
-                return {
-                    "entry_order": {
-                        "symbol": symbol,
-                        "orderId": entry_order_id,
-                        "side": side,
-                        "type": "MARKET",
-                        "quantity": str(quantity),
-                        "price": str(price),
-                        "status": "FILLED",
-                        "executedQty": str(quantity),
-                        "fills": [
-                            {
-                                "price": str(price),
-                                "qty": str(quantity),
-                                "commission": str(quantity * price * 0.001),
-                            }
-                        ],
-                    },
-                    "oco_order": {
-                        "orderListId": oco_order_id,
-                        "symbol": symbol,
-                        "listOrderStatus": "EXECUTING",
-                        "orders": [
-                            {
-                                "symbol": symbol,
-                                "orderId": f"TEST_TP_{asyncio.get_event_loop().time()}",
-                                "side": "SELL" if side.upper() == "BUY" else "BUY",
-                                "type": "LIMIT_MAKER",
-                                "price": str(take_profit_price),
-                            },
-                            {
-                                "symbol": symbol,
-                                "orderId": f"TEST_SL_{asyncio.get_event_loop().time()}",
-                                "side": "SELL" if side.upper() == "BUY" else "BUY",
-                                "type": "STOP_LOSS_LIMIT",
-                                "stopPrice": str(stop_loss_price),
-                            },
-                        ],
-                    },
-                    "take_profit_price": take_profit_price,
-                    "stop_loss_price": stop_loss_price,
-                }
+            # Step 1: Place market entry order
+            entry_order = self.client.order_market(
+                symbol=symbol, side=side.upper(), quantity=quantity
+            )
+            
+            logger.info(f"✅ Entry order filled: {entry_order['orderId']}")
+            
+            # Step 2: Determine exit side (opposite of entry)
+            exit_side = "SELL" if side.upper() == "BUY" else "BUY"
+            
+            # Step 3: Calculate stop limit price (slightly worse than stop)
+            if exit_side == "SELL":
+                stop_limit_price = stop_loss_price * 0.999  # 0.1% worse for SELL
             else:
-                # Real Binance execution
-                # Step 1: Place market entry order
-                entry_order = self.client.order_market(
-                    symbol=symbol, side=side.upper(), quantity=quantity
-                )
-                
-                logger.info(f"✅ Entry order filled: {entry_order['orderId']}")
-                
-                # Step 2: Determine exit side (opposite of entry)
-                exit_side = "SELL" if side.upper() == "BUY" else "BUY"
-                
-                # Step 3: Calculate stop limit price (slightly worse than stop)
-                if exit_side == "SELL":
-                    stop_limit_price = stop_loss_price * 0.999  # 0.1% worse for SELL
-                else:
-                    stop_limit_price = stop_loss_price * 1.001  # 0.1% worse for BUY
-                
-                # Step 4: Place OCO order
-                oco_order = self.client.create_oco_order(
-                    symbol=symbol,
-                    side=exit_side,
-                    quantity=quantity,
-                    price=str(take_profit_price),
-                    stopPrice=str(stop_loss_price),
-                    stopLimitPrice=str(stop_limit_price),
-                    stopLimitTimeInForce=TIME_IN_FORCE_GTC,
-                )
-                
-                logger.info(f"✅ OCO order created: {oco_order['orderListId']}")
-                
-                return {
-                    "entry_order": entry_order,
-                    "oco_order": oco_order,
-                    "take_profit_price": take_profit_price,
-                    "stop_loss_price": stop_loss_price,
-                }
+                stop_limit_price = stop_loss_price * 1.001  # 0.1% worse for BUY
+            
+            # Step 4: Place OCO order
+            oco_order = self.client.create_oco_order(
+                symbol=symbol,
+                side=exit_side,
+                quantity=quantity,
+                price=str(take_profit_price),
+                stopPrice=str(stop_loss_price),
+                stopLimitPrice=str(stop_limit_price),
+                stopLimitTimeInForce=TIME_IN_FORCE_GTC,
+            )
+            
+            logger.info(f"✅ OCO order created: {oco_order['orderListId']}")
+            
+            return {
+                "entry_order": entry_order,
+                "oco_order": oco_order,
+                "take_profit_price": take_profit_price,
+                "stop_loss_price": stop_loss_price,
+            }
                 
         except Exception as e:
             logger.error(f"Error placing OCO order for {symbol}: {e}")
@@ -292,7 +230,7 @@ class BinanceService:
 
     def get_oco_order_status(self, order_list_id: str) -> Optional[Dict]:
         """
-        Check the status of an OCO order
+        Check the status of an OCO order on Binance
         
         Returns:
         - Status of the OCO order (EXECUTING, ALL_DONE, REJECTED)
@@ -300,15 +238,6 @@ class BinanceService:
         - Execution details
         """
         try:
-            # For test orders, simulate status
-            if str(order_list_id).startswith("TEST_"):
-                return {
-                    "orderListId": order_list_id,
-                    "listOrderStatus": "EXECUTING",  # Simulated as still active
-                    "orders": []
-                }
-            
-            # Real Binance query
             result = self.client.get_order_list(orderListId=int(order_list_id))
             return result
             
@@ -317,13 +246,9 @@ class BinanceService:
             return None
 
     def cancel_oco_order(self, symbol: str, order_list_id: str) -> bool:
-        """Cancel an active OCO order"""
+        """Cancel an active OCO order on Binance"""
         try:
-            if str(order_list_id).startswith("TEST_"):
-                logger.info(f"✅ Test OCO order cancelled: {order_list_id}")
-                return True
-            
-            result = self.client.cancel_order_list(
+            self.client.cancel_order_list(
                 symbol=symbol,
                 orderListId=int(order_list_id)
             )
