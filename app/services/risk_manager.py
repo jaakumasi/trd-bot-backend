@@ -1,10 +1,27 @@
 import logging
-from typing import Dict, Tuple, Optional, Union
+from typing import Dict, Tuple, Optional, Union, List
 from decimal import Decimal
 from datetime import datetime, timezone
-import asyncio
+
+from .service_constants import (
+    DEFAULT_MAX_DAILY_TRADES,
+    DEFAULT_RISK_PERCENTAGE,
+    EIGHT_DECIMAL_PLACES,
+    MAX_BALANCE_TRADE_RATIO,
+    MIN_ACCOUNT_BALANCE,
+    MIN_SIGNAL_CONFIDENCE,
+    MIN_TRADE_VALUE,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class RiskValidationError(Exception):
+    """Raised when a trade fails risk validation checks."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
 
 
 class RiskManager:
@@ -22,43 +39,50 @@ class RiskManager:
     ) -> float:
         """Calculate safe position size based on risk management rules"""
         try:
-            # Ensure all inputs are floats to avoid type mismatches
-            account_balance = float(account_balance)
-            risk_percentage = float(risk_percentage)
-            entry_price = float(entry_price)
-            stop_loss_price = float(stop_loss_price)
-            
-            logger.debug(f"Position calc inputs: balance=${account_balance:.2f}, risk={risk_percentage}%, entry=${entry_price:.2f}, stop=${stop_loss_price:.2f}")
+            balance = self._to_float(account_balance)
+            risk = self._to_float(risk_percentage)
+            entry = self._to_float(entry_price)
+            stop = self._to_float(stop_loss_price)
 
-            # Calculate risk per trade in USD
-            risk_amount = account_balance * (risk_percentage / 100)
+            logger.debug(
+                "Position calc inputs: balance=$%.2f, risk=%s%%, entry=$%.2f, stop=$%.2f",
+                balance,
+                risk,
+                entry,
+                stop,
+            )
 
-            # Calculate price difference (risk per unit)
-            price_risk = abs(entry_price - stop_loss_price)
-
+            price_risk = abs(entry - stop)
             if price_risk == 0:
                 logger.warning("Price risk is zero - entry price equals stop loss price")
                 return 0.0
 
-            # Calculate position size
-            position_size = risk_amount / price_risk
-            logger.debug(f"Initial position size: {position_size:.8f}")
+            position_size = self._risk_amount(balance, risk) / price_risk
+            logger.debug("Initial position size: %.8f", position_size)
 
-            # Ensure we don't risk more than intended
-            max_position_value = account_balance * 0.1  # Max 10% of balance per trade
-            if position_size * entry_price > max_position_value:
-                position_size = max_position_value / entry_price
-                logger.debug(f"Position size adjusted for max 10% balance: {position_size:.8f}")
+            position_size = self._enforce_max_position(position_size, entry, balance)
+            position_size = self._truncate(position_size)
 
-            # Round down to avoid over-allocation using simple rounding instead of Decimal
-            position_size = float(int(position_size * 100000000) / 100000000)  # 8 decimal places
-            
-            logger.info(f"✅ Calculated position size: {position_size:.8f} (${position_size * entry_price:.2f})")
+            logger.info(
+                "✅ Calculated position size: %.8f ($%.2f)",
+                position_size,
+                position_size * entry,
+            )
             return position_size
 
         except Exception as e:
             logger.error(f"Position size calculation error: {e}")
-            logger.error(f"Inputs - balance: {account_balance} ({type(account_balance)}), risk: {risk_percentage} ({type(risk_percentage)}), entry: {entry_price} ({type(entry_price)}), stop: {stop_loss_price} ({type(stop_loss_price)})")
+            logger.error(
+                "Inputs - balance: %s (%s), risk: %s (%s), entry: %s (%s), stop: %s (%s)",
+                account_balance,
+                type(account_balance),
+                risk_percentage,
+                type(risk_percentage),
+                entry_price,
+                type(entry_price),
+                stop_loss_price,
+                type(stop_loss_price),
+            )
             return 0.0
 
     def validate_trade_signal(
@@ -66,79 +90,48 @@ class RiskManager:
     ) -> Tuple[bool, str, Dict]:
         """Validate if a trade signal meets risk management criteria"""
         try:
-            # Check if trading is active
-            if not config.get("is_active", False):
-                return False, "Trading bot is not active", {}
+            self._assert_trading_active(config)
 
-            # CRITICAL: Check for existing open positions (ONE TRADE AT A TIME POLICY)
             existing_positions = self.get_open_positions(user_id)
-            if existing_positions:
-                position_details = existing_positions[0]  # Get first position for details
-                return (
-                    False, 
-                    f"User already has {len(existing_positions)} open position(s) for {position_details['symbol']}. Only one trade allowed at a time.",
-                    {}
-                )
+            self._assert_no_open_positions(existing_positions)
 
-            # Check daily trade limit
             today_count = self.daily_trade_count.get(user_id, 0)
-            max_trades = config.get("max_daily_trades", 10)
+            self._assert_daily_limit(user_id, today_count, config)
 
-            if today_count >= max_trades:
-                return False, f"Daily trade limit reached ({max_trades})", {}
+            confidence = self._extract_confidence(signal)
+            self._assert_confidence(confidence)
 
-            # Check minimum confidence score
-            confidence = signal.get("final_confidence", 0)
-            if confidence < 60:  # Minimum confidence threshold
-                return False, f"Signal confidence too low: {confidence}%", {}
+            balance = self._to_float(account_balance)
+            self._assert_sufficient_balance(balance)
 
-            # Check account balance
-            if account_balance < 10:  # Minimum $10 to trade
-                return False, "Insufficient account balance for trading", {}
+            entry_price, stop_loss = self._extract_prices(signal)
+            risk_percentage = self._resolve_risk_percentage(config)
 
-            # Calculate position details - ensure all values are floats
-            entry_price = float(signal.get("entry_price", 0))
-            stop_loss = float(signal.get("stop_loss", 0))
-
-            if not entry_price or not stop_loss:
-                return False, "Missing entry price or stop loss in signal", {}
-
-            # Convert risk_percentage from Decimal to float
-            risk_percentage = float(config.get("risk_percentage", 1.0))
-            
             position_size = self.calculate_position_size(
-                account_balance,
+                balance,
                 risk_percentage,
                 entry_price,
                 stop_loss,
             )
 
-            if position_size == 0:
-                return False, "Calculated position size is zero", {}
+            self._assert_position_size(position_size)
 
-            # Calculate trade value - both values are now guaranteed to be floats
-            trade_value = position_size * entry_price
+            trade_value = self._compute_trade_value(position_size, entry_price)
+            self._assert_trade_value(trade_value, balance)
 
-            if trade_value < 10:  # Minimum trade value $10
-                return False, f"Trade value too small: ${trade_value:.2f}", {}
-
-            if trade_value > account_balance * 0.1:  # Max 10% per trade
-                return False, "Trade value exceeds 10% of balance", {}
-
-            # All checks passed
-            take_profit = float(signal.get("take_profit", entry_price * 1.003))  # Default 0.3% profit
-            
             trade_params = {
                 "position_size": position_size,
                 "trade_value": trade_value,
-                "risk_amount": account_balance * (risk_percentage / 100),
+                "risk_amount": self._risk_amount(balance, risk_percentage),
                 "entry_price": entry_price,
                 "stop_loss": stop_loss,
-                "take_profit": take_profit,
+                "take_profit": self._resolve_take_profit(signal, entry_price),
             }
 
             return True, "Trade approved", trade_params
 
+        except RiskValidationError as err:
+            return False, err.message, {}
         except Exception as e:
             logger.error(f"Trade validation error: {e}")
             return False, f"Validation error: {str(e)}", {}
@@ -174,57 +167,30 @@ class RiskManager:
 
     def close_position(self, user_id: int, trade_id: str, exit_price: float, exit_reason: str, fees_paid: float) -> Optional[Dict]:
         """Close a position and calculate P&L"""
-        if user_id not in self.open_positions:
+        position_with_index = self._find_position(user_id, trade_id)
+        if position_with_index is None:
             return None
-            
-        for i, position in enumerate(self.open_positions[user_id]):
-            if position['trade_id'] == trade_id:
-                # Calculate P&L
-                if position['side'].lower() == 'buy':
-                    # For buy positions: profit when price goes up
-                    pnl = (exit_price - position['entry_price']) * position['amount']
-                else:
-                    # For sell positions: profit when price goes down
-                    pnl = (position['entry_price'] - exit_price) * position['amount']
-                
-                # Subtract all fees
-                total_fees = position['fees_paid'] + fees_paid
-                net_pnl = pnl - total_fees
-                
-                # Calculate percentage return
-                pnl_percentage = (net_pnl / position['entry_value']) * 100
-                
-                # Handle timezone-aware and timezone-naive datetime comparison
-                current_time = datetime.now(timezone.utc)
-                entry_time = position['entry_time']
-                
-                # If entry_time is timezone-aware, use it as is; otherwise make it UTC
-                if entry_time.tzinfo is None:
-                    entry_time = entry_time.replace(tzinfo=timezone.utc)
-                
-                duration_seconds = (current_time - entry_time).total_seconds()
-                
-                closed_position = {
-                    **position,
-                    'exit_price': exit_price,
-                    'exit_reason': exit_reason,
-                    'exit_time': current_time,
-                    'exit_fees': fees_paid,
-                    'total_fees': total_fees,
-                    'gross_pnl': pnl,
-                    'net_pnl': net_pnl,
-                    'pnl_percentage': pnl_percentage,
-                    'duration_seconds': duration_seconds
-                }
-                
-                # Remove from open positions
-                self.open_positions[user_id].pop(i)
-                
-                logger.info(f"💰 [User {user_id}] Position CLOSED: {net_pnl:+.2f} USD ({pnl_percentage:+.2f}%) - {exit_reason}")
-                
-                return closed_position
-        
-        return None
+
+        index, position = position_with_index
+        metrics = self._compute_exit_metrics(position, exit_price, fees_paid)
+
+        closed_position = {
+            **position,
+            **metrics,
+            "exit_reason": exit_reason,
+        }
+
+        self.open_positions[user_id].pop(index)
+
+        logger.info(
+            "💰 [User %s] Position CLOSED: %+0.2f USD (%+0.2f%%) - %s",
+            user_id,
+            metrics["net_pnl"],
+            metrics["pnl_percentage"],
+            exit_reason,
+        )
+
+        return closed_position
 
     def check_exit_conditions(self, user_id: int, current_price: float, symbol: str) -> list:
         """Check if any positions should be closed based on current price"""
@@ -232,41 +198,184 @@ class RiskManager:
         
         if user_id not in self.open_positions:
             return positions_to_close
-            
+
         for position in self.open_positions[user_id]:
             if position['symbol'] != symbol:
                 continue
-                
-            should_close = False
-            exit_reason = ""
-            
-            if position['side'].lower() == 'buy':
-                # For buy positions
-                if current_price >= position['take_profit']:
-                    should_close = True
-                    exit_reason = "TAKE_PROFIT"
-                elif current_price <= position['stop_loss']:
-                    should_close = True
-                    exit_reason = "STOP_LOSS"
-            else:
-                # For sell positions
-                if current_price <= position['take_profit']:
-                    should_close = True
-                    exit_reason = "TAKE_PROFIT"
-                elif current_price >= position['stop_loss']:
-                    should_close = True
-                    exit_reason = "STOP_LOSS"
-            
-            if should_close:
-                positions_to_close.append({
-                    'position': position,
-                    'exit_reason': exit_reason,
-                    'current_price': current_price
-                })
-        
+
+            exit_reason = self._determine_exit_reason(position, current_price)
+            if exit_reason:
+                positions_to_close.append(
+                    {
+                        "position": position,
+                        "exit_reason": exit_reason,
+                        "current_price": current_price,
+                    }
+                )
+
         return positions_to_close
 
     def reset_daily_counters(self):
         """Reset daily trade counters (called at midnight)"""
         self.daily_trade_count.clear()
         logger.info("Daily trade counters reset")
+
+    @staticmethod
+    def _to_float(value: Union[float, Decimal, int]) -> float:
+        return float(value)
+
+    @staticmethod
+    def _risk_amount(balance: float, risk_percentage: float) -> float:
+        return balance * (risk_percentage / 100)
+
+    def _enforce_max_position(
+        self, position_size: float, entry_price: float, balance: float
+    ) -> float:
+        max_position_value = balance * MAX_BALANCE_TRADE_RATIO
+        if position_size * entry_price > max_position_value:
+            adjusted = max_position_value / entry_price
+            logger.debug(
+                "Position size adjusted for max balance ratio: %.8f -> %.8f",
+                position_size,
+                adjusted,
+            )
+            return adjusted
+        return position_size
+
+    @staticmethod
+    def _truncate(position_size: float) -> float:
+        truncated = int(position_size * EIGHT_DECIMAL_PLACES) / EIGHT_DECIMAL_PLACES
+        return float(truncated)
+
+    @staticmethod
+    def _compute_trade_value(position_size: float, entry_price: float) -> float:
+        return position_size * entry_price
+
+    @staticmethod
+    def _extract_confidence(signal: Dict) -> float:
+        return float(signal.get("final_confidence", 0))
+
+    @staticmethod
+    def _extract_prices(signal: Dict) -> Tuple[float, float]:
+        entry_price = float(signal.get("entry_price", 0))
+        stop_loss = float(signal.get("stop_loss", 0))
+        if entry_price <= 0 or stop_loss <= 0:
+            raise RiskValidationError("Missing entry price or stop loss in signal")
+        return entry_price, stop_loss
+
+    @staticmethod
+    def _resolve_risk_percentage(config: Dict) -> float:
+        return float(config.get("risk_percentage", DEFAULT_RISK_PERCENTAGE))
+
+    @staticmethod
+    def _assert_position_size(position_size: float) -> None:
+        if position_size <= 0:
+            raise RiskValidationError("Calculated position size is zero")
+
+    @staticmethod
+    def _assert_confidence(confidence: float) -> None:
+        if confidence < MIN_SIGNAL_CONFIDENCE:
+            raise RiskValidationError(f"Signal confidence too low: {confidence}%")
+
+    @staticmethod
+    def _assert_sufficient_balance(balance: float) -> None:
+        if balance < MIN_ACCOUNT_BALANCE:
+            raise RiskValidationError("Insufficient account balance for trading")
+
+    @staticmethod
+    def _assert_trade_value(trade_value: float, balance: float) -> None:
+        if trade_value < MIN_TRADE_VALUE:
+            raise RiskValidationError(f"Trade value too small: ${trade_value:.2f}")
+        if trade_value > balance * MAX_BALANCE_TRADE_RATIO:
+            raise RiskValidationError("Trade value exceeds 10% of balance")
+
+    @staticmethod
+    def _assert_trading_active(config: Dict) -> None:
+        if not config.get("is_active", False):
+            raise RiskValidationError("Trading bot is not active")
+
+    def _assert_no_open_positions(self, positions: List[Dict]) -> None:
+        if not positions:
+            return
+        position_details = positions[0]
+        raise RiskValidationError(
+            f"User already has {len(positions)} open position(s) for {position_details['symbol']}. Only one trade allowed at a time."
+        )
+
+    def _assert_daily_limit(self, user_id: int, today_count: int, config: Dict) -> None:
+        max_trades = self.max_daily_trades.get(
+            user_id, config.get("max_daily_trades", DEFAULT_MAX_DAILY_TRADES)
+        )
+        if today_count >= max_trades:
+            raise RiskValidationError(f"Daily trade limit reached ({max_trades})")
+
+    def _find_position(self, user_id: int, trade_id: str) -> Optional[Tuple[int, Dict]]:
+        positions = self.open_positions.get(user_id)
+        if not positions:
+            return None
+        for index, position in enumerate(positions):
+            if position.get("trade_id") == trade_id:
+                return index, position
+        return None
+
+    def _compute_exit_metrics(
+        self, position: Dict, exit_price: float, fees_paid: float
+    ) -> Dict:
+        pnl = self._calculate_pnl(position, exit_price)
+        total_fees = position["fees_paid"] + fees_paid
+        net_pnl = pnl - total_fees
+        pnl_percentage = (net_pnl / position["entry_value"]) * 100
+
+        current_time = datetime.now(timezone.utc)
+        entry_time = self._ensure_timezone(position["entry_time"])
+        duration_seconds = (current_time - entry_time).total_seconds()
+
+        return {
+            "exit_price": exit_price,
+            "exit_time": current_time,
+            "exit_fees": fees_paid,
+            "total_fees": total_fees,
+            "gross_pnl": pnl,
+            "net_pnl": net_pnl,
+            "pnl_percentage": pnl_percentage,
+            "duration_seconds": duration_seconds,
+        }
+
+    @staticmethod
+    def _calculate_pnl(position: Dict, exit_price: float) -> float:
+        amount = position["amount"]
+        entry_price = position["entry_price"]
+        side = position["side"].lower()
+        if side == "buy":
+            return (exit_price - entry_price) * amount
+        return (entry_price - exit_price) * amount
+
+    @staticmethod
+    def _ensure_timezone(entry_time: datetime) -> datetime:
+        if entry_time.tzinfo is None:
+            return entry_time.replace(tzinfo=timezone.utc)
+        return entry_time
+
+    @staticmethod
+    def _determine_exit_reason(position: Dict, current_price: float) -> Optional[str]:
+        side = position["side"].lower()
+        take_profit = position["take_profit"]
+        stop_loss = position["stop_loss"]
+
+        if side == "buy":
+            if current_price >= take_profit:
+                return "TAKE_PROFIT"
+            if current_price <= stop_loss:
+                return "STOP_LOSS"
+        else:
+            if current_price <= take_profit:
+                return "TAKE_PROFIT"
+            if current_price >= stop_loss:
+                return "STOP_LOSS"
+        return None
+
+    @staticmethod
+    def _resolve_take_profit(signal: Dict, entry_price: float) -> float:
+        return float(signal.get("take_profit") or (entry_price * 1.003))
+
+

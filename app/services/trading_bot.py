@@ -1,7 +1,8 @@
 import asyncio
 import logging
+from contextlib import suppress
 from datetime import datetime, time, timedelta, timezone
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from ..database import get_db, get_async_session
@@ -15,6 +16,11 @@ from .risk_manager import RiskManager
 from .websocket_manager import WebSocketManager
 from ..logging_config import get_trading_metrics_logger
 from ..config import settings
+from .service_constants import (
+    ANALYSIS_RATE_LIMIT_SECONDS,
+    POSITION_TIMEOUT_MINUTES,
+    TRADING_CYCLE_DELAY_SECONDS,
+)
 import json
 
 logger = logging.getLogger(__name__)
@@ -23,14 +29,7 @@ metrics_logger = get_trading_metrics_logger()
 
 class TradingBot:
     def __init__(self, ws_manager: WebSocketManager):
-        # Choose Binance service based on configuration
-        if settings.use_mock_binance:
-            self.binance = MockBinanceService()
-            logger.info("🧪 Using MOCK Binance service - All trades are simulated!")
-        else:
-            self.binance = BinanceService()
-            logger.info("🔧 Using REAL Binance service")
-            
+        self.binance = self._create_binance_service()
         self.ai_analyzer = AIAnalyzer()
         self.risk_manager = RiskManager()
         self.ws_manager = ws_manager
@@ -38,37 +37,67 @@ class TradingBot:
         self.active_users = {}
         self.last_analysis_time = {}
 
+    def _create_binance_service(self):
+        if settings.use_mock_binance:
+            logger.info("🧪 Using MOCK Binance service - All trades are simulated!")
+            return MockBinanceService()
+
+        logger.info("🔧 Using REAL Binance service")
+        return BinanceService()
+
+    async def _initialize_binance_service(self) -> bool:
+        logger.info("📡 Connecting to Binance API...")
+        binance_connected = await self.binance.initialize()
+        if not binance_connected:
+            logger.error("❌ Failed to initialize Binance service - Trading Bot will not start!")
+            return False
+        logger.info("✅ Binance service initialized successfully")
+        return True
+
+    def _initialize_support_services(self) -> None:
+        logger.info("🧠 Initializing AI Analyzer...")
+        logger.info("✅ AI Analyzer ready")
+        logger.info("🛡️  Initializing Risk Manager...")
+        logger.info("✅ Risk Manager ready")
+        logger.info("🌐 WebSocket Manager ready")
+
+    def _log_initialization_success(self) -> None:
+        logger.info("🤖 Trading Bot initialized successfully")
+        metrics_logger.info("BOT_INITIALIZED | STATUS=SUCCESS")
+
+    def _log_trading_window_status(self) -> None:
+        logger.info(
+            f"⏰ Trading Hours: {settings.trading_active_hours_start} - {settings.trading_active_hours_end}"
+        )
+        current_time = datetime.now(timezone.utc).time()
+        status = "✅ Yes" if self._is_trading_hours(current_time) else "❌ No"
+        logger.info(
+            f"🕐 Current time: {current_time.strftime('%H:%M:%S')} | Trading active: {status}"
+        )
+
+    def _start_background_tasks(self) -> None:
+        self.trading_task = asyncio.create_task(self.trading_loop())
+        logger.info("🔄 Trading loop task created and started!")
+
+        self.daily_reset_task_handle = asyncio.create_task(self.daily_reset_task())
+        logger.info("⏰ Daily reset task created and started!")
+
     async def initialize(self):
         """Initialize all services"""
         try:
             logger.info("🔧 Initializing Trading Bot services...")
-            
-            logger.info("📡 Connecting to Binance API...")
-            binance_connected = await self.binance.initialize()
-            if not binance_connected:
-                logger.error("❌ Failed to initialize Binance service - Trading Bot will not start!")
+
+            if not await self._initialize_binance_service():
                 return False
-            logger.info("✅ Binance service initialized successfully")
 
-            logger.info("🧠 Initializing AI Analyzer...")
-            logger.info("✅ AI Analyzer ready")
-            
-            logger.info("🛡️  Initializing Risk Manager...")
-            
-            # Load open positions from database
+            self._initialize_support_services()
             await self._load_open_positions_from_db()
-            
-            logger.info("✅ Risk Manager ready")
-            
-            logger.info("🌐 WebSocket Manager ready")
-
-            logger.info("🤖 Trading Bot initialized successfully")
-            metrics_logger.info("BOT_INITIALIZED | STATUS=SUCCESS")
+            self._log_initialization_success()
             return True
 
         except Exception as e:
             logger.error(f"❌ Bot initialization failed: {e}")
-            logger.error(f"❌ This means the trading bot will NOT run!")
+            logger.error("❌ This means the trading bot will NOT run!")
             metrics_logger.info(f"BOT_INITIALIZATION_FAILED | ERROR={str(e)}")
             return False
 
@@ -81,26 +110,16 @@ class TradingBot:
         if not initialized:
             return False
 
-        # Log the trading hours configuration
-        logger.info(f"⏰ Trading Hours: {settings.trading_active_hours_start} - {settings.trading_active_hours_end}")
-        
-        # Test current trading hours status
-        current_time = datetime.now(timezone.utc).time()
-        is_trading_time = self._is_trading_hours(current_time)
-        logger.info(f"🕐 Current time: {current_time.strftime('%H:%M:%S')} | Trading active: {'✅ Yes' if is_trading_time else '❌ No'}")
+        self._log_trading_window_status()
 
         self.is_running = True
 
-        # Start main trading loop
-        self.trading_task = asyncio.create_task(self.trading_loop())
-        logger.info("🔄 Trading loop task created and started!")
-
-        # Start daily reset task
-        self.daily_reset_task_handle = asyncio.create_task(self.daily_reset_task())
-        logger.info("⏰ Daily reset task created and started!")
+        self._start_background_tasks()
 
         logger.info("🚀 Trading Bot started and running!")
-        logger.info("⚡ You should see trading cycle logs every 60 seconds")
+        logger.info(
+            f"⚡ You should see trading cycle logs every {TRADING_CYCLE_DELAY_SECONDS} seconds"
+        )
         metrics_logger.info("BOT_STARTED | STATUS=RUNNING")
         return True
 
@@ -112,17 +131,15 @@ class TradingBot:
         # Cancel running tasks
         if hasattr(self, 'trading_task') and not self.trading_task.done():
             self.trading_task.cancel()
-            try:
+            with suppress(asyncio.CancelledError):
                 await self.trading_task
-            except asyncio.CancelledError:
-                logger.debug("Trading task cancelled")
+            logger.debug("Trading task cancelled")
                 
         if hasattr(self, 'daily_reset_task_handle') and not self.daily_reset_task_handle.done():
             self.daily_reset_task_handle.cancel()
-            try:
+            with suppress(asyncio.CancelledError):
                 await self.daily_reset_task_handle
-            except asyncio.CancelledError:
-                logger.debug("Daily reset task cancelled")
+            logger.debug("Daily reset task cancelled")
         
         self.active_users.clear()
         logger.info("🛑 Trading Bot stopped")
@@ -134,302 +151,527 @@ class TradingBot:
         while self.is_running:
             try:
                 cycle_count += 1
-                cycle_start_time = datetime.now(timezone.utc)
-                
-                logger.info(f"🔄 Starting trading cycle #{cycle_count} at {cycle_start_time.strftime('%H:%M:%S')}")
-                
-                # Check if we're in trading hours
-                current_time = datetime.now(timezone.utc).time()
-                if not self._is_trading_hours(current_time):
-                    logger.info(f"⏰ Outside trading hours ({current_time.strftime('%H:%M:%S')}). Next check in 1 minute.")
-                    await asyncio.sleep(60)  # Check again in 1 minute
-                    continue
-
-                # Load active trading configurations
-                async for db in get_db():
-                    active_configs = await self._get_active_trading_configs(db)
-                    total_active_users = len(active_configs)
-                    connected_users = self.ws_manager.get_connected_users()
-                    total_connected = len(connected_users)
-                    connection_count = self.ws_manager.get_connection_count()
-                    
-                    # Log user statistics
-                    logger.info(f"👥 TRADING CYCLE #{cycle_count} STATS:")
-                    logger.info(f"   📊 Active trading users: {total_active_users}")
-                    logger.info(f"   🌐 Connected users: {total_connected}")
-                    logger.info(f"   🔌 Total connections: {connection_count}")
-                    
-                    # Log metrics for analysis
-                    metrics_logger.info(f"CYCLE_{cycle_count} | ACTIVE_USERS={total_active_users} | CONNECTED_USERS={total_connected} | CONNECTIONS={connection_count}")
-                    
-                    if total_active_users == 0:
-                        logger.info("⚠️  No active trading users found")
-                    else:
-                        logger.info(f"🎯 Processing {total_active_users} active trading configurations...")
-
-                    processed_users = 0
-                    for config in active_configs:
-                        try:
-                            processed_users += 1
-                            logger.debug(f"📈 Processing user {config.user_id} ({processed_users}/{total_active_users}) - {config.trading_pair}")
-                            
-                            # Check OCO orders first (automatic TP/SL from Binance)
-                            await self._check_oco_orders(db)
-                            
-                            # Check for manual position exits (fallback if no OCO)
-                            await self._check_position_exits(db, config)
-                            
-                            # Then process new trading signals
-                            await self._process_user_trading(db, config)
-                        except Exception as e:
-                            logger.error(f"❌ Error processing user {config.user_id}: {e}")
-
-                    cycle_duration = (datetime.now(timezone.utc) - cycle_start_time).total_seconds()
-                    
-                    # Log cycle summary with position overview
-                    self._log_cycle_summary(cycle_count, cycle_duration, processed_users)
-                    
-                    break  # Exit the db session loop
-
-                # Wait before next analysis cycle (1 minute for scalping)
-                logger.debug("⏳ Waiting 60 seconds before next cycle...")
-                await asyncio.sleep(60)
-
+                await self._run_trading_cycle(cycle_count)
             except Exception as e:
                 logger.error(f"❌ Trading loop error in cycle #{cycle_count}: {e}")
                 await asyncio.sleep(10)  # Short delay before retry
+
+    async def _run_trading_cycle(self, cycle_count: int) -> None:
+        cycle_start_time = datetime.now(timezone.utc)
+        logger.info(
+            f"🔄 Starting trading cycle #{cycle_count} at {cycle_start_time.strftime('%H:%M:%S')}"
+        )
+
+        current_time = datetime.now(timezone.utc).time()
+        if not self._is_trading_hours(current_time):
+            logger.info(
+                f"⏰ Outside trading hours ({current_time.strftime('%H:%M:%S')}). Next check in {TRADING_CYCLE_DELAY_SECONDS} seconds."
+            )
+            await asyncio.sleep(TRADING_CYCLE_DELAY_SECONDS)
+            return
+
+        async for db in get_db():
+            active_configs = await self._get_active_trading_configs(db)
+            self._log_cycle_stats(cycle_count, active_configs)
+
+            processed_users = await self._process_active_configs(db, active_configs)
+
+            cycle_duration = (
+                datetime.now(timezone.utc) - cycle_start_time
+            ).total_seconds()
+            self._log_cycle_summary(cycle_count, cycle_duration, processed_users)
+            break
+
+        logger.debug(
+            f"⏳ Waiting {TRADING_CYCLE_DELAY_SECONDS} seconds before next cycle..."
+        )
+        await asyncio.sleep(TRADING_CYCLE_DELAY_SECONDS)
+
+    def _log_cycle_stats(self, cycle_count: int, active_configs) -> None:
+        total_active_users = len(active_configs)
+        connected_users = self.ws_manager.get_connected_users()
+        total_connected = len(connected_users)
+        connection_count = self.ws_manager.get_connection_count()
+
+        logger.info(f"👥 TRADING CYCLE #{cycle_count} STATS:")
+        logger.info(f"   📊 Active trading users: {total_active_users}")
+        logger.info(f"   🌐 Connected users: {total_connected}")
+        logger.info(f"   🔌 Total connections: {connection_count}")
+
+        metrics_logger.info(
+            f"CYCLE_{cycle_count} | ACTIVE_USERS={total_active_users} | CONNECTED_USERS={total_connected} | CONNECTIONS={connection_count}"
+        )
+
+        if total_active_users == 0:
+            logger.info("⚠️  No active trading users found")
+        else:
+            logger.info(
+                f"🎯 Processing {total_active_users} active trading configurations..."
+            )
+
+    async def _process_active_configs(
+        self, db: AsyncSession, active_configs
+    ) -> int:
+        total_active_users = len(active_configs)
+        if total_active_users == 0:
+            return 0
+
+        await self._check_oco_orders(db)
+
+        processed_users = 0
+        for config in active_configs:
+            processed_users += 1
+            await self._process_single_config(
+                db, config, processed_users, total_active_users
+            )
+
+        return processed_users
+
+    async def _process_single_config(
+        self,
+        db: AsyncSession,
+        config: TradingConfig,
+        processed_users: int,
+        total_users: int,
+    ) -> None:
+        try:
+            logger.debug(
+                f"📈 Processing user {config.user_id} ({processed_users}/{total_users}) - {config.trading_pair}"
+            )
+            await self._check_position_exits(db, config)
+            await self._process_user_trading(db, config)
+        except Exception as exc:
+            logger.error(f"❌ Error processing user {config.user_id}: {exc}")
 
     async def _process_user_trading(self, db: AsyncSession, config: TradingConfig):
         """Process trading for a specific user"""
         try:
             user_id = config.user_id
             symbol = config.trading_pair
-            
             logger.debug(f"🔍 [User {user_id}] Starting trading analysis for {symbol}")
 
-            # Rate limiting: Don't analyze too frequently per user
-            last_analysis = self.last_analysis_time.get(user_id, 0)
-            time_since_last = asyncio.get_event_loop().time() - last_analysis
-            
-            if time_since_last < 30:  # 30 seconds minimum
-                logger.debug(f"⏱️  [User {user_id}] Rate limit active: {30 - time_since_last:.1f}s remaining")
+            remaining_cooldown = self._remaining_rate_limit(user_id)
+            if remaining_cooldown > 0:
+                logger.debug(
+                    f"⏱️  [User {user_id}] Rate limit active: {remaining_cooldown:.1f}s remaining"
+                )
                 return
 
-            logger.info(f"📊 [User {user_id}] ANALYZING {symbol} (Network: {'Testnet' if settings.binance_testnet else 'Mainnet'})")
-
-            # Get market data
-            logger.debug(f"📈 [User {user_id}] Fetching market data for {symbol}...")
-            kline_data = self.binance.get_kline_data(symbol, "1m", 100)
-            if kline_data.empty:
-                logger.warning(f"⚠️  [User {user_id}] No market data available for {symbol}")
-                return
-
-            current_price = kline_data.iloc[-1]['close'] if not kline_data.empty else 0
-            logger.debug(f"💰 [User {user_id}] Current {symbol} price: ${current_price:.4f}")
-
-            # Get AI analysis
-            logger.debug(f"🤖 [User {user_id}] Running AI analysis...")
-            ai_signal = await self.ai_analyzer.analyze_market_data(symbol, kline_data)
-            self.last_analysis_time[user_id] = asyncio.get_event_loop().time()
-
-            # Validate AI signal response
-            if ai_signal is None:
-                logger.error(f"❌ [User {user_id}] AI analyzer returned None")
-                return
-            
-            if not isinstance(ai_signal, dict):
-                logger.error(f"❌ [User {user_id}] AI analyzer returned invalid type: {type(ai_signal)}")
-                return
-
-            # Ensure required fields exist with defaults
-            signal = ai_signal.get("signal", "hold")
-            confidence = ai_signal.get("confidence", 0)
-            reasoning = ai_signal.get("reasoning", "No reasoning provided")
-
-            # Log AI analysis results
-            signal_emoji = {"buy": "🟢", "sell": "🔴", "hold": "🟡"}.get(signal, "❓")
-            logger.info(f"{signal_emoji} [User {user_id}] AI SIGNAL: {signal.upper()} | Confidence: {confidence:.1f}% | {reasoning}")
-            
-            # Log detailed metrics
-            metrics_logger.info(f"AI_ANALYSIS | USER={user_id} | SYMBOL={symbol} | SIGNAL={signal} | CONFIDENCE={confidence:.1f} | PRICE={current_price:.4f}")
-
-            # Send analysis update via WebSocket
-            await self.ws_manager.send_to_user(
-                user_id,
-                {
-                    "type": "ai_analysis",
-                    "symbol": symbol,
-                    "signal": signal,
-                    "confidence": confidence,
-                    "reasoning": reasoning,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                },
+            logger.info(
+                f"📊 [User {user_id}] ANALYZING {symbol} (Network: {'Testnet' if settings.binance_testnet else 'Mainnet'})"
             )
 
-            # Only proceed if we have a buy/sell signal
-            if signal == "hold":
+            market_snapshot = self._fetch_market_snapshot(symbol, user_id)
+            if market_snapshot is None:
+                return
+
+            kline_data, current_price = market_snapshot
+
+            ai_signal = await self._request_ai_signal(symbol, kline_data, user_id)
+            if ai_signal is None:
+                return
+
+            self._mark_analysis_timestamp(user_id)
+
+            signal_details = self._resolve_signal_details(ai_signal)
+            self._log_ai_analysis(user_id, symbol, signal_details, current_price)
+            await self._emit_ai_analysis(user_id, symbol, signal_details)
+
+            if signal_details["signal"] == "hold":
                 logger.debug(f"⏸️  [User {user_id}] HOLD signal - no action taken")
                 return
 
-            logger.info(f"🎯 [User {user_id}] TRADE SIGNAL DETECTED: {signal.upper()}")
+            logger.info(
+                f"🎯 [User {user_id}] TRADE SIGNAL DETECTED: {signal_details['signal'].upper()}"
+            )
 
-            # Get account balance
-            logger.debug(f"💳 [User {user_id}] Checking account balance...")
-            balances = self.binance.get_account_balance()
-            usdt_balance = balances.get("USDT", {}).get("free", 0.0)
-            logger.info(f"💰 [User {user_id}] Available USDT balance: ${usdt_balance:.2f}")
+            usdt_balance = self._fetch_usdt_balance(user_id)
 
-            # Validate trade with risk management
-            logger.debug(f"🛡️  [User {user_id}] Validating trade with risk management...")
             is_valid, message, trade_params = self.risk_manager.validate_trade_signal(
                 user_id, ai_signal, usdt_balance, config.__dict__
             )
 
             if not is_valid:
-                logger.warning(f"❌ [User {user_id}] TRADE REJECTED: {message}")
-                metrics_logger.info(f"TRADE_REJECTED | USER={user_id} | SYMBOL={symbol} | REASON={message}")
-                await self.ws_manager.send_to_user(
-                    user_id,
-                    {
-                        "type": "trade_rejected",
-                        "reason": message,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    },
-                )
+                await self._handle_trade_rejection(user_id, symbol, message)
                 return
 
-            logger.info(f"✅ [User {user_id}] Trade validation PASSED - proceeding to execution")
-            logger.info(f"📋 [User {user_id}] Trade params: Size=${trade_params.get('trade_value', 0):.2f}, Position=${trade_params.get('position_size', 0):.6f}")
+            self._log_trade_validation_success(user_id, trade_params)
 
-            # Execute trade
             await self._execute_trade(db, config, ai_signal, trade_params)
 
         except Exception as e:
             logger.error(f"❌ [User {user_id}] Error in trading process: {e}")
             metrics_logger.info(f"TRADING_ERROR | USER={user_id} | ERROR={str(e)}")
 
+    def _remaining_rate_limit(self, user_id: int) -> float:
+        last_analysis = self.last_analysis_time.get(user_id)
+        if not last_analysis:
+            return 0.0
+        elapsed = asyncio.get_event_loop().time() - last_analysis
+        remaining = ANALYSIS_RATE_LIMIT_SECONDS - elapsed
+        return remaining if remaining > 0 else 0.0
+
+    def _fetch_market_snapshot(self, symbol: str, user_id: int):
+        logger.debug(f"📈 [User {user_id}] Fetching market data for {symbol}...")
+        kline_data = self.binance.get_kline_data(symbol, "1m", 100)
+        if kline_data.empty:
+            logger.warning(f"⚠️  [User {user_id}] No market data available for {symbol}")
+            return None
+
+        current_price = float(kline_data.iloc[-1]["close"])
+        logger.debug(f"💰 [User {user_id}] Current {symbol} price: ${current_price:.4f}")
+        return kline_data, current_price
+
+    async def _request_ai_signal(self, symbol, kline_data, user_id: int):
+        logger.debug(f"🤖 [User {user_id}] Running AI analysis...")
+        ai_signal = await self.ai_analyzer.analyze_market_data(symbol, kline_data)
+
+        if ai_signal is None:
+            logger.error(f"❌ [User {user_id}] AI analyzer returned None")
+            return None
+
+        if not isinstance(ai_signal, dict):
+            logger.error(
+                f"❌ [User {user_id}] AI analyzer returned invalid type: {type(ai_signal)}"
+            )
+            return None
+
+        return ai_signal
+
+    def _mark_analysis_timestamp(self, user_id: int) -> None:
+        self.last_analysis_time[user_id] = asyncio.get_event_loop().time()
+
+    @staticmethod
+    def _resolve_signal_details(ai_signal: Dict) -> Dict:
+        confidence = float(
+            ai_signal.get("final_confidence", ai_signal.get("confidence", 0))
+        )
+        return {
+            "signal": ai_signal.get("signal", "hold"),
+            "confidence": confidence,
+            "reasoning": ai_signal.get("reasoning", "No reasoning provided"),
+            "raw": ai_signal,
+        }
+
+    def _log_ai_analysis(
+        self, user_id: int, symbol: str, signal_details: Dict, current_price: float
+    ) -> None:
+        signal = signal_details["signal"]
+        confidence = signal_details["confidence"]
+        reasoning = signal_details["reasoning"]
+        signal_emoji = {"buy": "🟢", "sell": "🔴", "hold": "🟡"}.get(signal, "❓")
+
+        logger.info(
+            f"{signal_emoji} [User {user_id}] AI SIGNAL: {signal.upper()} | Confidence: {confidence:.1f}% | {reasoning}"
+        )
+
+        metrics_logger.info(
+            f"AI_ANALYSIS | USER={user_id} | SYMBOL={symbol} | SIGNAL={signal} | CONFIDENCE={confidence:.1f} | PRICE={current_price:.4f}"
+        )
+
+    async def _emit_ai_analysis(
+        self, user_id: int, symbol: str, signal_details: Dict
+    ) -> None:
+        await self.ws_manager.send_to_user(
+            user_id,
+            {
+                "type": "ai_analysis",
+                "symbol": symbol,
+                "signal": signal_details["signal"],
+                "confidence": signal_details["confidence"],
+                "reasoning": signal_details["reasoning"],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    def _fetch_usdt_balance(self, user_id: int) -> float:
+        logger.debug(f"💳 [User {user_id}] Checking account balance...")
+        balances = self.binance.get_account_balance()
+        usdt_balance = balances.get("USDT", {}).get("free", 0.0)
+        logger.info(f"💰 [User {user_id}] Available USDT balance: ${usdt_balance:.2f}")
+        return usdt_balance
+
+    async def _handle_trade_rejection(
+        self, user_id: int, symbol: str, message: str
+    ) -> None:
+        logger.warning(f"❌ [User {user_id}] TRADE REJECTED: {message}")
+        metrics_logger.info(
+            f"TRADE_REJECTED | USER={user_id} | SYMBOL={symbol} | REASON={message}"
+        )
+        await self.ws_manager.send_to_user(
+            user_id,
+            {
+                "type": "trade_rejected",
+                "reason": message,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    def _log_trade_validation_success(self, user_id: int, trade_params: Dict) -> None:
+        logger.info(
+            f"✅ [User {user_id}] Trade validation PASSED - proceeding to execution"
+        )
+        logger.info(
+            f"📋 [User {user_id}] Trade params: Size=${trade_params.get('trade_value', 0):.2f}, Position={trade_params.get('position_size', 0):.6f}"
+        )
+
     async def _check_position_exits(self, db: AsyncSession, config: TradingConfig):
         """Check if any open positions should be closed"""
         try:
             user_id = config.user_id
             symbol = config.trading_pair
-            
-            # Get current open positions for debugging
             current_positions = self.risk_manager.get_open_positions(user_id)
             if current_positions:
-                logger.debug(f"🔍 [User {user_id}] Checking {len(current_positions)} open positions for exits")
-            
-            # Get current price
+                logger.debug(
+                    f"🔍 [User {user_id}] Checking {len(current_positions)} open positions for exits"
+                )
+
             current_price = self.binance.get_symbol_price(symbol)
             if not current_price or current_price <= 0.0:
                 logger.debug(f"❌ [User {user_id}] Invalid current price: {current_price}")
                 return
-            
-            logger.debug(f"💰 [User {user_id}] Current {symbol} price: ${current_price:.4f}")
-            
-            # Check for positions that should be closed
-            positions_to_close = self.risk_manager.check_exit_conditions(user_id, current_price, symbol)
-            
-            if positions_to_close:
-                logger.info(f"🚨 [User {user_id}] Found {len(positions_to_close)} positions ready to close!")
-            else:
-                logger.debug(f"✅ [User {user_id}] No positions ready to close at current price ${current_price:.4f}")
-            
-            for position_info in positions_to_close:
-                position = position_info['position']
-                exit_reason = position_info['exit_reason']
-                
-                logger.info(f"🚨 [User {user_id}] CLOSING POSITION: {exit_reason}")
-                logger.info(f"   📊 Position: {position['side'].upper()} {position['amount']:.6f} {symbol}")
-                logger.info(f"   💰 Entry: ${position['entry_price']:.4f} → Exit: ${current_price:.4f}")
-                
-                # Execute closing order (opposite side)
-                close_side = "SELL" if position['side'].upper() == "BUY" else "BUY"
-                
-                close_order_result = self.binance.place_market_order(
-                    symbol=symbol,
-                    side=close_side,
-                    quantity=position['amount'],
+
+            logger.debug(
+                f"💰 [User {user_id}] Current {symbol} price: ${current_price:.4f}"
+            )
+
+            positions_to_close = self.risk_manager.check_exit_conditions(
+                user_id, current_price, symbol
+            )
+
+            if not positions_to_close:
+                logger.debug(
+                    f"✅ [User {user_id}] No positions ready to close at current price ${current_price:.4f}"
                 )
-                
-                if close_order_result:
-                    # Extract closing order details
-                    executed_qty = float(close_order_result["executedQty"])
-                    exit_price = float(close_order_result["fills"][0]["price"])
-                    exit_commission = float(close_order_result["fills"][0]["commission"])
-                    
-                    # Close the position and calculate P&L
-                    closed_position = self.risk_manager.close_position(
-                        user_id, position['trade_id'], exit_price, exit_reason, exit_commission
-                    )
-                    
-                    if closed_position:
-                        # Log comprehensive exit summary
-                        duration = closed_position['duration_seconds']
-                        duration_str = f"{int(duration//60)}m {int(duration%60)}s" if duration > 60 else f"{duration:.1f}s"
-                        
-                        logger.info(f"🎯 [User {user_id}] POSITION CLOSED SUMMARY:")
-                        logger.info(f"   📈 Trade: {position['side'].upper()} → {close_side}")
-                        logger.info(f"   💰 Entry: ${position['entry_price']:.4f} → Exit: ${exit_price:.4f}")
-                        logger.info(f"   📊 Quantity: {executed_qty:.6f} {symbol}")
-                        logger.info(f"   ⏱️  Duration: {duration_str}")
-                        logger.info(f"   💸 Total Fees: ${closed_position['total_fees']:.4f}")
-                        logger.info(f"   💵 P&L: ${closed_position['net_pnl']:+.2f} ({closed_position['pnl_percentage']:+.2f}%)")
-                        
-                        # Get actual Binance balance for accurate reporting
-                        fresh_balances = self.binance.get_account_balance()
-                        actual_usdt_balance = fresh_balances.get("USDT", {}).get("free", 0.0)
-                        logger.info(f"   🏦 Binance USDT Balance: ${actual_usdt_balance:.2f}")
-                        
-                        # Log to metrics
-                        profit_loss = "PROFIT" if closed_position['net_pnl'] > 0 else "LOSS"
-                        metrics_logger.info(f"POSITION_CLOSED | USER={user_id} | SYMBOL={symbol} | REASON={exit_reason} | PNL=${closed_position['net_pnl']:+.2f} | PCT={closed_position['pnl_percentage']:+.2f}% | DURATION={duration:.0f}s | RESULT={profit_loss}")
-                        
-                        # Record closing trade in database
-                        close_trade = Trade(
-                            user_id=user_id,
-                            trade_id=str(close_order_result["orderId"]),
-                            symbol=symbol,
-                            side=close_side.lower(),
-                            amount=float(executed_qty),
-                            price=float(exit_price),
-                            total_value=float(executed_qty * exit_price),
-                            fee=float(exit_commission),
-                            status="filled",
-                            is_test_trade=config.is_test_mode,
-                            strategy_used="scalping_ai_exit",
-                            ai_signal_confidence=0.0,  # This is a system-generated exit
-                        )
-                        
-                        db.add(close_trade)
-                        await db.commit()
-                        
-                        # Remove open position from database
-                        position_query = select(OpenPosition).where(
-                            OpenPosition.trade_id == position['trade_id']
-                        )
-                        db_position = await db.execute(position_query)
-                        db_position_obj = db_position.scalar_one_or_none()
-                        
-                        if db_position_obj:
-                            await db.delete(db_position_obj)
-                            await db.commit()
-                            logger.debug(f"✅ [User {user_id}] Open position removed from database")
-                        
-                        #Send notification with actual Binance balance
-                        await self.ws_manager.send_to_user(
-                            user_id,
-                            {
-                                "type": "position_closed",
-                                "position": closed_position,
-                                "exit_reason": exit_reason,
-                                "new_balance": actual_usdt_balance,
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                            },
-                        )
-                
+                return
+
+            logger.info(
+                f"� [User {user_id}] Found {len(positions_to_close)} positions ready to close!"
+            )
+
+            for position_info in positions_to_close:
+                await self._handle_position_exit(
+                    db, config, position_info, current_price
+                )
+
         except Exception as e:
             logger.error(f"❌ [User {user_id}] Error checking position exits: {e}")
+
+    async def _handle_position_exit(
+        self,
+        db: AsyncSession,
+        config: TradingConfig,
+        position_info: Dict,
+        current_price: float,
+    ) -> None:
+        user_id = config.user_id
+        symbol = config.trading_pair
+        position = position_info["position"]
+        exit_reason = position_info["exit_reason"]
+
+        logger.info(f"🚨 [User {user_id}] CLOSING POSITION: {exit_reason}")
+        logger.info(
+            f"   📊 Position: {position['side'].upper()} {position['amount']:.6f} {symbol}"
+        )
+        logger.info(
+            f"   💰 Entry: ${position['entry_price']:.4f} → Exit: ${current_price:.4f}"
+        )
+
+        close_side = "SELL" if position["side"].upper() == "BUY" else "BUY"
+        close_order_result = self.binance.place_market_order(
+            symbol=symbol,
+            side=close_side,
+            quantity=position["amount"],
+        )
+
+        if not close_order_result:
+            logger.error(f"❌ [User {user_id}] Failed to place close order for {symbol}")
+            return
+
+        executed_qty = float(close_order_result["executedQty"])
+        exit_price = float(close_order_result["fills"][0]["price"])
+        exit_commission = float(close_order_result["fills"][0]["commission"])
+
+        closed_position = self.risk_manager.close_position(
+            user_id,
+            position["trade_id"],
+            exit_price,
+            exit_reason,
+            exit_commission,
+        )
+
+        if not closed_position:
+            logger.warning(
+                f"⚠️  [User {user_id}] Unable to close position {position['trade_id']}"
+            )
+            return
+
+        await self._finalize_position_close(
+            db=db,
+            config=config,
+            position=position,
+            closed_position=closed_position,
+            close_order_result=close_order_result,
+            close_side=close_side,
+            exit_reason=exit_reason,
+            executed_qty=executed_qty,
+            exit_price=exit_price,
+            exit_commission=exit_commission,
+        )
+
+    async def _finalize_position_close(
+        self,
+        db: AsyncSession,
+        config: TradingConfig,
+        position: Dict,
+        closed_position: Dict,
+        close_order_result: Dict,
+        close_side: str,
+        exit_reason: str,
+        executed_qty: float,
+        exit_price: float,
+        exit_commission: float,
+    ) -> None:
+        user_id = config.user_id
+        symbol = config.trading_pair
+
+        self._log_position_close_summary(
+            user_id,
+            symbol,
+            position,
+            close_side,
+            executed_qty,
+            exit_price,
+            closed_position,
+        )
+
+        fresh_balance = self._get_current_usdt_balance()
+
+        profit_label = (
+            "PROFIT" if closed_position["net_pnl"] > 0 else "LOSS"
+        )
+        metrics_logger.info(
+            f"POSITION_CLOSED | USER={user_id} | SYMBOL={symbol} | REASON={exit_reason} | PNL=${closed_position['net_pnl']:+.2f} | PCT={closed_position['pnl_percentage']:+.2f}% | DURATION={closed_position['duration_seconds']:.0f}s | RESULT={profit_label}"
+        )
+
+        await self._record_closing_trade(
+            db,
+            config,
+            close_order_result,
+            close_side,
+            executed_qty,
+            exit_price,
+            exit_commission,
+        )
+
+        await self._remove_open_position_from_db(db, position["trade_id"])
+
+        await self._notify_position_closed(
+            user_id, closed_position, exit_reason, fresh_balance
+        )
+
+    def _log_position_close_summary(
+        self,
+        user_id: int,
+        symbol: str,
+        position: Dict,
+        close_side: str,
+        executed_qty: float,
+        exit_price: float,
+        closed_position: Dict,
+    ) -> None:
+        duration = closed_position["duration_seconds"]
+        duration_str = (
+            f"{int(duration // 60)}m {int(duration % 60)}s"
+            if duration > 60
+            else f"{duration:.1f}s"
+        )
+
+        logger.info("🎯 [User %s] POSITION CLOSED SUMMARY:", user_id)
+        logger.info(
+            "   📈 Trade: %s → %s",
+            position["side"].upper(),
+            close_side,
+        )
+        logger.info(
+            "   💰 Entry: $%.4f → Exit: $%.4f",
+            position["entry_price"],
+            exit_price,
+        )
+        logger.info("   📊 Quantity: %.6f %s", executed_qty, symbol)
+        logger.info("   ⏱️  Duration: %s", duration_str)
+        logger.info("   💸 Total Fees: $%.4f", closed_position["total_fees"])
+        logger.info(
+            "   💵 P&L: $%+.2f (%+.2f%%)",
+            closed_position["net_pnl"],
+            closed_position["pnl_percentage"],
+        )
+
+    def _get_current_usdt_balance(self) -> float:
+        fresh_balances = self.binance.get_account_balance()
+        balance = fresh_balances.get("USDT", {}).get("free", 0.0)
+        logger.info("   🏦 Binance USDT Balance: $%.2f", balance)
+        return balance
+
+    async def _record_closing_trade(
+        self,
+        db: AsyncSession,
+        config: TradingConfig,
+        close_order_result: Dict,
+        close_side: str,
+        executed_qty: float,
+        exit_price: float,
+        exit_commission: float,
+    ) -> None:
+        close_trade = Trade(
+            user_id=config.user_id,
+            trade_id=str(close_order_result["orderId"]),
+            symbol=config.trading_pair,
+            side=close_side.lower(),
+            amount=float(executed_qty),
+            price=float(exit_price),
+            total_value=float(executed_qty * exit_price),
+            fee=float(exit_commission),
+            status="filled",
+            is_test_trade=config.is_test_mode,
+            strategy_used="scalping_ai_exit",
+            ai_signal_confidence=0.0,
+        )
+
+        db.add(close_trade)
+        await db.commit()
+
+    async def _remove_open_position_from_db(
+        self, db: AsyncSession, trade_id: str
+    ) -> None:
+        position_query = select(OpenPosition).where(OpenPosition.trade_id == trade_id)
+        db_position = await db.execute(position_query)
+        db_position_obj = db_position.scalar_one_or_none()
+
+        if db_position_obj:
+            await db.delete(db_position_obj)
+            await db.commit()
+            logger.debug(
+                f"✅ [DB] Open position removed for trade {trade_id}"
+            )
+
+    async def _notify_position_closed(
+        self,
+        user_id: int,
+        closed_position: Dict,
+        exit_reason: str,
+        actual_usdt_balance: float,
+    ) -> None:
+        await self.ws_manager.send_to_user(
+            user_id,
+            {
+                "type": "position_closed",
+                "position": closed_position,
+                "exit_reason": exit_reason,
+                "new_balance": actual_usdt_balance,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
     async def _check_oco_orders(self, db: AsyncSession):
         """
@@ -437,265 +679,402 @@ class TradingBot:
         This runs periodically to detect when Binance executes TP or SL
         """
         try:
-            # Query all open positions that have OCO orders
-            result = await db.execute(
-                select(OpenPosition).where(OpenPosition.oco_order_id.isnot(None))
-            )
-            positions_with_oco = result.scalars().all()
-            
+            positions_with_oco = await self._get_positions_with_oco(db)
             if not positions_with_oco:
                 logger.debug("🔍 No OCO orders to check")
                 return
-            
+
             logger.debug(f"🔍 Checking {len(positions_with_oco)} OCO orders...")
-            
+
             for position in positions_with_oco:
-                try:
-                    user_id = position.user_id
-                    oco_order_id = position.oco_order_id
-                    symbol = position.symbol
-                    
-                    # Get OCO order status from Binance
-                    oco_status = self.binance.get_oco_order_status(oco_order_id)
-                    
-                    if not oco_status:
-                        logger.warning(f"⚠️  [User {user_id}] Could not get OCO status for {oco_order_id}")
-                        continue
-                    
-                    order_status = oco_status.get('listOrderStatus', 'UNKNOWN')
-                    
-                    # Check if OCO has been executed (one leg filled, other cancelled)
-                    if order_status == 'ALL_DONE':
-                        logger.info(f"🎯 [User {user_id}] OCO ORDER EXECUTED: {oco_order_id}")
-                        
-                        # Determine which leg was executed (TP or SL)
-                        orders = oco_status.get('orders', [])
-                        exit_reason = None
-                        exit_price = None
-                        
-                        for order in orders:
-                            order_status_detail = order.get('status', '')
-                            if order_status_detail == 'FILLED':
-                                order_type = order.get('type', '')
-                                exit_price = float(order.get('price', 0))
-                                
-                                # Determine if it was TP or SL
-                                if 'STOP' in order_type.upper():
-                                    exit_reason = 'STOP_LOSS'
-                                    logger.info(f"🛑 [User {user_id}] Stop Loss triggered at ${exit_price:.4f}")
-                                else:
-                                    exit_reason = 'TAKE_PROFIT'
-                                    logger.info(f"🎯 [User {user_id}] Take Profit triggered at ${exit_price:.4f}")
-                                break
-                        
-                        if not exit_reason or not exit_price:
-                            logger.warning(f"⚠️  [User {user_id}] Could not determine exit details for OCO {oco_order_id}")
-                            continue
-                        
-                        # Calculate P&L
-                        entry_price = float(position.entry_price)
-                        amount = float(position.amount)
-                        entry_fees = float(position.fees_paid)
-                        
-                        # Estimate exit fee (0.1% on Binance)
-                        exit_value = amount * exit_price
-                        exit_fee = exit_value * 0.001
-                        
-                        # Calculate P&L based on position side
-                        if position.side.upper() == 'BUY':
-                            profit_loss = (exit_price - entry_price) * amount - entry_fees - exit_fee
-                        else:  # SELL
-                            profit_loss = (entry_price - exit_price) * amount - entry_fees - exit_fee
-                        
-                        profit_loss_pct = (profit_loss / float(position.entry_value)) * 100
-                        duration = (datetime.now(timezone.utc) - position.opened_at).total_seconds()
-                        
-                        # Update the original trade record
-                        trade_query = select(Trade).where(Trade.trade_id == position.trade_id)
-                        trade_result = await db.execute(trade_query)
-                        trade_obj = trade_result.scalar_one_or_none()
-                        
-                        if trade_obj:
-                            trade_obj.closed_at = datetime.now(timezone.utc)
-                            trade_obj.exit_price = exit_price
-                            trade_obj.exit_fee = exit_fee
-                            trade_obj.exit_reason = exit_reason
-                            trade_obj.profit_loss = profit_loss
-                            trade_obj.profit_loss_percentage = profit_loss_pct
-                            trade_obj.duration_seconds = int(duration)
-                            trade_obj.status = 'closed'
-                            
-                            await db.commit()
-                            logger.debug(f"✅ [User {user_id}] Trade record updated in database")
-                        
-                        # Remove open position from database
-                        await db.delete(position)
-                        await db.commit()
-                        logger.debug(f"✅ [User {user_id}] Open position removed from database")
-                        
-                        # Remove from risk manager tracking
-                        self.risk_manager.close_position(
-                            user_id, 
-                            position.trade_id, 
-                            exit_price, 
-                            exit_reason,
-                            exit_fee
-                        )
-                        
-                        # Get fresh balance
-                        fresh_balances = self.binance.get_account_balance()
-                        actual_usdt_balance = fresh_balances.get("USDT", {}).get("free", 0.0)
-                        
-                        # Log comprehensive exit
-                        profit_emoji = "💰" if profit_loss > 0 else "📉"
-                        logger.info(f"{profit_emoji} [User {user_id}] POSITION CLOSED VIA OCO:")
-                        logger.info(f"   📊 {position.side.upper()} {amount:.6f} {symbol}")
-                        logger.info(f"   📈 Entry: ${entry_price:.4f} → Exit: ${exit_price:.4f}")
-                        logger.info(f"   🎯 Reason: {exit_reason}")
-                        logger.info(f"   💵 P&L: ${profit_loss:.2f} ({profit_loss_pct:+.2f}%)")
-                        logger.info(f"   💸 Total Fees: ${entry_fees + exit_fee:.4f}")
-                        logger.info(f"   ⏱️  Duration: {duration/60:.1f} minutes")
-                        logger.info(f"   🏦 Binance USDT Balance: ${actual_usdt_balance:.2f}")
-                        
-                        # Log to metrics
-                        metrics_logger.info(f"OCO_POSITION_CLOSED | USER={user_id} | SYMBOL={symbol} | REASON={exit_reason} | ENTRY=${entry_price:.4f} | EXIT=${exit_price:.4f} | PL=${profit_loss:.2f} | PL_PCT={profit_loss_pct:+.2f} | DURATION={duration:.0f}s | BALANCE=${actual_usdt_balance:.2f}")
-                        
-                        # Send WebSocket notification
-                        await self.ws_manager.send_to_user(
-                            user_id,
-                            {
-                                "type": "oco_position_closed",
-                                "position": {
-                                    "symbol": symbol,
-                                    "side": position.side,
-                                    "amount": amount,
-                                    "entry_price": entry_price,
-                                    "exit_price": exit_price,
-                                    "profit_loss": profit_loss,
-                                    "profit_loss_percentage": profit_loss_pct,
-                                },
-                                "exit_reason": exit_reason,
-                                "new_balance": actual_usdt_balance,
-                                "timestamp": datetime.now(timezone.utc).isoformat(),
-                            },
-                        )
-                        
-                    elif order_status == 'EXECUTING':
-                        logger.debug(f"⏳ [User {user_id}] OCO {oco_order_id} still active for {symbol}")
-                        
-                        # Check if position has been open too long (manual timeout)
-                        time_open = (datetime.now(timezone.utc) - position.opened_at).total_seconds() / 3600  # hours
-                        MAX_POSITION_HOURS = 2  # Close positions after 2 hours
-                        
-                        if time_open > MAX_POSITION_HOURS:
-                            logger.warning(f"⏰ [User {user_id}] Position {position.trade_id} open for {time_open:.1f} hours - FORCE CLOSING")
-                            
-                            # Cancel existing OCO order
-                            cancel_success = self.binance.cancel_oco_order(symbol, oco_order_id)
-                            if not cancel_success:
-                                logger.error(f"❌ [User {user_id}] Failed to cancel OCO {oco_order_id}")
-                                continue
-                            
-                            # Get current market price
-                            current_price = self.binance.get_symbol_price(symbol)
-                            
-                            # Place market exit order
-                            exit_side = "SELL" if position.side.upper() == "BUY" else "BUY"
-                            
-                            try:
-                                exit_order = self.binance.client.order_market(
-                                    symbol=symbol,
-                                    side=exit_side,
-                                    quantity=float(position.amount)
-                                )
-                                
-                                exit_price = float(exit_order["fills"][0]["price"])
-                                exit_fee = float(exit_order["fills"][0]["commission"])
-                                
-                                # Calculate P&L
-                                entry_price = float(position.entry_price)
-                                amount = float(position.amount)
-                                entry_fees = float(position.fees_paid)
-                                
-                                if position.side.upper() == 'BUY':
-                                    profit_loss = (exit_price - entry_price) * amount - entry_fees - exit_fee
-                                else:
-                                    profit_loss = (entry_price - exit_price) * amount - entry_fees - exit_fee
-                                
-                                profit_loss_pct = (profit_loss / float(position.entry_value)) * 100
-                                
-                                # Update trade record
-                                trade_query = select(Trade).where(Trade.trade_id == position.trade_id)
-                                trade_result = await db.execute(trade_query)
-                                trade_obj = trade_result.scalar_one_or_none()
-                                
-                                if trade_obj:
-                                    trade_obj.closed_at = datetime.now(timezone.utc)
-                                    trade_obj.exit_price = exit_price
-                                    trade_obj.exit_fee = exit_fee
-                                    trade_obj.exit_reason = "TIMEOUT_AUTO_CLOSE"
-                                    trade_obj.profit_loss = profit_loss
-                                    trade_obj.profit_loss_percentage = profit_loss_pct
-                                    trade_obj.duration_seconds = int(time_open * 3600)
-                                    trade_obj.status = 'closed'
-                                    await db.commit()
-                                
-                                # Remove position
-                                await db.delete(position)
-                                await db.commit()
-                                
-                                # Remove from risk manager
-                                self.risk_manager.close_position(
-                                    user_id, 
-                                    position.trade_id, 
-                                    exit_price, 
-                                    "TIMEOUT_AUTO_CLOSE",
-                                    exit_fee
-                                )
-                                
-                                # Get fresh balance
-                                fresh_balances = self.binance.get_account_balance()
-                                actual_usdt_balance = fresh_balances.get("USDT", {}).get("free", 0.0)
-                                
-                                logger.info(f"⏰ [User {user_id}] POSITION FORCE CLOSED (TIMEOUT):")
-                                logger.info(f"   📊 {position.side.upper()} {amount:.6f} {symbol}")
-                                logger.info(f"   📈 Entry: ${entry_price:.4f} → Exit: ${exit_price:.4f}")
-                                logger.info(f"   💵 P&L: ${profit_loss:.2f} ({profit_loss_pct:+.2f}%)")
-                                logger.info(f"   ⏱️  Duration: {time_open:.1f} hours")
-                                logger.info(f"   🏦 USDT Balance: ${actual_usdt_balance:.2f}")
-                                
-                                # Send notification
-                                await self.ws_manager.send_to_user(
-                                    user_id,
-                                    {
-                                        "type": "position_timeout_closed",
-                                        "position": {
-                                            "symbol": symbol,
-                                            "side": position.side,
-                                            "amount": amount,
-                                            "entry_price": entry_price,
-                                            "exit_price": exit_price,
-                                            "profit_loss": profit_loss,
-                                            "profit_loss_percentage": profit_loss_pct,
-                                        },
-                                        "exit_reason": "TIMEOUT_AUTO_CLOSE",
-                                        "new_balance": actual_usdt_balance,
-                                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                                    },
-                                )
-                                
-                            except Exception as close_error:
-                                logger.error(f"❌ [User {user_id}] Failed to force close position: {close_error}")
-                    
-                    else:
-                        logger.warning(f"⚠️  [User {user_id}] OCO {oco_order_id} has unexpected status: {order_status}")
-                        
-                except Exception as e:
-                    logger.error(f"❌ Error processing OCO order {position.oco_order_id}: {e}")
-                    continue
-                    
+                await self._process_oco_position(db, position)
+
         except Exception as e:
             logger.error(f"❌ Error in _check_oco_orders: {e}")
+
+    async def _get_positions_with_oco(self, db: AsyncSession):
+        result = await db.execute(
+            select(OpenPosition).where(OpenPosition.oco_order_id.isnot(None))
+        )
+        return result.scalars().all()
+
+    async def _process_oco_position(self, db: AsyncSession, position: OpenPosition):
+        try:
+            user_id = position.user_id
+            oco_order_id = position.oco_order_id
+            symbol = position.symbol
+
+            oco_status = self.binance.get_oco_order_status(oco_order_id)
+            if not oco_status:
+                logger.warning(
+                    f"⚠️  [User {user_id}] Could not get OCO status for {oco_order_id}"
+                )
+                return
+
+            order_status = oco_status.get("listOrderStatus", "UNKNOWN")
+
+            if order_status == "ALL_DONE":
+                logger.info(f"🎯 [User {user_id}] OCO ORDER EXECUTED: {oco_order_id}")
+                await self._handle_oco_all_done(db, position, oco_status)
+            elif order_status == "EXECUTING":
+                logger.debug(
+                    f"⏳ [User {user_id}] OCO {oco_order_id} still active for {symbol}"
+                )
+                await self._handle_oco_executing(db, position)
+            else:
+                logger.warning(
+                    f"⚠️  [User {user_id}] OCO {oco_order_id} has unexpected status: {order_status}"
+                )
+
+        except Exception as exc:
+            logger.error(
+                f"❌ Error processing OCO order {position.oco_order_id}: {exc}"
+            )
+
+    async def _handle_oco_all_done(
+        self, db: AsyncSession, position: OpenPosition, oco_status: Dict
+    ) -> None:
+        user_id = position.user_id
+        symbol = position.symbol
+
+        exit_reason, exit_price = self._extract_oco_exit_details(oco_status)
+        if not exit_reason or not exit_price:
+            logger.warning(
+                f"⚠️  [User {user_id}] Could not determine exit details for OCO {position.oco_order_id}"
+            )
+            return
+
+        amount = float(position.amount)
+        entry_price = float(position.entry_price)
+        entry_fees = float(position.fees_paid)
+        exit_fee = self._estimate_exit_fee(amount, exit_price)
+        profit_loss = self._calculate_profit_loss(
+            position.side, entry_price, exit_price, amount, entry_fees, exit_fee
+        )
+        profit_loss_pct = (profit_loss / float(position.entry_value)) * 100
+        duration = (datetime.now(timezone.utc) - position.opened_at).total_seconds()
+
+        await self._update_trade_record_after_exit(
+            db,
+            position.trade_id,
+            exit_price,
+            exit_fee,
+            exit_reason,
+            profit_loss,
+            profit_loss_pct,
+            duration,
+        )
+
+        await self._delete_position_record(db, position)
+
+        closed_position = self.risk_manager.close_position(
+            user_id, position.trade_id, exit_price, exit_reason, exit_fee
+        )
+
+        if not closed_position:
+            logger.warning(
+                f"⚠️  [User {user_id}] Risk manager could not close position {position.trade_id}"
+            )
+            return
+
+        actual_usdt_balance = self._get_current_usdt_balance()
+
+        self._log_oco_position_closed(
+            user_id,
+            symbol,
+            position.side,
+            amount,
+            entry_price,
+            exit_price,
+            exit_reason,
+            profit_loss,
+            profit_loss_pct,
+            entry_fees + exit_fee,
+            duration,
+            actual_usdt_balance,
+        )
+
+        metrics_logger.info(
+            f"OCO_POSITION_CLOSED | USER={user_id} | SYMBOL={symbol} | REASON={exit_reason} | ENTRY=${entry_price:.4f} | EXIT=${exit_price:.4f} | PL=${profit_loss:.2f} | PL_PCT={profit_loss_pct:+.2f} | DURATION={duration:.0f}s | BALANCE=${actual_usdt_balance:.2f}"
+        )
+
+        await self._notify_oco_position_closed(
+            user_id,
+            symbol,
+            position.side,
+            amount,
+            entry_price,
+            exit_price,
+            profit_loss,
+            profit_loss_pct,
+            exit_reason,
+            actual_usdt_balance,
+        )
+
+    async def _handle_oco_executing(
+        self, db: AsyncSession, position: OpenPosition
+    ) -> None:
+        minutes_open = (
+            datetime.now(timezone.utc) - position.opened_at
+        ).total_seconds() / 60
+
+        if minutes_open <= POSITION_TIMEOUT_MINUTES:
+            return
+
+        logger.warning(
+            f"⏰ [User {position.user_id}] Position {position.trade_id} open for {minutes_open:.1f} minutes - FORCE CLOSING"
+        )
+
+        cancel_success = self.binance.cancel_oco_order(
+            position.symbol, position.oco_order_id
+        )
+        if not cancel_success:
+            logger.error(
+                f"❌ [User {position.user_id}] Failed to cancel OCO {position.oco_order_id}"
+            )
+            return
+
+        await self._force_close_timed_out_position(db, position, minutes_open)
+
+    @staticmethod
+    def _extract_oco_exit_details(oco_status: Dict) -> Tuple[Optional[str], Optional[float]]:
+        for order in oco_status.get("orders", []):
+            if order.get("status") != "FILLED":
+                continue
+            order_type = order.get("type", "")
+            price = float(order.get("price", 0))
+            if "STOP" in order_type.upper():
+                return "STOP_LOSS", price
+            return "TAKE_PROFIT", price
+        return None, None
+
+    @staticmethod
+    def _estimate_exit_fee(amount: float, exit_price: float) -> float:
+        return amount * exit_price * 0.001
+
+    @staticmethod
+    def _calculate_profit_loss(
+        side: str,
+        entry_price: float,
+        exit_price: float,
+        amount: float,
+        entry_fees: float,
+        exit_fee: float,
+    ) -> float:
+        side_upper = side.upper()
+        if side_upper == "BUY":
+            gross = (exit_price - entry_price) * amount
+        else:
+            gross = (entry_price - exit_price) * amount
+        return gross - entry_fees - exit_fee
+
+    async def _update_trade_record_after_exit(
+        self,
+        db: AsyncSession,
+        trade_id: str,
+        exit_price: float,
+        exit_fee: float,
+        exit_reason: str,
+        profit_loss: float,
+        profit_loss_pct: float,
+        duration_seconds: float,
+    ) -> None:
+        trade_query = select(Trade).where(Trade.trade_id == trade_id)
+        trade_result = await db.execute(trade_query)
+        trade_obj = trade_result.scalar_one_or_none()
+
+        if trade_obj:
+            trade_obj.closed_at = datetime.now(timezone.utc)
+            trade_obj.exit_price = exit_price
+            trade_obj.exit_fee = exit_fee
+            trade_obj.exit_reason = exit_reason
+            trade_obj.profit_loss = profit_loss
+            trade_obj.profit_loss_percentage = profit_loss_pct
+            trade_obj.duration_seconds = int(duration_seconds)
+            trade_obj.status = "closed"
+            await db.commit()
+            logger.debug(f"✅ Trade record {trade_id} updated in database")
+
+    async def _delete_position_record(
+        self, db: AsyncSession, position: OpenPosition
+    ) -> None:
+        await db.delete(position)
+        await db.commit()
+        logger.debug(
+            f"✅ [User {position.user_id}] Open position {position.trade_id} removed from database"
+        )
+
+    def _log_oco_position_closed(
+        self,
+        user_id: int,
+        symbol: str,
+        side: str,
+        amount: float,
+        entry_price: float,
+        exit_price: float,
+        exit_reason: str,
+        profit_loss: float,
+        profit_loss_pct: float,
+        total_fees: float,
+        duration_seconds: float,
+        actual_usdt_balance: float,
+    ) -> None:
+        profit_emoji = "💰" if profit_loss > 0 else "📉"
+        logger.info(f"{profit_emoji} [User {user_id}] POSITION CLOSED VIA OCO:")
+        logger.info(f"   📊 {side.upper()} {amount:.6f} {symbol}")
+        logger.info(f"   📈 Entry: ${entry_price:.4f} → Exit: ${exit_price:.4f}")
+        logger.info(f"   🎯 Reason: {exit_reason}")
+        logger.info(f"   💵 P&L: ${profit_loss:.2f} ({profit_loss_pct:+.2f}%)")
+        logger.info(f"   💸 Total Fees: ${total_fees:.4f}")
+        logger.info(f"   ⏱️  Duration: {duration_seconds/60:.1f} minutes")
+        logger.info(f"   🏦 Binance USDT Balance: ${actual_usdt_balance:.2f}")
+
+    async def _notify_oco_position_closed(
+        self,
+        user_id: int,
+        symbol: str,
+        side: str,
+        amount: float,
+        entry_price: float,
+        exit_price: float,
+        profit_loss: float,
+        profit_loss_pct: float,
+        exit_reason: str,
+        actual_usdt_balance: float,
+    ) -> None:
+        await self.ws_manager.send_to_user(
+            user_id,
+            {
+                "type": "oco_position_closed",
+                "position": {
+                    "symbol": symbol,
+                    "side": side,
+                    "amount": amount,
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "profit_loss": profit_loss,
+                    "profit_loss_percentage": profit_loss_pct,
+                },
+                "exit_reason": exit_reason,
+                "new_balance": actual_usdt_balance,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    async def _force_close_timed_out_position(
+        self, db: AsyncSession, position: OpenPosition, minutes_open: float
+    ) -> None:
+        symbol = position.symbol
+        user_id = position.user_id
+        exit_side = "SELL" if position.side.upper() == "BUY" else "BUY"
+
+        exit_order = self.binance.place_market_order(
+            symbol=symbol, side=exit_side, quantity=float(position.amount)
+        )
+
+        if not exit_order:
+            logger.error(
+                f"❌ [User {user_id}] Failed to force close position {position.trade_id}"
+            )
+            return
+
+        exit_price = float(exit_order["fills"][0]["price"])
+        exit_fee = float(exit_order["fills"][0]["commission"])
+        amount = float(position.amount)
+        entry_price = float(position.entry_price)
+        entry_fees = float(position.fees_paid)
+
+        profit_loss = self._calculate_profit_loss(
+            position.side, entry_price, exit_price, amount, entry_fees, exit_fee
+        )
+        profit_loss_pct = (profit_loss / float(position.entry_value)) * 100
+
+        await self._update_trade_record_after_exit(
+            db,
+            position.trade_id,
+            exit_price,
+            exit_fee,
+            "TIMEOUT_AUTO_CLOSE",
+            profit_loss,
+            profit_loss_pct,
+            minutes_open * 60,
+        )
+
+        await self._delete_position_record(db, position)
+
+        closed_position = self.risk_manager.close_position(
+            user_id,
+            position.trade_id,
+            exit_price,
+            "TIMEOUT_AUTO_CLOSE",
+            exit_fee,
+        )
+
+        if not closed_position:
+            return
+
+        actual_usdt_balance = self._get_current_usdt_balance()
+
+        logger.info("⏰ [User %s] POSITION FORCE CLOSED (TIMEOUT):", user_id)
+        logger.info(
+            "   📊 %s %.6f %s",
+            position.side.upper(),
+            amount,
+            symbol,
+        )
+        logger.info(
+            "   📈 Entry: $%.4f → Exit: $%.4f",
+            entry_price,
+            exit_price,
+        )
+        logger.info(
+            "   💵 P&L: $%.2f (%+.2f%%)", profit_loss, profit_loss_pct
+        )
+        logger.info("   ⏱️  Duration: %.1f minutes", minutes_open)
+        logger.info("   🏦 USDT Balance: $%.2f", actual_usdt_balance)
+
+        await self._notify_position_timeout_closed(
+            user_id,
+            symbol,
+            position.side,
+            amount,
+            entry_price,
+            exit_price,
+            profit_loss,
+            profit_loss_pct,
+            actual_usdt_balance,
+        )
+
+    async def _notify_position_timeout_closed(
+        self,
+        user_id: int,
+        symbol: str,
+        side: str,
+        amount: float,
+        entry_price: float,
+        exit_price: float,
+        profit_loss: float,
+        profit_loss_pct: float,
+        new_balance: float,
+    ) -> None:
+        await self.ws_manager.send_to_user(
+            user_id,
+            {
+                "type": "position_timeout_closed",
+                "position": {
+                    "symbol": symbol,
+                    "side": side,
+                    "amount": amount,
+                    "entry_price": entry_price,
+                    "exit_price": exit_price,
+                    "profit_loss": profit_loss,
+                    "profit_loss_percentage": profit_loss_pct,
+                },
+                "exit_reason": "TIMEOUT_AUTO_CLOSE",
+                "new_balance": new_balance,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
 
     async def _execute_trade(
         self, db: AsyncSession, config: TradingConfig, signal: Dict, params: Dict

@@ -5,6 +5,10 @@ from typing import Dict, List, Optional
 import pandas as pd
 import numpy as np
 from ..config import settings
+from .service_constants import (
+    OCO_BUY_STOP_LIMIT_BUFFER,
+    OCO_SELL_STOP_LIMIT_BUFFER,
+)
 import logging
 import time
 
@@ -97,77 +101,103 @@ class BinanceService:
             logger.error(f"Error formatting quantity for {symbol}: {e}")
             return quantity
 
-    async def initialize(self):
-        """Initialize connection and validate API keys"""
+    def format_price(self, symbol: str, price: float) -> float:
+        """
+        Format price to meet Binance PRICE_FILTER requirements
+        
+        PRICE_FILTER requires:
+        - price >= minPrice
+        - price <= maxPrice
+        - (price - minPrice) % tickSize == 0
+        """
         try:
-            # Test connectivity first (no auth needed)
-            status = self.client.get_system_status()
-            logger.info(f"🌐 Binance {'Testnet' if settings.binance_testnet else 'Live'} network: {status}")
+            symbol_info = self.get_symbol_info(symbol)
+            if not symbol_info:
+                logger.warning(f"⚠️  Could not get symbol info for {symbol}, using price as-is")
+                return price
             
-            # Get server time and calculate offset
-            server_time = self.client.get_server_time()
-            local_time = int(time.time() * 1000)
-            time_offset = server_time['serverTime'] - local_time
-            logger.info(f"⏰ Time sync - Server: {server_time['serverTime']}, Local: {local_time}, Offset: {time_offset}ms")
+            # Find PRICE_FILTER
+            price_filter = None
+            for f in symbol_info.get('filters', []):
+                if f['filterType'] == 'PRICE_FILTER':
+                    price_filter = f
+                    break
             
-            # Apply timestamp offset to client if significant (>1000ms)
-            if abs(time_offset) > 1000:
-                logger.warning(f"⚠️  Large time offset detected ({time_offset}ms), adjusting client timestamp")
-                self.client.timestamp_offset = time_offset
+            if not price_filter:
+                logger.warning(f"⚠️  No PRICE_FILTER found for {symbol}, using price as-is")
+                return price
             
-            # Test authentication with retries
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    account = self.client.get_account()
-                    self.is_connected = True
-                    logger.info(f"✅ Binance {'Testnet' if settings.binance_testnet else 'Live'} connected successfully")
-                    logger.info(f"📊 Account permissions - Can Trade: {account.get('canTrade', False)}")
-                    return True
-                except Exception as retry_error:
-                    error_str = str(retry_error)
-                    # If it's a timestamp error, try adjusting the offset
-                    if "-1021" in error_str and attempt < max_retries - 1:
-                        logger.warning(f"⚠️  Timestamp error on attempt {attempt + 1}, recalculating offset...")
-                        # Recalculate server time offset
-                        server_time = self.client.get_server_time()
-                        local_time = int(time.time() * 1000)
-                        time_offset = server_time['serverTime'] - local_time
-                        self.client.timestamp_offset = time_offset
-                        logger.info(f"🔄 Updated timestamp offset to {time_offset}ms")
-                        wait_time = (attempt + 1) * 2
-                        await asyncio.sleep(wait_time)
-                    elif attempt < max_retries - 1:
-                        wait_time = (attempt + 1) * 2
-                        logger.warning(f"⚠️  Connection attempt {attempt + 1} failed, retrying in {wait_time}s: {retry_error}")
-                        await asyncio.sleep(wait_time)
-                    else:
-                        raise retry_error
+            min_price = float(price_filter['minPrice'])
+            max_price = float(price_filter['maxPrice'])
+            tick_size = float(price_filter['tickSize'])
+            
+            # Calculate precision from tick_size
+            tick_size_str = f"{tick_size:.8f}".rstrip('0')
+            precision = len(tick_size_str.split('.')[-1]) if '.' in tick_size_str else 0
+            
+            # Round price to tick_size precision
+            formatted_price = round(price, precision)
+            
+            # Ensure it meets min/max requirements
+            if formatted_price < min_price:
+                logger.warning(f"⚠️  Price {formatted_price} below minPrice {min_price}, adjusting to {min_price}")
+                formatted_price = min_price
+            elif formatted_price > max_price:
+                logger.warning(f"⚠️  Price {formatted_price} above maxPrice {max_price}, adjusting to {max_price}")
+                formatted_price = max_price
+            
+            # Ensure it aligns with tick_size
+            steps = round((formatted_price - min_price) / tick_size)
+            formatted_price = steps * tick_size + min_price
+            formatted_price = round(formatted_price, precision)
+            
+            logger.debug(f"💲 Price formatting: {price} -> {formatted_price} (min={min_price}, max={max_price}, tick={tick_size})")
+            
+            return formatted_price
             
         except Exception as e:
-            logger.error(f"❌ Binance connection failed: {e}")
-            
-            # Provide detailed error information
-            error_str = str(e)
-            if "-2015" in error_str:
-                logger.error("💡 Error -2015 means: Invalid API key, IP restriction, or insufficient permissions")
-                logger.error("🔧 Solutions:")
-                logger.error("   1. Check API key is correct (no extra spaces)")
-                logger.error("   2. Check secret key is correct (no extra spaces)")
-                logger.error("   3. Verify API permissions include 'Enable Reading' and 'Enable Spot & Margin Trading'")
-                logger.error("   4. Check IP restrictions (disable for testing)")
-                logger.error(f"   5. Ensure using {'TESTNET' if settings.binance_testnet else 'MAINNET'} keys")
-                logger.error("   6. Try regenerating your API keys")
-            elif "connectivity" in error_str.lower() or "network" in error_str.lower():
-                logger.error("💡 Network connectivity issue - check your internet connection")
-            elif "-1021" in error_str:
-                logger.error("💡 Error -1021 means: Timestamp for request was ahead of server time")
-                logger.error("🔧 Solutions:")
-                logger.error("   1. Check system clock is synchronized (Windows: w32tm /resync)")
-                logger.error("   2. Try restarting the application")
-                logger.error("   3. Check for network latency issues")
-            
+            logger.error(f"Error formatting price for {symbol}: {e}")
+            return price
+
+    async def initialize(self):
+        """Initialize connection and validate API keys."""
+        try:
+            self._log_network_status()
+            self._synchronize_time()
+            await self._authenticate_with_retries()
+            return True
+        except Exception as error:
+            self._handle_initialization_error(error)
             return False
+
+    def _log_network_status(self) -> None:
+        network_label = "Testnet (Safe)" if settings.binance_testnet else "Mainnet (REAL MONEY)"
+        logger.info(f"🌐 Binance Network: {network_label}")
+
+    def _synchronize_time(self) -> None:
+        try:
+            server_time = self.client.get_server_time()
+            logger.debug(f"⏱️  Server time synchronized: {server_time['serverTime']}")
+        except Exception as sync_error:
+            logger.warning(f"⚠️  Time sync failed: {sync_error}")
+
+    async def _authenticate_with_retries(self, max_retries: int = 3) -> None:
+        for attempt in range(1, max_retries + 1):
+            try:
+                _ = self.client.get_account()
+                self.is_connected = True
+                logger.info(f"✅ Authenticated successfully (attempt {attempt}/{max_retries})")
+                return
+            except Exception as auth_error:
+                logger.warning(f"⚠️  Authentication attempt {attempt}/{max_retries} failed: {auth_error}")
+                if attempt == max_retries:
+                    raise
+                await asyncio.sleep(2)
+
+    def _handle_initialization_error(self, error: Exception) -> None:
+        logger.error(f"❌ Binance initialization failed: {error}")
+        logger.error("❌ Check your API keys and network connection")
+        self.is_connected = False
 
     def get_account_balance(self) -> Dict:
         """Get account balances"""
@@ -280,75 +310,98 @@ class BinanceService:
         - If SL hits → position closes with loss, TP cancels
         """
         try:
-            # Format quantity to meet Binance LOT_SIZE requirements
             formatted_qty = self.format_quantity(symbol, quantity)
+            entry_order = self._place_market_entry(symbol, side, formatted_qty)
+
+            exit_side = self._opposite_side(side)
+            executed_qty = self._extract_executed_quantity(entry_order, formatted_qty)
             
-            # Step 1: Place market entry order
-            entry_order = self.client.order_market(
-                symbol=symbol, side=side.upper(), quantity=formatted_qty
+            # Format prices to meet PRICE_FILTER requirements
+            formatted_tp = self.format_price(symbol, take_profit_price)
+            formatted_sl = self.format_price(symbol, stop_loss_price)
+            
+            oco_payload = self._build_oco_payload(
+                symbol,
+                exit_side,
+                executed_qty,
+                formatted_tp,
+                formatted_sl,
             )
-            
-            logger.info(f"✅ Entry order filled: {entry_order['orderId']}")
-            
-            # Step 2: Determine exit side (opposite of entry)
-            exit_side = "SELL" if side.upper() == "BUY" else "BUY"
-            
-            # Step 3: Get executed quantity from entry order (may differ from requested)
-            executed_qty = float(entry_order.get('executedQty', formatted_qty))
-            
-            # Step 4: Calculate stop limit price (slightly worse than stop)
-            if exit_side == "SELL":
-                stop_limit_price = stop_loss_price * 0.999  # 0.1% worse for SELL
-            else:
-                stop_limit_price = stop_loss_price * 1.001  # 0.1% worse for BUY
-            
-            # Step 5: Determine which price is above/below for OCO
-            # Above = higher price, Below = lower price
-            # 
-            # For SELL exit: We're selling, so TP (higher price) is above, SL (lower price) is below
-            # For BUY exit: We're buying, so SL (higher price) is above, TP (lower price) is below
-            if exit_side == "SELL":
-                # SELL exit: Taking profit at higher price, stop loss at lower price
-                # Example: Bought @ $50k, Sell TP @ $51k (above), Sell SL @ $49k (below)
-                above_price = take_profit_price  # Higher price (take profit)
-                above_type = "LIMIT_MAKER"
-                below_price = stop_loss_price  # Lower price (stop loss)
-                below_type = "STOP_LOSS_LIMIT"
-            else:
-                # BUY exit: Taking profit at lower price, stop loss at higher price
-                # Example: Sold @ $118k, Buy TP @ $117k (below), Buy SL @ $119k (above)
-                above_price = stop_loss_price  # Higher price (stop loss)
-                above_type = "STOP_LOSS_LIMIT"
-                below_price = take_profit_price  # Lower price (take profit)
-                below_type = "LIMIT_MAKER"
-            
-            # Step 6: Place OCO order with new format
-            oco_order = self.client.create_oco_order(
-                symbol=symbol,
-                side=exit_side,
-                quantity=executed_qty,
-                aboveType=above_type,
-                abovePrice=str(above_price),
-                aboveStopPrice=str(above_price) if above_type == "STOP_LOSS_LIMIT" else None,
-                belowType=below_type,
-                belowPrice=str(below_price),
-                belowStopPrice=str(below_price) if below_type == "STOP_LOSS_LIMIT" else None,
-                aboveTimeInForce=TIME_IN_FORCE_GTC if above_type == "STOP_LOSS_LIMIT" else None,
-                belowTimeInForce=TIME_IN_FORCE_GTC if below_type == "STOP_LOSS_LIMIT" else None,
-            )
-            
+
+            oco_order = self.client.create_oco_order(symbol=symbol, side=exit_side, **oco_payload)
             logger.info(f"✅ OCO order created: {oco_order['orderListId']}")
-            
+
             return {
                 "entry_order": entry_order,
                 "oco_order": oco_order,
-                "take_profit_price": take_profit_price,
-                "stop_loss_price": stop_loss_price,
+                "take_profit_price": formatted_tp,
+                "stop_loss_price": formatted_sl,
             }
-                
-        except Exception as e:
-            logger.error(f"Error placing OCO order for {symbol}: {e}")
+
+        except Exception as error:
+            logger.error(f"Error placing OCO order for {symbol}: {error}")
             return {}
+
+    def _place_market_entry(self, symbol: str, side: str, quantity: float) -> Dict:
+        entry_order = self.client.order_market(
+            symbol=symbol,
+            side=side.upper(),
+            quantity=quantity,
+        )
+        logger.info(f"✅ Entry order filled: {entry_order['orderId']}")
+        return entry_order
+
+    @staticmethod
+    def _opposite_side(side: str) -> str:
+        return "SELL" if side.upper() == "BUY" else "BUY"
+
+    @staticmethod
+    def _extract_executed_quantity(entry_order: Dict, fallback_quantity: float) -> float:
+        try:
+            return float(entry_order.get("executedQty", fallback_quantity))
+        except (TypeError, ValueError):
+            return fallback_quantity
+
+    def _build_oco_payload(
+        self,
+        symbol: str,
+        exit_side: str,
+        quantity: float,
+        take_profit_price: float,
+        stop_loss_price: float,
+    ) -> Dict:
+        # Format stop limit prices to respect PRICE_FILTER
+        if exit_side == "SELL":
+            stop_limit_price = self.format_price(symbol, stop_loss_price * OCO_SELL_STOP_LIMIT_BUFFER)
+            payload = {
+                "quantity": quantity,
+                "aboveType": "LIMIT_MAKER",
+                "abovePrice": self._to_price_str(take_profit_price),
+                "belowType": "STOP_LOSS_LIMIT",
+                "belowPrice": self._to_price_str(stop_limit_price),
+                "belowStopPrice": self._to_price_str(stop_loss_price),
+                "belowTimeInForce": TIME_IN_FORCE_GTC,
+            }
+        else:
+            stop_limit_price = self.format_price(symbol, stop_loss_price * OCO_BUY_STOP_LIMIT_BUFFER)
+            payload = {
+                "quantity": quantity,
+                "aboveType": "STOP_LOSS_LIMIT",
+                "abovePrice": self._to_price_str(stop_limit_price),
+                "aboveStopPrice": self._to_price_str(stop_loss_price),
+                "aboveTimeInForce": TIME_IN_FORCE_GTC,
+                "belowType": "LIMIT_MAKER",
+                "belowPrice": self._to_price_str(take_profit_price),
+            }
+        return self._filter_none(payload)
+
+    @staticmethod
+    def _to_price_str(price: float) -> str:
+        return f"{price:.8f}"
+
+    @staticmethod
+    def _filter_none(payload: Dict) -> Dict:
+        return {key: value for key, value in payload.items() if value is not None}
 
     def get_oco_order_status(self, order_list_id: str) -> Optional[Dict]:
         """
