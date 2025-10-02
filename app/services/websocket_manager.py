@@ -20,7 +20,10 @@ class WebSocketManager:
             self.active_connections[user_id] = []
 
         self.active_connections[user_id].append(websocket)
-        logger.info(f"WebSocket connected for user {user_id}")
+        total_connections = self.get_connection_count()
+        total_users = len(self.active_connections)
+        
+        logger.info(f"🌐 WebSocket connected for user {user_id} | Total users: {total_users} | Total connections: {total_connections}")
 
         # Send initial connection confirmation
         await self.send_to_user(
@@ -42,7 +45,9 @@ class WebSocketManager:
             if not self.active_connections[user_id]:
                 del self.active_connections[user_id]
 
-        logger.info(f"WebSocket disconnected for user {user_id}")
+        total_connections = self.get_connection_count()
+        total_users = len(self.active_connections)
+        logger.info(f"🔌 WebSocket disconnected for user {user_id} | Remaining users: {total_users} | Remaining connections: {total_connections}")
 
     async def send_to_user(self, user_id: int, message: dict):
         """Send message to all connections for a specific user"""
@@ -67,7 +72,7 @@ class WebSocketManager:
 
     async def broadcast(self, message: dict):
         """Send message to all connected users"""
-        for user_id in list(self.active_connections.keys()):
+        for user_id in self.active_connections.keys():
             await self.send_to_user(user_id, message)
 
     def get_connected_users(self) -> List[int]:

@@ -9,9 +9,19 @@ from .database import engine, Base
 from .api import trading, portfolio, auth
 from .services.trading_bot import TradingBot
 from .services.websocket_manager import WebSocketManager
+from .logging_config import setup_logging
+# Import all models to ensure they're registered with SQLAlchemy
+from .models.user import User
+from .models.trade import Trade, TradingConfig, OpenPosition
+from .models.portfolio import Portfolio
 from dotenv import load_dotenv
+import logging
 
 load_dotenv("../.env")
+
+# Initialize logging system
+trading_metrics_logger = setup_logging()
+logger = logging.getLogger(__name__)
 
 # Create FastAPI app
 app = FastAPI(
@@ -45,9 +55,16 @@ async def startup_event():
     # Initialize trading bot
     global trading_bot
     trading_bot = TradingBot(ws_manager)
+    
+    # Start the trading bot
+    bot_started = await trading_bot.start()
+    if bot_started:
+        logger.info("🚀 Trading Bot started and running!")
+    else:
+        logger.error("❌ Failed to start Trading Bot")
 
-    print("🤖 Trd Bot API Started Successfully!")
-    print(f"📊 Database: Connected to PostgreSQL db")
+    logger.info("🤖 Trd Bot API Started Successfully!")
+    logger.info("📊 Database: Connected to PostgreSQL db")
     print(f"🔗 CORS Origins: {settings.cors_origins}")
     print(f"🧪 Test Mode: {settings.binance_testnet}")
 
@@ -72,6 +89,38 @@ async def health_check():
         "version": "1.0.0",
         "bot_active": trading_bot.is_running if trading_bot else False,
         "test_mode": settings.binance_testnet,
+    }
+
+
+@app.get("/debug/bot-status")
+async def debug_bot_status():
+    """Debug endpoint to check trading bot status"""
+    if not trading_bot:
+        return {"error": "Trading bot not initialized"}
+    
+    from datetime import datetime
+    from .database import get_db
+    
+    # Get active users count
+    active_users_count = 0
+    try:
+        async for db in get_db():
+            active_configs = await trading_bot._get_active_trading_configs(db)
+            active_users_count = len(active_configs)
+            break
+    except Exception as e:
+        logger.error(f"Error getting active users: {e}")
+    
+    connected_users = ws_manager.get_connected_users()
+    
+    return {
+        "bot_running": trading_bot.is_running,
+        "active_users_count": active_users_count,
+        "connected_users": connected_users,
+        "total_connections": ws_manager.get_connection_count(),
+        "current_time": datetime.now().isoformat(),
+        "is_trading_hours": trading_bot._is_trading_hours(datetime.now().time()),
+        "last_analysis_times": dict(trading_bot.last_analysis_time),
     }
 
 

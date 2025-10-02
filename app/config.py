@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     gemini_api_key: str = Field(default="")
     
     # Security
-    jwt_secret: str = Field(default="your-secret-key-change-in-production")
+    jwt_secret: str = Field(default="")
     jwt_algorithm: str = Field(default="HS256")
     jwt_expiration: int = Field(default=3600)
     
@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     default_trading_pair: str = Field(default="BTCUSDT")
     trading_active_hours_start: str = Field(default="08:00")
     trading_active_hours_end: str = Field(default="16:00")
+    use_mock_binance: bool = Field(default=False) 
     
     # CORS - accepts both string and list
     cors_origins: Union[str, List[str]] = Field(
