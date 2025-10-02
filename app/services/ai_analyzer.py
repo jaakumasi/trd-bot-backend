@@ -172,8 +172,8 @@ class AIAnalyzer:
             2. "confidence": integer from 0-100
             3. "reasoning": brief explanation (max 100 words)
             4. "entry_price": REQUIRED - suggested entry price (use current price {latest['close']:.2f} if unsure)
-            5. "stop_loss": REQUIRED - suggested stop loss price (0.5% from entry for scalping)
-            6. "take_profit": REQUIRED - suggested take profit price (0.3% from entry for scalping)
+            5. "stop_loss": REQUIRED - suggested stop loss price (1.5% from entry for reliable execution)
+            6. "take_profit": REQUIRED - suggested take profit price (2% from entry for reliable execution)
 
             Consider:
             - RSI overbought (>70) or oversold (<30) conditions
@@ -186,7 +186,7 @@ class AIAnalyzer:
             Return ONLY valid JSON without markdown code blocks or any other formatting.
             
             Example format with ALL required fields:
-            {{"signal": "buy", "confidence": 75, "reasoning": "Strong bullish momentum", "entry_price": {latest['close']:.2f}, "stop_loss": {latest['close'] * 0.995:.2f}, "take_profit": {latest['close'] * 1.003:.2f}}}
+            {{"signal": "buy", "confidence": 75, "reasoning": "Strong bullish momentum", "entry_price": {latest['close']:.2f}, "stop_loss": {latest['close'] * 0.985:.2f}, "take_profit": {latest['close'] * 1.02:.2f}}}
             """
 
             try:
@@ -208,12 +208,12 @@ class AIAnalyzer:
                     response_text = '\n'.join(lines[1:-1])  # Remove first and last lines
                 
                 response_text = response_text.strip()
-                logger.info(f"🔍 Cleaned JSON for parsing: {response_text}")
+                # logger.info(f"🔍 Cleaned JSON for parsing: {response_text}")
 
                 # Parse AI response
                 try:
                     ai_analysis = json.loads(response_text)
-                    logger.info(f"✅ Successfully parsed AI response: {ai_analysis}")
+                    # logger.info(f"✅ Successfully parsed AI response: {ai_analysis}")
                 except json.JSONDecodeError as json_error:
                     logger.error(f"❌ JSON Parse Error: {json_error}")
                     logger.error(f"❌ Raw response text: {repr(response_text)}")
@@ -247,23 +247,24 @@ class AIAnalyzer:
                     logger.info(f"🔧 Added fallback entry_price: {current_price}")
                 
                 # Set stop loss based on signal direction
+                # Using wider percentages (1.5% SL, 2% TP) for reliable execution on testnet
                 if "stop_loss" not in ai_analysis or not ai_analysis["stop_loss"]:
                     if signal == "buy":
-                        ai_analysis["stop_loss"] = current_price * 0.995  # 0.5% stop loss for buy
+                        ai_analysis["stop_loss"] = current_price * 0.985  # 1.5% stop loss for buy
                     elif signal == "sell":
-                        ai_analysis["stop_loss"] = current_price * 1.005  # 0.5% stop loss for sell
+                        ai_analysis["stop_loss"] = current_price * 1.015  # 1.5% stop loss for sell
                     else:  # hold
-                        ai_analysis["stop_loss"] = current_price * 0.99   # 1% stop loss for hold
+                        ai_analysis["stop_loss"] = current_price * 0.98   # 2% stop loss for hold
                     logger.info(f"🔧 Added fallback stop_loss: {ai_analysis['stop_loss']} for {signal} signal")
                 
                 # Set take profit based on signal direction
                 if "take_profit" not in ai_analysis or not ai_analysis["take_profit"]:
                     if signal == "buy":
-                        ai_analysis["take_profit"] = current_price * 1.01  # 1% take profit for buy
+                        ai_analysis["take_profit"] = current_price * 1.02  # 2% take profit for buy
                     elif signal == "sell":
-                        ai_analysis["take_profit"] = current_price * 0.99  # 1% take profit for sell
+                        ai_analysis["take_profit"] = current_price * 0.98  # 2% take profit for sell
                     else:  # hold
-                        ai_analysis["take_profit"] = current_price * 1.005 # 0.5% take profit for hold
+                        ai_analysis["take_profit"] = current_price * 1.015 # 1.5% take profit for hold
                     logger.info(f"🔧 Added fallback take_profit: {ai_analysis['take_profit']} for {signal} signal")
 
                 # Add technical confirmation to validate AI analysis

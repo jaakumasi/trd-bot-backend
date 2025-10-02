@@ -582,6 +582,111 @@ class TradingBot:
                         
                     elif order_status == 'EXECUTING':
                         logger.debug(f"⏳ [User {user_id}] OCO {oco_order_id} still active for {symbol}")
+                        
+                        # Check if position has been open too long (manual timeout)
+                        time_open = (datetime.now(timezone.utc) - position.opened_at).total_seconds() / 3600  # hours
+                        MAX_POSITION_HOURS = 2  # Close positions after 2 hours
+                        
+                        if time_open > MAX_POSITION_HOURS:
+                            logger.warning(f"⏰ [User {user_id}] Position {position.trade_id} open for {time_open:.1f} hours - FORCE CLOSING")
+                            
+                            # Cancel existing OCO order
+                            cancel_success = self.binance.cancel_oco_order(symbol, oco_order_id)
+                            if not cancel_success:
+                                logger.error(f"❌ [User {user_id}] Failed to cancel OCO {oco_order_id}")
+                                continue
+                            
+                            # Get current market price
+                            current_price = self.binance.get_symbol_price(symbol)
+                            
+                            # Place market exit order
+                            exit_side = "SELL" if position.side.upper() == "BUY" else "BUY"
+                            
+                            try:
+                                exit_order = self.binance.client.order_market(
+                                    symbol=symbol,
+                                    side=exit_side,
+                                    quantity=float(position.amount)
+                                )
+                                
+                                exit_price = float(exit_order["fills"][0]["price"])
+                                exit_fee = float(exit_order["fills"][0]["commission"])
+                                
+                                # Calculate P&L
+                                entry_price = float(position.entry_price)
+                                amount = float(position.amount)
+                                entry_fees = float(position.fees_paid)
+                                
+                                if position.side.upper() == 'BUY':
+                                    profit_loss = (exit_price - entry_price) * amount - entry_fees - exit_fee
+                                else:
+                                    profit_loss = (entry_price - exit_price) * amount - entry_fees - exit_fee
+                                
+                                profit_loss_pct = (profit_loss / float(position.entry_value)) * 100
+                                
+                                # Update trade record
+                                trade_query = select(Trade).where(Trade.trade_id == position.trade_id)
+                                trade_result = await db.execute(trade_query)
+                                trade_obj = trade_result.scalar_one_or_none()
+                                
+                                if trade_obj:
+                                    trade_obj.closed_at = datetime.now(timezone.utc)
+                                    trade_obj.exit_price = exit_price
+                                    trade_obj.exit_fee = exit_fee
+                                    trade_obj.exit_reason = "TIMEOUT_AUTO_CLOSE"
+                                    trade_obj.profit_loss = profit_loss
+                                    trade_obj.profit_loss_percentage = profit_loss_pct
+                                    trade_obj.duration_seconds = int(time_open * 3600)
+                                    trade_obj.status = 'closed'
+                                    await db.commit()
+                                
+                                # Remove position
+                                await db.delete(position)
+                                await db.commit()
+                                
+                                # Remove from risk manager
+                                self.risk_manager.close_position(
+                                    user_id, 
+                                    position.trade_id, 
+                                    exit_price, 
+                                    "TIMEOUT_AUTO_CLOSE",
+                                    exit_fee
+                                )
+                                
+                                # Get fresh balance
+                                fresh_balances = self.binance.get_account_balance()
+                                actual_usdt_balance = fresh_balances.get("USDT", {}).get("free", 0.0)
+                                
+                                logger.info(f"⏰ [User {user_id}] POSITION FORCE CLOSED (TIMEOUT):")
+                                logger.info(f"   📊 {position.side.upper()} {amount:.6f} {symbol}")
+                                logger.info(f"   📈 Entry: ${entry_price:.4f} → Exit: ${exit_price:.4f}")
+                                logger.info(f"   💵 P&L: ${profit_loss:.2f} ({profit_loss_pct:+.2f}%)")
+                                logger.info(f"   ⏱️  Duration: {time_open:.1f} hours")
+                                logger.info(f"   🏦 USDT Balance: ${actual_usdt_balance:.2f}")
+                                
+                                # Send notification
+                                await self.ws_manager.send_to_user(
+                                    user_id,
+                                    {
+                                        "type": "position_timeout_closed",
+                                        "position": {
+                                            "symbol": symbol,
+                                            "side": position.side,
+                                            "amount": amount,
+                                            "entry_price": entry_price,
+                                            "exit_price": exit_price,
+                                            "profit_loss": profit_loss,
+                                            "profit_loss_percentage": profit_loss_pct,
+                                        },
+                                        "exit_reason": "TIMEOUT_AUTO_CLOSE",
+                                        "new_balance": actual_usdt_balance,
+                                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                                    },
+                                )
+                                
+                            except Exception as close_error:
+                                logger.error(f"❌ [User {user_id}] Failed to force close position: {close_error}")
+                    
                     else:
                         logger.warning(f"⚠️  [User {user_id}] OCO {oco_order_id} has unexpected status: {order_status}")
                         
