@@ -61,6 +61,22 @@ class AIAnalyzer:
         # Volume indicators
         df["volume_sma"] = df["volume"].rolling(window=20).mean()
 
+        # On-Balance Volume (OBV)
+        df["obv"] = (np.sign(df["close"].diff()) * df["volume"]).fillna(0).cumsum()
+
+        # Stochastic Oscillator
+        low_14 = df["low"].rolling(window=14).min()
+        high_14 = df["high"].rolling(window=14).max()
+        df["stoch_k"] = 100 * ((df["close"] - low_14) / (high_14 - low_14))
+        df["stoch_d"] = df["stoch_k"].rolling(window=3).mean()
+
+        # Average True Range (ATR)
+        high_low = df["high"] - df["low"]
+        high_close = np.abs(df["high"] - df["close"].shift())
+        low_close = np.abs(df["low"] - df["close"].shift())
+        tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+        df["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
+
         return df
 
     async def analyze_market_data(self, symbol: str, df: pd.DataFrame) -> Dict:
