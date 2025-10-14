@@ -248,6 +248,15 @@ class TradingBot:
         try:
             user_id = config.user_id
             symbol = config.trading_pair
+
+            # Skip analysis if a position is already open for this pair
+            open_positions = self.risk_manager.get_open_positions(user_id)
+            if any(p.get("symbol") == symbol for p in open_positions):
+                logger.info(
+                    f"✅ [User {user_id}] Position already open for {symbol}. Skipping new trade analysis."
+                )
+                return
+
             logger.debug(f"🔍 [User {user_id}] Starting trading analysis for {symbol}")
 
             remaining_cooldown = self._remaining_rate_limit(user_id)
@@ -492,26 +501,42 @@ class TradingBot:
         exit_price = float(close_order_result["fills"][0]["price"])
         exit_commission = float(close_order_result["fills"][0]["commission"])
 
-        closed_position = self.risk_manager.close_position(
-            user_id,
-            position["trade_id"],
-            exit_price,
-            exit_reason,
-            exit_commission,
+        # Calculate P&L metrics (same as OCO/timeout paths)
+        entry_price = position["entry_price"]
+        entry_fees = position["fees_paid"]
+        profit_loss = self._calculate_profit_loss(
+            position["side"], entry_price, exit_price, position["amount"], entry_fees, exit_commission
         )
-
-        if not closed_position:
-            logger.warning(
-                f"⚠️  [User {user_id}] Unable to close position {position['trade_id']}"
-            )
-            return
+        profit_loss_pct = (profit_loss / position["entry_value"]) * 100
+        
+        # Calculate duration
+        entry_time = position["entry_time"]
+        if entry_time.tzinfo is None:
+            entry_time = entry_time.replace(tzinfo=timezone.utc)
+        duration_seconds = (datetime.now(timezone.utc) - entry_time).total_seconds()
+        
+        # Build closed position dict
+        closed_position = {
+            **position,
+            "exit_price": exit_price,
+            "exit_time": datetime.now(timezone.utc),
+            "exit_fees": exit_commission,
+            "total_fees": entry_fees + exit_commission,
+            "gross_pnl": profit_loss + entry_fees + exit_commission,
+            "net_pnl": profit_loss,
+            "pnl_percentage": profit_loss_pct,
+            "duration_seconds": duration_seconds,
+            "exit_reason": exit_reason,
+        }
+        
+        # Remove from risk manager memory
+        self._remove_position_from_risk_manager(user_id, position["trade_id"])
 
         await self._finalize_position_close(
             db=db,
             config=config,
             position=position,
             closed_position=closed_position,
-            close_order_result=close_order_result,
             close_side=close_side,
             exit_reason=exit_reason,
             executed_qty=executed_qty,
@@ -525,7 +550,6 @@ class TradingBot:
         config: TradingConfig,
         position: Dict,
         closed_position: Dict,
-        close_order_result: Dict,
         close_side: str,
         exit_reason: str,
         executed_qty: float,
@@ -554,14 +578,16 @@ class TradingBot:
             f"POSITION_CLOSED | USER={user_id} | SYMBOL={symbol} | REASON={exit_reason} | PNL=${closed_position['net_pnl']:+.2f} | PCT={closed_position['pnl_percentage']:+.2f}% | DURATION={closed_position['duration_seconds']:.0f}s | RESULT={profit_label}"
         )
 
-        await self._record_closing_trade(
+        # ✅ FIX: Update original trade record with exit details (consistent with OCO/timeout exits)
+        await self._update_trade_record_after_exit(
             db,
-            config,
-            close_order_result,
-            close_side,
-            executed_qty,
-            exit_price,
-            exit_commission,
+            trade_id=position["trade_id"],
+            exit_price=exit_price,
+            exit_fee=exit_commission,
+            exit_reason=exit_reason,
+            profit_loss=closed_position["net_pnl"],
+            profit_loss_pct=closed_position["pnl_percentage"],
+            duration_seconds=closed_position["duration_seconds"],
         )
 
         await self._remove_open_position_from_db(db, position["trade_id"])
@@ -613,33 +639,14 @@ class TradingBot:
         logger.info("   🏦 Binance USDT Balance: $%.2f", balance)
         return balance
 
-    async def _record_closing_trade(
-        self,
-        db: AsyncSession,
-        config: TradingConfig,
-        close_order_result: Dict,
-        close_side: str,
-        executed_qty: float,
-        exit_price: float,
-        exit_commission: float,
-    ) -> None:
-        close_trade = Trade(
-            user_id=config.user_id,
-            trade_id=str(close_order_result["orderId"]),
-            symbol=config.trading_pair,
-            side=close_side.lower(),
-            amount=float(executed_qty),
-            price=float(exit_price),
-            total_value=float(executed_qty * exit_price),
-            fee=float(exit_commission),
-            status="filled",
-            is_test_trade=config.is_test_mode,
-            strategy_used="scalping_ai_exit",
-            ai_signal_confidence=0.0,
-        )
-
-        db.add(close_trade)
-        await db.commit()
+    def _remove_position_from_risk_manager(self, user_id: int, trade_id: str) -> None:
+        """Remove a position from risk manager's in-memory tracking"""
+        risk_manager_positions = self.risk_manager.get_open_positions(user_id)
+        for i, pos in enumerate(risk_manager_positions):
+            if pos.get("trade_id") == trade_id:
+                self.risk_manager.open_positions[user_id].pop(i)
+                logger.debug(f"✅ Removed position {trade_id} from risk manager memory")
+                break
 
     async def _remove_open_position_from_db(
         self, db: AsyncSession, trade_id: str
@@ -684,7 +691,9 @@ class TradingBot:
                 logger.debug("🔍 No OCO orders to check")
                 return
 
-            logger.debug(f"🔍 Checking {len(positions_with_oco)} OCO orders...")
+            logger.info(f"🔍 Checking {len(positions_with_oco)} active OCO orders...")
+            for position in positions_with_oco:
+                logger.debug(f"   📋 OCO {position.oco_order_id} | Trade {position.trade_id} | User {position.user_id}")
 
             for position in positions_with_oco:
                 await self._process_oco_position(db, position)
@@ -704,6 +713,7 @@ class TradingBot:
             oco_order_id = position.oco_order_id
             symbol = position.symbol
 
+            logger.debug(f"🔎 Querying OCO status for order {oco_order_id}...")
             oco_status = self.binance.get_oco_order_status(oco_order_id)
             if not oco_status:
                 logger.warning(
@@ -712,18 +722,23 @@ class TradingBot:
                 return
 
             order_status = oco_status.get("listOrderStatus", "UNKNOWN")
+            logger.debug(f"📊 OCO {oco_order_id} status: {order_status}")
 
             if order_status == "ALL_DONE":
-                logger.info(f"🎯 [User {user_id}] OCO ORDER EXECUTED: {oco_order_id}")
+                logger.info(f"🎯 [User {user_id}] OCO ORDER EXECUTED/DONE: {oco_order_id}")
                 await self._handle_oco_all_done(db, position, oco_status)
             elif order_status == "EXECUTING":
                 logger.debug(
                     f"⏳ [User {user_id}] OCO {oco_order_id} still active for {symbol}"
                 )
                 await self._handle_oco_executing(db, position)
+            elif order_status in ["REJECT", "CANCELLING"]:
+                logger.warning(
+                    f"⚠️  [User {user_id}] OCO {oco_order_id} has status: {order_status}. It may need manual review."
+                )
             else:
                 logger.warning(
-                    f"⚠️  [User {user_id}] OCO {oco_order_id} has unexpected status: {order_status}"
+                    f"⚠️  [User {user_id}] OCO {oco_order_id} has unexpected listOrderStatus: {order_status}"
                 )
 
         except Exception as exc:
@@ -766,16 +781,9 @@ class TradingBot:
         )
 
         await self._delete_position_record(db, position)
-
-        closed_position = self.risk_manager.close_position(
-            user_id, position.trade_id, exit_price, exit_reason, exit_fee
-        )
-
-        if not closed_position:
-            logger.warning(
-                f"⚠️  [User {user_id}] Risk manager could not close position {position.trade_id}"
-            )
-            return
+        
+        # Remove from risk manager memory
+        self._remove_position_from_risk_manager(user_id, position.trade_id)
 
         actual_usdt_balance = self._get_current_usdt_balance()
 
@@ -838,14 +846,31 @@ class TradingBot:
 
     @staticmethod
     def _extract_oco_exit_details(oco_status: Dict) -> Tuple[Optional[str], Optional[float]]:
+        """
+        Extract which OCO leg was filled and at what price
+        Returns: (exit_reason, exit_price)
+        """
+        logger.debug(f"🔍 Extracting exit details from OCO status")
         for order in oco_status.get("orders", []):
-            if order.get("status") != "FILLED":
-                continue
+            order_status = order.get("status", "")
             order_type = order.get("type", "")
+            order_id = order.get("orderId", "")
+            
+            logger.debug(f"   📋 Order {order_id}: type={order_type}, status={order_status}")
+            
+            if order_status != "FILLED":
+                continue
+                
             price = float(order.get("price", 0))
+            
             if "STOP" in order_type.upper():
+                logger.info(f"🛑 Stop Loss triggered at ${price:.4f}")
                 return "STOP_LOSS", price
+            
+            logger.info(f"🎯 Take Profit triggered at ${price:.4f}")
             return "TAKE_PROFIT", price
+        
+        logger.warning("⚠️  No FILLED order found in OCO status")
         return None, None
 
     @staticmethod
@@ -879,11 +904,13 @@ class TradingBot:
         profit_loss_pct: float,
         duration_seconds: float,
     ) -> None:
+        logger.debug(f"🔍 Attempting to update trade record {trade_id} with exit details")
         trade_query = select(Trade).where(Trade.trade_id == trade_id)
         trade_result = await db.execute(trade_query)
         trade_obj = trade_result.scalar_one_or_none()
 
         if trade_obj:
+            logger.info(f"✅ Found trade {trade_id} in database - updating exit details")
             trade_obj.closed_at = datetime.now(timezone.utc)
             trade_obj.exit_price = exit_price
             trade_obj.exit_fee = exit_fee
@@ -892,8 +919,24 @@ class TradingBot:
             trade_obj.profit_loss_percentage = profit_loss_pct
             trade_obj.duration_seconds = int(duration_seconds)
             trade_obj.status = "closed"
+            
+            logger.debug(f"   📝 Exit Price: ${exit_price:.4f}, Exit Fee: ${exit_fee:.4f}")
+            logger.debug(f"   📝 P&L: ${profit_loss:.2f} ({profit_loss_pct:+.2f}%)")
+            logger.debug(f"   📝 Reason: {exit_reason}, Duration: {int(duration_seconds)}s")
+            
             await db.commit()
-            logger.debug(f"✅ Trade record {trade_id} updated in database")
+            logger.info(f"💾 Trade record {trade_id} committed to database")
+            
+            # Verify the update
+            await db.refresh(trade_obj)
+            if trade_obj.closed_at:
+                logger.info(f"✅ Verified: closed_at = {trade_obj.closed_at.isoformat()}")
+            else:
+                logger.error(f"❌ ERROR: closed_at is still NULL after commit!")
+        else:
+            logger.error(f"❌ CRITICAL: Trade record {trade_id} NOT FOUND in database!")
+            logger.error(f"   Cannot update exit details for non-existent trade")
+            logger.error(f"   This indicates a mismatch between OpenPosition and Trade tables")
 
     async def _delete_position_record(
         self, db: AsyncSession, position: OpenPosition
@@ -1001,17 +1044,9 @@ class TradingBot:
         )
 
         await self._delete_position_record(db, position)
-
-        closed_position = self.risk_manager.close_position(
-            user_id,
-            position.trade_id,
-            exit_price,
-            "TIMEOUT_AUTO_CLOSE",
-            exit_fee,
-        )
-
-        if not closed_position:
-            return
+        
+        # Remove from risk manager memory
+        self._remove_position_from_risk_manager(user_id, position.trade_id)
 
         actual_usdt_balance = self._get_current_usdt_balance()
 

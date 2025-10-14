@@ -22,8 +22,11 @@ class BinanceService:
             api_secret=settings.binance_secret_key,
             testnet=settings.binance_testnet,
         )
+        # Increase recvWindow to allow for more clock variance (default is 5000ms, we use 10000ms)
+        self.client.RECV_WINDOW = 10000
         self.is_connected = False
         self.symbol_info_cache = {}  # Cache for symbol trading rules
+        self.timestamp_offset = 0  # Will be set during time synchronization
 
     def get_symbol_info(self, symbol: str) -> Optional[Dict]:
         """Get trading rules and filters for a symbol"""
@@ -175,11 +178,29 @@ class BinanceService:
         logger.info(f"🌐 Binance Network: {network_label}")
 
     def _synchronize_time(self) -> None:
+        """Synchronize local time with Binance server time to prevent timestamp errors."""
         try:
-            server_time = self.client.get_server_time()
-            logger.debug(f"⏱️  Server time synchronized: {server_time['serverTime']}")
+            # Get server time
+            server_time_response = self.client.get_server_time()
+            server_time = server_time_response['serverTime']
+            
+            # Get local time in milliseconds
+            local_time = int(time.time() * 1000)
+            
+            # Calculate offset (server_time - local_time)
+            self.timestamp_offset = server_time - local_time
+            
+            # Apply offset to client
+            # Subtract a small buffer (1000ms) to ensure we're always slightly behind server time
+            self.client.timestamp_offset = self.timestamp_offset - 1000
+            
+            logger.info(f"⏱️  Time synchronized - Offset: {self.timestamp_offset}ms (applied: {self.client.timestamp_offset}ms)")
+            logger.debug(f"🕐 Server time: {server_time}, Local time: {local_time}")
         except Exception as sync_error:
             logger.warning(f"⚠️  Time sync failed: {sync_error}")
+            # Set a default conservative offset if sync fails
+            self.client.timestamp_offset = -2000  # 2 seconds behind
+            logger.info("⏱️  Using default offset: -%s ms", self.client.timestamp_offset)
 
     async def _authenticate_with_retries(self, max_retries: int = 3) -> None:
         for attempt in range(1, max_retries + 1):

@@ -165,33 +165,6 @@ class RiskManager:
         """Get all open positions for a user"""
         return self.open_positions.get(user_id, [])
 
-    def close_position(self, user_id: int, trade_id: str, exit_price: float, exit_reason: str, fees_paid: float) -> Optional[Dict]:
-        """Close a position and calculate P&L"""
-        position_with_index = self._find_position(user_id, trade_id)
-        if position_with_index is None:
-            return None
-
-        index, position = position_with_index
-        metrics = self._compute_exit_metrics(position, exit_price, fees_paid)
-
-        closed_position = {
-            **position,
-            **metrics,
-            "exit_reason": exit_reason,
-        }
-
-        self.open_positions[user_id].pop(index)
-
-        logger.info(
-            "💰 [User %s] Position CLOSED: %+0.2f USD (%+0.2f%%) - %s",
-            user_id,
-            metrics["net_pnl"],
-            metrics["pnl_percentage"],
-            exit_reason,
-        )
-
-        return closed_position
-
     def check_exit_conditions(self, user_id: int, current_price: float, symbol: str) -> list:
         """Check if any positions should be closed based on current price"""
         positions_to_close = []
@@ -308,38 +281,6 @@ class RiskManager:
         )
         if today_count >= max_trades:
             raise RiskValidationError(f"Daily trade limit reached ({max_trades})")
-
-    def _find_position(self, user_id: int, trade_id: str) -> Optional[Tuple[int, Dict]]:
-        positions = self.open_positions.get(user_id)
-        if not positions:
-            return None
-        for index, position in enumerate(positions):
-            if position.get("trade_id") == trade_id:
-                return index, position
-        return None
-
-    def _compute_exit_metrics(
-        self, position: Dict, exit_price: float, fees_paid: float
-    ) -> Dict:
-        pnl = self._calculate_pnl(position, exit_price)
-        total_fees = position["fees_paid"] + fees_paid
-        net_pnl = pnl - total_fees
-        pnl_percentage = (net_pnl / position["entry_value"]) * 100
-
-        current_time = datetime.now(timezone.utc)
-        entry_time = self._ensure_timezone(position["entry_time"])
-        duration_seconds = (current_time - entry_time).total_seconds()
-
-        return {
-            "exit_price": exit_price,
-            "exit_time": current_time,
-            "exit_fees": fees_paid,
-            "total_fees": total_fees,
-            "gross_pnl": pnl,
-            "net_pnl": net_pnl,
-            "pnl_percentage": pnl_percentage,
-            "duration_seconds": duration_seconds,
-        }
 
     @staticmethod
     def _calculate_pnl(position: Dict, exit_price: float) -> float:
