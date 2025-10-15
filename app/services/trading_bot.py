@@ -276,7 +276,11 @@ class TradingBot:
 
             kline_data, current_price = market_snapshot
 
-            ai_signal = await self._request_ai_signal(symbol, kline_data, user_id)
+            # Fetch user's trade history for personalized AI context
+            logger.debug(f"📊 [User {user_id}] Fetching trade history for AI context...")
+            user_trade_history = await self.ai_analyzer.get_user_trade_history_context(db, user_id)
+
+            ai_signal = await self._request_ai_signal(symbol, kline_data, user_id, user_trade_history)
             if ai_signal is None:
                 return
 
@@ -331,9 +335,9 @@ class TradingBot:
         logger.debug(f"💰 [User {user_id}] Current {symbol} price: ${current_price:.4f}")
         return kline_data, current_price
 
-    async def _request_ai_signal(self, symbol, kline_data, user_id: int):
+    async def _request_ai_signal(self, symbol, kline_data, user_id: int, user_trade_history=None):
         logger.debug(f"🤖 [User {user_id}] Running AI analysis...")
-        ai_signal = await self.ai_analyzer.analyze_market_data(symbol, kline_data)
+        ai_signal = await self.ai_analyzer.analyze_market_data(symbol, kline_data, user_trade_history)
 
         if ai_signal is None:
             logger.error(f"❌ [User {user_id}] AI analyzer returned None")
@@ -862,7 +866,7 @@ class TradingBot:
         
         Returns: (exit_reason, exit_price)
         """
-        logger.debug(f"🔍 Extracting exit details from OCO status")
+        logger.debug("🔍 Extracting exit details from OCO status")
         
         filled_order = None
         expired_order = None
@@ -900,14 +904,14 @@ class TradingBot:
             # If STOP_LOSS expired, then TAKE_PROFIT filled
             # If LIMIT_MAKER expired, then STOP_LOSS filled
             if "STOP" in expired_type.upper():
-                logger.info(f"✅ Inferred: Take Profit filled (Stop Loss expired)")
+                logger.info("✅ Inferred: Take Profit filled (Stop Loss expired)")
                 # Find the take profit order price
                 for order in oco_status.get("orders", []):
                     if order.get("orderId") != expired_order.get("orderId"):
                         tp_price = float(order.get("price", 0))
                         return "TAKE_PROFIT", tp_price
             else:
-                logger.info(f"✅ Inferred: Stop Loss filled (Take Profit expired)")
+                logger.info("✅ Inferred: Stop Loss filled (Take Profit expired)")
                 # Find the stop loss order price
                 for order in oco_status.get("orders", []):
                     if order.get("orderId") != expired_order.get("orderId"):
@@ -949,19 +953,18 @@ class TradingBot:
                 logger.info(f"✅ Fallback found: Take Profit at ${price:.4f}")
                 return "TAKE_PROFIT", price
         
-        # Strategy 2: If one is expired, check its price vs current price to infer which filled
+        # Strategy 2: If one is expired, check its price vs current price to infer which one filled
         if expired_order:
             try:
                 expired_price = float(expired_order.get("stopPrice") or expired_order.get("price", 0))
                 expired_type = expired_order.get("type", "")
                 
                 # Get current market price
-                current_price = self.binance.get_latest_price(position.symbol)
+                current_price = self.binance.get_symbol_price(position.symbol)
                 
                 logger.debug(f"📊 Expired order: type={expired_type}, price=${expired_price:.4f}, current=${current_price:.4f}")
                 
-                # Logic: If stop order was expired, TP must have filled
-                # If limit order was expired, SL must have filled
+                # If stop order was expired, TP must have filled, and vice versa
                 if "STOP" in expired_type.upper():
                     # Stop was expired, so Take Profit filled
                     # Find the other order's price
@@ -998,7 +1001,7 @@ class TradingBot:
         
         try:
             # Get current market price as exit price
-            current_price = self.binance.get_latest_price(symbol)
+            current_price = self.binance.get_symbol_price(symbol)
             amount = float(position.amount)
             entry_price = float(position.entry_price)
             entry_fees = float(position.fees_paid)
@@ -1113,11 +1116,11 @@ class TradingBot:
             if trade_obj.closed_at:
                 logger.info(f"✅ Verified: closed_at = {trade_obj.closed_at.isoformat()}")
             else:
-                logger.error(f"❌ ERROR: closed_at is still NULL after commit!")
+                logger.error("❌ ERROR: closed_at is still NULL after commit!")
         else:
             logger.error(f"❌ CRITICAL: Trade record {trade_id} NOT FOUND in database!")
-            logger.error(f"   Cannot update exit details for non-existent trade")
-            logger.error(f"   This indicates a mismatch between OpenPosition and Trade tables")
+            logger.error("   Cannot update exit details for non-existent trade")
+            logger.error("   This indicates a mismatch between OpenPosition and Trade tables")
 
     async def _delete_position_record(
         self, db: AsyncSession, position: OpenPosition
