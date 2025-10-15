@@ -445,11 +445,13 @@ class BinanceService:
     def cancel_oco_order(self, symbol: str, order_list_id: str) -> bool:
         """Cancel an active OCO order on Binance"""
         try:
-            self.client.cancel_order_list(
-                symbol=symbol,
-                orderListId=int(order_list_id)
-            )
-            logger.info(f"✅ OCO order cancelled: {order_list_id}")
+            # Use the private method _delete with the correct endpoint
+            # This matches the Binance API endpoint: DELETE /api/v3/orderList
+            result = self.client._delete('orderList', True, data={
+                'symbol': symbol,
+                'orderListId': int(order_list_id)
+            })
+            logger.info(f"✅ OCO order cancelled: {order_list_id} - {result}")
             return True
             
         except Exception as e:
