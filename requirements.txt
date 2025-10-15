@@ -6,6 +6,7 @@ python-binance
 ccxt
 pandas
 numpy
+scipy
 python-dotenv
 python-multipart
 PyJWT>=2.10.0

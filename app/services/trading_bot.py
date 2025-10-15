@@ -14,6 +14,7 @@ from .mock_binance_service import MockBinanceService
 from .ai_analyzer import AIAnalyzer
 from .risk_manager import RiskManager
 from .websocket_manager import WebSocketManager
+from .market_regime_analyzer import MarketRegimeAnalyzer
 from ..logging_config import get_trading_metrics_logger
 from ..config import settings
 from .service_constants import (
@@ -32,6 +33,7 @@ class TradingBot:
         self.binance = self._create_binance_service()
         self.ai_analyzer = AIAnalyzer()
         self.risk_manager = RiskManager()
+        self.regime_analyzer = MarketRegimeAnalyzer()
         self.ws_manager = ws_manager
         self.is_running = False
         self.active_users = {}
@@ -248,6 +250,15 @@ class TradingBot:
         try:
             user_id = config.user_id
             symbol = config.trading_pair
+
+            # Skip analysis if a position is already open for this pair
+            open_positions = self.risk_manager.get_open_positions(user_id)
+            if any(p.get("symbol") == symbol for p in open_positions):
+                logger.info(
+                    f"✅ [User {user_id}] Position already open for {symbol}. Skipping new trade analysis."
+                )
+                return
+
             logger.debug(f"🔍 [User {user_id}] Starting trading analysis for {symbol}")
 
             remaining_cooldown = self._remaining_rate_limit(user_id)
@@ -267,7 +278,28 @@ class TradingBot:
 
             kline_data, current_price = market_snapshot
 
-            ai_signal = await self._request_ai_signal(symbol, kline_data, user_id)
+            # Calculate technical indicators FIRST (required by regime analyzer)
+            logger.debug(f"📊 [User {user_id}] Calculating technical indicators...")
+            kline_data = self.ai_analyzer.calculate_technical_indicators(kline_data)
+            
+            # Run market regime analysis with enriched data
+            logger.debug(f"🔍 [User {user_id}] Analyzing market regime...")
+            regime_analysis = await self.regime_analyzer.classify_market_regime(kline_data, symbol)
+            
+            # Check if scalping is allowed in current regime
+            if not regime_analysis.get('allow_scalping', False):
+                logger.info(
+                    f"🚫 [User {user_id}] Scalping blocked - Regime: {regime_analysis.get('regime')} | "
+                    f"ADX: {regime_analysis.get('trend_strength', 0):.1f} | "
+                    f"ATR%: {regime_analysis.get('atr_percentage', 0):.2f}%"
+                )
+                return
+
+            # Fetch user's trade history for personalized AI context
+            logger.debug(f"📊 [User {user_id}] Fetching trade history for AI context...")
+            user_trade_history = await self.ai_analyzer.get_user_trade_history_context(db, user_id)
+
+            ai_signal = await self._request_ai_signal(symbol, kline_data, user_id, user_trade_history, regime_analysis)
             if ai_signal is None:
                 return
 
@@ -322,9 +354,9 @@ class TradingBot:
         logger.debug(f"💰 [User {user_id}] Current {symbol} price: ${current_price:.4f}")
         return kline_data, current_price
 
-    async def _request_ai_signal(self, symbol, kline_data, user_id: int):
+    async def _request_ai_signal(self, symbol, kline_data, user_id: int, user_trade_history=None, regime_analysis=None):
         logger.debug(f"🤖 [User {user_id}] Running AI analysis...")
-        ai_signal = await self.ai_analyzer.analyze_market_data(symbol, kline_data)
+        ai_signal = await self.ai_analyzer.analyze_market_data(symbol, kline_data, user_trade_history, regime_analysis)
 
         if ai_signal is None:
             logger.error(f"❌ [User {user_id}] AI analyzer returned None")
@@ -492,26 +524,42 @@ class TradingBot:
         exit_price = float(close_order_result["fills"][0]["price"])
         exit_commission = float(close_order_result["fills"][0]["commission"])
 
-        closed_position = self.risk_manager.close_position(
-            user_id,
-            position["trade_id"],
-            exit_price,
-            exit_reason,
-            exit_commission,
+        # Calculate P&L metrics (same as OCO/timeout paths)
+        entry_price = position["entry_price"]
+        entry_fees = position["fees_paid"]
+        profit_loss = self._calculate_profit_loss(
+            position["side"], entry_price, exit_price, position["amount"], entry_fees, exit_commission
         )
-
-        if not closed_position:
-            logger.warning(
-                f"⚠️  [User {user_id}] Unable to close position {position['trade_id']}"
-            )
-            return
+        profit_loss_pct = (profit_loss / position["entry_value"]) * 100
+        
+        # Calculate duration
+        entry_time = position["entry_time"]
+        if entry_time.tzinfo is None:
+            entry_time = entry_time.replace(tzinfo=timezone.utc)
+        duration_seconds = (datetime.now(timezone.utc) - entry_time).total_seconds()
+        
+        # Build closed position dict
+        closed_position = {
+            **position,
+            "exit_price": exit_price,
+            "exit_time": datetime.now(timezone.utc),
+            "exit_fees": exit_commission,
+            "total_fees": entry_fees + exit_commission,
+            "gross_pnl": profit_loss + entry_fees + exit_commission,
+            "net_pnl": profit_loss,
+            "pnl_percentage": profit_loss_pct,
+            "duration_seconds": duration_seconds,
+            "exit_reason": exit_reason,
+        }
+        
+        # Remove from risk manager memory
+        self._remove_position_from_risk_manager(user_id, position["trade_id"])
 
         await self._finalize_position_close(
             db=db,
             config=config,
             position=position,
             closed_position=closed_position,
-            close_order_result=close_order_result,
             close_side=close_side,
             exit_reason=exit_reason,
             executed_qty=executed_qty,
@@ -525,7 +573,6 @@ class TradingBot:
         config: TradingConfig,
         position: Dict,
         closed_position: Dict,
-        close_order_result: Dict,
         close_side: str,
         exit_reason: str,
         executed_qty: float,
@@ -554,14 +601,16 @@ class TradingBot:
             f"POSITION_CLOSED | USER={user_id} | SYMBOL={symbol} | REASON={exit_reason} | PNL=${closed_position['net_pnl']:+.2f} | PCT={closed_position['pnl_percentage']:+.2f}% | DURATION={closed_position['duration_seconds']:.0f}s | RESULT={profit_label}"
         )
 
-        await self._record_closing_trade(
+        # ✅ FIX: Update original trade record with exit details (consistent with OCO/timeout exits)
+        await self._update_trade_record_after_exit(
             db,
-            config,
-            close_order_result,
-            close_side,
-            executed_qty,
-            exit_price,
-            exit_commission,
+            trade_id=position["trade_id"],
+            exit_price=exit_price,
+            exit_fee=exit_commission,
+            exit_reason=exit_reason,
+            profit_loss=closed_position["net_pnl"],
+            profit_loss_pct=closed_position["pnl_percentage"],
+            duration_seconds=closed_position["duration_seconds"],
         )
 
         await self._remove_open_position_from_db(db, position["trade_id"])
@@ -613,33 +662,14 @@ class TradingBot:
         logger.info("   🏦 Binance USDT Balance: $%.2f", balance)
         return balance
 
-    async def _record_closing_trade(
-        self,
-        db: AsyncSession,
-        config: TradingConfig,
-        close_order_result: Dict,
-        close_side: str,
-        executed_qty: float,
-        exit_price: float,
-        exit_commission: float,
-    ) -> None:
-        close_trade = Trade(
-            user_id=config.user_id,
-            trade_id=str(close_order_result["orderId"]),
-            symbol=config.trading_pair,
-            side=close_side.lower(),
-            amount=float(executed_qty),
-            price=float(exit_price),
-            total_value=float(executed_qty * exit_price),
-            fee=float(exit_commission),
-            status="filled",
-            is_test_trade=config.is_test_mode,
-            strategy_used="scalping_ai_exit",
-            ai_signal_confidence=0.0,
-        )
-
-        db.add(close_trade)
-        await db.commit()
+    def _remove_position_from_risk_manager(self, user_id: int, trade_id: str) -> None:
+        """Remove a position from risk manager's in-memory tracking"""
+        risk_manager_positions = self.risk_manager.get_open_positions(user_id)
+        for i, pos in enumerate(risk_manager_positions):
+            if pos.get("trade_id") == trade_id:
+                self.risk_manager.open_positions[user_id].pop(i)
+                logger.debug(f"✅ Removed position {trade_id} from risk manager memory")
+                break
 
     async def _remove_open_position_from_db(
         self, db: AsyncSession, trade_id: str
@@ -684,7 +714,9 @@ class TradingBot:
                 logger.debug("🔍 No OCO orders to check")
                 return
 
-            logger.debug(f"🔍 Checking {len(positions_with_oco)} OCO orders...")
+            logger.info(f"🔍 Checking {len(positions_with_oco)} active OCO orders...")
+            for position in positions_with_oco:
+                logger.debug(f"   📋 OCO {position.oco_order_id} | Trade {position.trade_id} | User {position.user_id}")
 
             for position in positions_with_oco:
                 await self._process_oco_position(db, position)
@@ -704,6 +736,7 @@ class TradingBot:
             oco_order_id = position.oco_order_id
             symbol = position.symbol
 
+            logger.debug(f"🔎 Querying OCO status for order {oco_order_id}...")
             oco_status = self.binance.get_oco_order_status(oco_order_id)
             if not oco_status:
                 logger.warning(
@@ -712,18 +745,23 @@ class TradingBot:
                 return
 
             order_status = oco_status.get("listOrderStatus", "UNKNOWN")
+            logger.debug(f"📊 OCO {oco_order_id} status: {order_status}")
 
             if order_status == "ALL_DONE":
-                logger.info(f"🎯 [User {user_id}] OCO ORDER EXECUTED: {oco_order_id}")
+                logger.info(f"🎯 [User {user_id}] OCO ORDER EXECUTED/DONE: {oco_order_id}")
                 await self._handle_oco_all_done(db, position, oco_status)
             elif order_status == "EXECUTING":
                 logger.debug(
                     f"⏳ [User {user_id}] OCO {oco_order_id} still active for {symbol}"
                 )
                 await self._handle_oco_executing(db, position)
+            elif order_status in ["REJECT", "CANCELLING"]:
+                logger.warning(
+                    f"⚠️  [User {user_id}] OCO {oco_order_id} has status: {order_status}. It may need manual review."
+                )
             else:
                 logger.warning(
-                    f"⚠️  [User {user_id}] OCO {oco_order_id} has unexpected status: {order_status}"
+                    f"⚠️  [User {user_id}] OCO {oco_order_id} has unexpected listOrderStatus: {order_status}"
                 )
 
         except Exception as exc:
@@ -740,9 +778,17 @@ class TradingBot:
         exit_reason, exit_price = self._extract_oco_exit_details(oco_status)
         if not exit_reason or not exit_price:
             logger.warning(
-                f"⚠️  [User {user_id}] Could not determine exit details for OCO {position.oco_order_id}"
+                f"⚠️  [User {user_id}] Could not determine exit details from OCO status for {position.oco_order_id}"
             )
-            return
+            # Fallback: try to extract from individual order details
+            exit_reason, exit_price = await self._fallback_extract_exit_details(position, oco_status)
+            
+            if not exit_reason or not exit_price:
+                logger.error(
+                    f"❌ [User {user_id}] Fallback extraction failed. Manually closing position for {symbol}"
+                )
+                await self._manually_close_stale_position(db, position)
+                return
 
         amount = float(position.amount)
         entry_price = float(position.entry_price)
@@ -766,16 +812,9 @@ class TradingBot:
         )
 
         await self._delete_position_record(db, position)
-
-        closed_position = self.risk_manager.close_position(
-            user_id, position.trade_id, exit_price, exit_reason, exit_fee
-        )
-
-        if not closed_position:
-            logger.warning(
-                f"⚠️  [User {user_id}] Risk manager could not close position {position.trade_id}"
-            )
-            return
+        
+        # Remove from risk manager memory
+        self._remove_position_from_risk_manager(user_id, position.trade_id)
 
         actual_usdt_balance = self._get_current_usdt_balance()
 
@@ -814,39 +853,281 @@ class TradingBot:
     async def _handle_oco_executing(
         self, db: AsyncSession, position: OpenPosition
     ) -> None:
-        minutes_open = (
-            datetime.now(timezone.utc) - position.opened_at
-        ).total_seconds() / 60
-
-        if minutes_open <= POSITION_TIMEOUT_MINUTES:
+        """
+        Enhanced position monitoring with time-based exit rules.
+        
+        Exit Rules:
+        1. Quick Profit: 5min + 0.2% profit → close immediately
+        2. Breakeven Timeout: 15min + stagnant (-0.1% to +0.1%) → close at breakeven
+        3. Time Stop-Loss: 20min + any loss → force close
+        4. Original Timeout: 30min → force close (legacy rule)
+        """
+        user_id = position.user_id
+        symbol = position.symbol
+        trade_id = position.trade_id
+        
+        # Calculate position metrics
+        duration_seconds = (datetime.now(timezone.utc) - position.opened_at).total_seconds()
+        duration_minutes = duration_seconds / 60
+        
+        current_price = self.binance.get_symbol_price(symbol)
+        entry_price = float(position.entry_price)
+        
+        # Calculate current P&L percentage
+        if position.side.lower() == 'buy':
+            current_pnl_pct = ((current_price - entry_price) / entry_price) * 100
+        else:  # sell
+            current_pnl_pct = ((entry_price - current_price) / entry_price) * 100
+        
+        # TIME-BASED EXIT RULES
+        
+        # Rule 1: Quick Exit for Small Profits (Scalping Logic)
+        # If position is 5+ minutes old and showing 0.2%+ profit, take it
+        if duration_seconds > 300 and current_pnl_pct > 0.2:
+            logger.info(
+                f"💰 [User {user_id}] QUICK PROFIT EXIT: {duration_minutes:.1f}min old, "
+                f"{current_pnl_pct:+.2f}% profit"
+            )
+            await self._manually_close_position_early(db, position, "QUICK_PROFIT", current_price)
+            return
+        
+        # Rule 2: Breakeven Exit for Stagnant Positions
+        # If position is 15+ minutes old and still near breakeven (-0.1% to +0.1%), exit
+        if duration_seconds > 900 and -0.1 < current_pnl_pct < 0.1:
+            logger.warning(
+                f"⚠️  [User {user_id}] BREAKEVEN TIMEOUT EXIT: {duration_minutes:.1f}min old, "
+                f"stagnant at {current_pnl_pct:+.2f}%"
+            )
+            await self._manually_close_position_early(db, position, "BREAKEVEN_TIMEOUT", current_price)
+            return
+        
+        # Rule 3: Force Exit for Losing Positions
+        # If position is 20+ minutes old and showing any loss, cut it
+        if duration_seconds > 1200 and current_pnl_pct < 0:
+            logger.error(
+                f"❌ [User {user_id}] TIME STOP-LOSS EXIT: {duration_minutes:.1f}min old, "
+                f"losing {current_pnl_pct:.2f}%"
+            )
+            await self._manually_close_position_early(db, position, "TIME_STOP_LOSS", current_price)
+            return
+        
+        # Rule 4: Original 30-minute timeout (legacy rule)
+        if duration_minutes <= POSITION_TIMEOUT_MINUTES:
             return
 
         logger.warning(
-            f"⏰ [User {position.user_id}] Position {position.trade_id} open for {minutes_open:.1f} minutes - FORCE CLOSING"
+            f"⏰ [User {user_id}] Position {trade_id} open for {duration_minutes:.1f} minutes - FORCE CLOSING (TIMEOUT)"
         )
 
-        cancel_success = self.binance.cancel_oco_order(
-            position.symbol, position.oco_order_id
-        )
+        cancel_success = self.binance.cancel_oco_order(symbol, position.oco_order_id)
         if not cancel_success:
             logger.error(
-                f"❌ [User {position.user_id}] Failed to cancel OCO {position.oco_order_id}"
+                f"❌ [User {user_id}] Failed to cancel OCO {position.oco_order_id}"
             )
             return
 
-        await self._force_close_timed_out_position(db, position, minutes_open)
+        await self._force_close_timed_out_position(db, position, duration_minutes)
 
     @staticmethod
     def _extract_oco_exit_details(oco_status: Dict) -> Tuple[Optional[str], Optional[float]]:
+        """
+        Extract which OCO leg was filled and at what price.
+        When an OCO order completes:
+        - One order will have status "FILLED" (this is the one that executed)
+        - The other order will have status "EXPIRED" (automatically expired by Binance)
+        
+        Returns: (exit_reason, exit_price)
+        """
+        logger.debug("🔍 Extracting exit details from OCO status")
+        
+        filled_order = None
+        expired_order = None
+        
         for order in oco_status.get("orders", []):
-            if order.get("status") != "FILLED":
-                continue
+            order_status = order.get("status", "")
             order_type = order.get("type", "")
-            price = float(order.get("price", 0))
+            order_id = order.get("orderId", "")
+            
+            logger.debug(f"   📋 Order {order_id}: type={order_type}, status={order_status}")
+            
+            if order_status == "FILLED":
+                filled_order = order
+            elif order_status == "EXPIRED":
+                expired_order = order
+        
+        # Primary: Use the FILLED order
+        if filled_order:
+            price = float(filled_order.get("price", 0))
+            order_type = filled_order.get("type", "")
+            
             if "STOP" in order_type.upper():
+                logger.info(f"🛑 Stop Loss triggered at ${price:.4f}")
                 return "STOP_LOSS", price
+            
+            logger.info(f"🎯 Take Profit triggered at ${price:.4f}")
             return "TAKE_PROFIT", price
+        
+        # Fallback: If no FILLED order found but we have an EXPIRED order,
+        # infer that the OTHER leg (not expired) must have filled
+        if expired_order:
+            expired_type = expired_order.get("type", "")
+            logger.debug(f"   🔄 No FILLED order found, but found EXPIRED {expired_type}")
+            
+            # If STOP_LOSS expired, then TAKE_PROFIT filled
+            # If LIMIT_MAKER expired, then STOP_LOSS filled
+            if "STOP" in expired_type.upper():
+                logger.info("✅ Inferred: Take Profit filled (Stop Loss expired)")
+                # Find the take profit order price
+                for order in oco_status.get("orders", []):
+                    if order.get("orderId") != expired_order.get("orderId"):
+                        tp_price = float(order.get("price", 0))
+                        return "TAKE_PROFIT", tp_price
+            else:
+                logger.info("✅ Inferred: Stop Loss filled (Take Profit expired)")
+                # Find the stop loss order price
+                for order in oco_status.get("orders", []):
+                    if order.get("orderId") != expired_order.get("orderId"):
+                        sl_price = float(order.get("stopPrice") or order.get("price", 0))
+                        return "STOP_LOSS", sl_price
+        
+        logger.warning("⚠️  No FILLED or EXPIRED order found in OCO status")
         return None, None
+
+    async def _fallback_extract_exit_details(
+        self, position: OpenPosition, oco_status: Dict
+    ) -> Tuple[Optional[str], Optional[float]]:
+        """
+        Fallback method to extract exit details when primary extraction fails.
+        Checks expired orders and uses recent trades to infer which leg executed.
+        """
+        logger.info(f"🔄 [User {position.user_id}] Attempting fallback extraction for OCO {position.oco_order_id}")
+        
+        # Strategy 1: Check if one order is EXPIRED - the other must have filled
+        filled_order = None
+        expired_order = None
+        
+        for order in oco_status.get("orders", []):
+            status = order.get("status", "")
+            if status == "EXPIRED":
+                expired_order = order
+            elif status == "FILLED":
+                filled_order = order
+        
+        # If we have a filled order that we missed before, use it
+        if filled_order:
+            price = float(filled_order.get("price", 0))
+            order_type = filled_order.get("type", "")
+            
+            if "STOP" in order_type.upper():
+                logger.info(f"✅ Fallback found: Stop Loss at ${price:.4f}")
+                return "STOP_LOSS", price
+            else:
+                logger.info(f"✅ Fallback found: Take Profit at ${price:.4f}")
+                return "TAKE_PROFIT", price
+        
+        # Strategy 2: If one is expired, check its price vs current price to infer which one filled
+        if expired_order:
+            try:
+                expired_price = float(expired_order.get("stopPrice") or expired_order.get("price", 0))
+                expired_type = expired_order.get("type", "")
+                
+                # Get current market price
+                current_price = self.binance.get_symbol_price(position.symbol)
+                
+                logger.debug(f"📊 Expired order: type={expired_type}, price=${expired_price:.4f}, current=${current_price:.4f}")
+                
+                # If stop order was expired, TP must have filled, and vice versa
+                if "STOP" in expired_type.upper():
+                    # Stop was expired, so Take Profit filled
+                    # Find the other order's price
+                    for order in oco_status.get("orders", []):
+                        if order.get("orderId") != expired_order.get("orderId"):
+                            tp_price = float(order.get("price", 0))
+                            logger.info(f"✅ Fallback inferred: Take Profit at ${tp_price:.4f}")
+                            return "TAKE_PROFIT", tp_price
+                else:
+                    # Limit was expired, so Stop Loss filled
+                    for order in oco_status.get("orders", []):
+                        if order.get("orderId") != expired_order.get("orderId"):
+                            sl_price = float(order.get("stopPrice") or order.get("price", 0))
+                            logger.info(f"✅ Fallback inferred: Stop Loss at ${sl_price:.4f}")
+                            return "STOP_LOSS", sl_price
+                            
+            except Exception as e:
+                logger.error(f"❌ Error in fallback inference: {e}")
+        
+        logger.warning(f"⚠️  Fallback extraction also failed for OCO {position.oco_order_id}")
+        return None, None
+
+    async def _manually_close_stale_position(
+        self, db: AsyncSession, position: OpenPosition
+    ) -> None:
+        """
+        Manually close a position when we can't determine exit details from Binance.
+        Uses current market price as the exit price.
+        """
+        user_id = position.user_id
+        symbol = position.symbol
+        
+        logger.warning(f"🔧 [User {user_id}] Manually closing stale position for {symbol}")
+        
+        try:
+            # Get current market price as exit price
+            current_price = self.binance.get_symbol_price(symbol)
+            amount = float(position.amount)
+            entry_price = float(position.entry_price)
+            entry_fees = float(position.fees_paid)
+            exit_fee = self._estimate_exit_fee(amount, current_price)
+            
+            profit_loss = self._calculate_profit_loss(
+                position.side, entry_price, current_price, amount, entry_fees, exit_fee
+            )
+            profit_loss_pct = (profit_loss / float(position.entry_value)) * 100
+            duration = (datetime.now(timezone.utc) - position.opened_at).total_seconds()
+            
+            # Infer exit reason based on P&L
+            exit_reason = "TAKE_PROFIT" if profit_loss > 0 else "STOP_LOSS"
+            
+            logger.info(f"🔧 [User {user_id}] Manual close details:")
+            logger.info(f"   💰 Current Price: ${current_price:.4f}")
+            logger.info(f"   📈 Entry: ${entry_price:.4f} → Exit: ${current_price:.4f}")
+            logger.info(f"   💵 P&L: ${profit_loss:.2f} ({profit_loss_pct:+.2f}%)")
+            logger.info(f"   📝 Inferred Reason: {exit_reason}")
+            
+            await self._update_trade_record_after_exit(
+                db,
+                position.trade_id,
+                current_price,
+                exit_fee,
+                f"MANUAL_CLOSE_{exit_reason}",
+                profit_loss,
+                profit_loss_pct,
+                duration,
+            )
+            
+            await self._delete_position_record(db, position)
+            self._remove_position_from_risk_manager(user_id, position.trade_id)
+            
+            actual_usdt_balance = self._get_current_usdt_balance()
+            
+            logger.info(f"✅ [User {user_id}] Stale position manually closed")
+            logger.info(f"   🏦 USDT Balance: ${actual_usdt_balance:.2f}")
+            
+            await self._notify_oco_position_closed(
+                user_id,
+                symbol,
+                position.side,
+                amount,
+                entry_price,
+                current_price,
+                profit_loss,
+                profit_loss_pct,
+                f"MANUAL_CLOSE_{exit_reason}",
+                actual_usdt_balance,
+            )
+            
+        except Exception as e:
+            logger.error(f"❌ [User {user_id}] Failed to manually close position: {e}")
 
     @staticmethod
     def _estimate_exit_fee(amount: float, exit_price: float) -> float:
@@ -879,11 +1160,13 @@ class TradingBot:
         profit_loss_pct: float,
         duration_seconds: float,
     ) -> None:
+        logger.debug(f"🔍 Attempting to update trade record {trade_id} with exit details")
         trade_query = select(Trade).where(Trade.trade_id == trade_id)
         trade_result = await db.execute(trade_query)
         trade_obj = trade_result.scalar_one_or_none()
 
         if trade_obj:
+            logger.info(f"✅ Found trade {trade_id} in database - updating exit details")
             trade_obj.closed_at = datetime.now(timezone.utc)
             trade_obj.exit_price = exit_price
             trade_obj.exit_fee = exit_fee
@@ -892,8 +1175,24 @@ class TradingBot:
             trade_obj.profit_loss_percentage = profit_loss_pct
             trade_obj.duration_seconds = int(duration_seconds)
             trade_obj.status = "closed"
+            
+            logger.debug(f"   📝 Exit Price: ${exit_price:.4f}, Exit Fee: ${exit_fee:.4f}")
+            logger.debug(f"   📝 P&L: ${profit_loss:.2f} ({profit_loss_pct:+.2f}%)")
+            logger.debug(f"   📝 Reason: {exit_reason}, Duration: {int(duration_seconds)}s")
+            
             await db.commit()
-            logger.debug(f"✅ Trade record {trade_id} updated in database")
+            logger.info(f"💾 Trade record {trade_id} committed to database")
+            
+            # Verify the update
+            await db.refresh(trade_obj)
+            if trade_obj.closed_at:
+                logger.info(f"✅ Verified: closed_at = {trade_obj.closed_at.isoformat()}")
+            else:
+                logger.error("❌ ERROR: closed_at is still NULL after commit!")
+        else:
+            logger.error(f"❌ CRITICAL: Trade record {trade_id} NOT FOUND in database!")
+            logger.error("   Cannot update exit details for non-existent trade")
+            logger.error("   This indicates a mismatch between OpenPosition and Trade tables")
 
     async def _delete_position_record(
         self, db: AsyncSession, position: OpenPosition
@@ -961,6 +1260,119 @@ class TradingBot:
             },
         )
 
+    async def _manually_close_position_early(
+        self, db: AsyncSession, position: OpenPosition, exit_reason: str, current_price: float
+    ) -> None:
+        """
+        Manually close a position early due to time-based rules.
+        Cancels the OCO order and places a market order to exit.
+        
+        Args:
+            db: Database session
+            position: The OpenPosition to close
+            exit_reason: One of 'QUICK_PROFIT', 'BREAKEVEN_TIMEOUT', 'TIME_STOP_LOSS'
+            current_price: Current market price for logging
+        """
+        user_id = position.user_id
+        symbol = position.symbol
+        trade_id = position.trade_id
+        
+        logger.info(
+            f"🔧 [User {user_id}] Initiating early position close | "
+            f"Reason: {exit_reason} | Current Price: ${current_price:.2f}"
+        )
+        
+        try:
+            # Step 1: Cancel the OCO order
+            logger.debug(f"🔧 [User {user_id}] Canceling OCO order {position.oco_order_id}...")
+            cancel_success = self.binance.cancel_oco_order(symbol, position.oco_order_id)
+            
+            if not cancel_success:
+                logger.error(
+                    f"❌ [User {user_id}] Failed to cancel OCO {position.oco_order_id} for early exit"
+                )
+                return
+            
+            # Step 2: Place market order to close position
+            exit_side = "SELL" if position.side.upper() == "BUY" else "BUY"
+            
+            logger.debug(f"📤 [User {user_id}] Placing market {exit_side} order to close position...")
+            exit_order = self.binance.place_market_order(
+                symbol=symbol, side=exit_side, quantity=float(position.amount)
+            )
+            
+            if not exit_order:
+                logger.error(
+                    f"❌ [User {user_id}] Failed to place market exit order for {trade_id}"
+                )
+                return
+            
+            # Step 3: Extract exit details
+            exit_price = float(exit_order["fills"][0]["price"])
+            exit_fee = float(exit_order["fills"][0]["commission"])
+            amount = float(position.amount)
+            entry_price = float(position.entry_price)
+            entry_fees = float(position.fees_paid)
+            
+            # Step 4: Calculate P&L
+            profit_loss = self._calculate_profit_loss(
+                position.side, entry_price, exit_price, amount, entry_fees, exit_fee
+            )
+            profit_loss_pct = (profit_loss / float(position.entry_value)) * 100
+            duration_seconds = (datetime.now(timezone.utc) - position.opened_at).total_seconds()
+            
+            # Step 5: Update trade record
+            await self._update_trade_record_after_exit(
+                db,
+                trade_id,
+                exit_price,
+                exit_fee,
+                exit_reason,
+                profit_loss,
+                profit_loss_pct,
+                duration_seconds,
+            )
+            
+            # Step 6: Delete position from database
+            await self._delete_position_record(db, position)
+            
+            # Step 7: Remove from risk manager memory
+            self._remove_position_from_risk_manager(user_id, trade_id)
+            
+            # Step 8: Get updated balance and log
+            actual_usdt_balance = self._get_current_usdt_balance()
+            
+            emoji = "💰" if profit_loss > 0 else "❌" if profit_loss < 0 else "⚖️"
+            logger.info(f"{emoji} [User {user_id}] POSITION CLOSED EARLY ({exit_reason}):")
+            logger.info(f"   📊 {position.side.upper()} {amount:.6f} {symbol}")
+            logger.info(f"   📈 Entry: ${entry_price:.4f} → Exit: ${exit_price:.4f}")
+            logger.info(f"   💵 P&L: ${profit_loss:+.2f} ({profit_loss_pct:+.2f}%)")
+            logger.info(f"   ⏱️  Duration: {duration_seconds/60:.1f} minutes")
+            logger.info(f"   💰 New Balance: ${actual_usdt_balance:.2f}")
+            
+            metrics_logger.info(
+                f"EARLY_EXIT | USER={user_id} | SYMBOL={symbol} | REASON={exit_reason} | "
+                f"ENTRY=${entry_price:.4f} | EXIT=${exit_price:.4f} | PL=${profit_loss:+.2f} | "
+                f"PL_PCT={profit_loss_pct:+.2f} | DURATION={duration_seconds:.0f}s | BALANCE=${actual_usdt_balance:.2f}"
+            )
+            
+            # Step 9: Notify user via WebSocket
+            await self._notify_oco_position_closed(
+                user_id,
+                symbol,
+                position.side,
+                amount,
+                entry_price,
+                exit_price,
+                profit_loss,
+                profit_loss_pct,
+                exit_reason,
+                actual_usdt_balance,
+            )
+            
+        except Exception as e:
+            logger.error(f"❌ [User {user_id}] Error in early position close: {e}")
+
     async def _force_close_timed_out_position(
         self, db: AsyncSession, position: OpenPosition, minutes_open: float
     ) -> None:
@@ -1001,17 +1413,9 @@ class TradingBot:
         )
 
         await self._delete_position_record(db, position)
-
-        closed_position = self.risk_manager.close_position(
-            user_id,
-            position.trade_id,
-            exit_price,
-            "TIMEOUT_AUTO_CLOSE",
-            exit_fee,
-        )
-
-        if not closed_position:
-            return
+        
+        # Remove from risk manager memory
+        self._remove_position_from_risk_manager(user_id, position.trade_id)
 
         actual_usdt_balance = self._get_current_usdt_balance()
 
@@ -1094,17 +1498,29 @@ class TradingBot:
             logger.info(f"   🌐 Binance Network: {'Testnet' if settings.binance_testnet else 'Mainnet (REAL MONEY)'}")
             logger.info(f"   🎯 AI Confidence: {signal.get('final_confidence', signal.get('confidence', 0)):.1f}%")
 
-            # Calculate take profit and stop loss prices from signal
+            # Calculate take profit and stop loss prices using ADAPTIVE approach
             current_price = self.binance.get_symbol_price(symbol)
-            take_profit_price = float(signal.get('take_profit', 0))
-            stop_loss_price = float(signal.get('stop_loss', 0))
             
-            # Validate TP/SL prices
-            if not take_profit_price or not stop_loss_price:
-                logger.error(f"❌ [User {user_id}] Invalid TP/SL prices: TP={take_profit_price}, SL={stop_loss_price}")
-                return
+            # Fetch market data for adaptive exit calculations
+            kline_data = self.binance.get_kline_data(symbol, "1m", 100)
+            df_with_indicators = self.ai_analyzer.calculate_technical_indicators(kline_data)
             
-            logger.info(f"🎯 [User {user_id}] Order prices: Entry=${current_price:.4f}, TP=${take_profit_price:.4f}, SL=${stop_loss_price:.4f}")
+            # Get adaptive exit levels based on ATR and historical performance
+            adaptive_exits = await self.risk_manager.get_adaptive_exit_levels(
+                db, user_id, df_with_indicators, side.lower(), current_price
+            )
+            
+            take_profit_price = adaptive_exits['take_profit_price']
+            stop_loss_price = adaptive_exits['stop_loss_price']
+            
+            logger.info(
+                f"🎯 [User {user_id}] Adaptive Exit Levels: "
+                f"Entry=${current_price:.4f}, "
+                f"TP=${take_profit_price:.4f} ({adaptive_exits['take_profit_pct']:.2f}%), "
+                f"SL=${stop_loss_price:.4f} ({adaptive_exits['stop_loss_pct']:.2f}%), "
+                f"R:R={adaptive_exits['risk_reward_ratio']:.2f}:1, "
+                f"Source={adaptive_exits['source']}"
+            )
 
             # Place order with OCO (entry + automatic TP/SL)
             logger.debug(f"📤 [User {user_id}] Placing {side} order with OCO on Binance...")

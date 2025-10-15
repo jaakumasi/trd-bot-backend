@@ -165,33 +165,6 @@ class RiskManager:
         """Get all open positions for a user"""
         return self.open_positions.get(user_id, [])
 
-    def close_position(self, user_id: int, trade_id: str, exit_price: float, exit_reason: str, fees_paid: float) -> Optional[Dict]:
-        """Close a position and calculate P&L"""
-        position_with_index = self._find_position(user_id, trade_id)
-        if position_with_index is None:
-            return None
-
-        index, position = position_with_index
-        metrics = self._compute_exit_metrics(position, exit_price, fees_paid)
-
-        closed_position = {
-            **position,
-            **metrics,
-            "exit_reason": exit_reason,
-        }
-
-        self.open_positions[user_id].pop(index)
-
-        logger.info(
-            "💰 [User %s] Position CLOSED: %+0.2f USD (%+0.2f%%) - %s",
-            user_id,
-            metrics["net_pnl"],
-            metrics["pnl_percentage"],
-            exit_reason,
-        )
-
-        return closed_position
-
     def check_exit_conditions(self, user_id: int, current_price: float, symbol: str) -> list:
         """Check if any positions should be closed based on current price"""
         positions_to_close = []
@@ -219,6 +192,210 @@ class RiskManager:
         """Reset daily trade counters (called at midnight)"""
         self.daily_trade_count.clear()
         logger.info("Daily trade counters reset")
+
+    async def get_adaptive_exit_levels(
+        self, 
+        db, 
+        user_id: int, 
+        df, 
+        side: str,
+        entry_price: float
+    ) -> Dict:
+        """
+        Calculate optimal SL/TP based on:
+        1. Current market volatility (ATR) - inversely scaled
+        2. Historical user performance in similar volatility
+        3. Safety caps to prevent excessive risk
+        
+        Philosophy:
+        - High volatility → Wider stops (larger ATR multipliers) to avoid premature exits
+        - Low volatility → Tighter stops (smaller ATR multipliers) for precision
+        
+        Returns:
+            {
+                "stop_loss_pct": float,
+                "take_profit_pct": float,
+                "stop_loss_price": float,
+                "take_profit_price": float,
+                "source": str,
+                "atr_value": float,
+                "atr_pct": float,
+                "risk_reward_ratio": float,
+                "volatility_regime": str
+            }
+        """
+        try:
+            # 1. ATR-Based Dynamic Stops with Adaptive Multipliers
+            atr = df['atr'].iloc[-1]
+            current_price = df['close'].iloc[-1]
+            atr_percentage = (atr / current_price) * 100
+            
+            # Calculate ATR percentile to determine volatility regime
+            atr_history = df['atr'].tail(100) if len(df) >= 100 else df['atr']
+            from scipy.stats import percentileofscore
+            volatility_percentile = percentileofscore(atr_history, atr)
+            
+            # Adaptive Multipliers based on volatility regime
+            # High volatility (>75th percentile) → Wider stops (2.5-3x ATR)
+            # Medium volatility (25th-75th) → Standard stops (1.8-2.2x ATR)
+            # Low volatility (<25th percentile) → Tighter stops (1.2-1.5x ATR)
+            
+            if volatility_percentile > 75:
+                # HIGH VOLATILITY: Use wider stops to avoid noise
+                sl_multiplier = 2.8
+                tp_multiplier = 3.5
+                volatility_regime = "HIGH"
+            elif volatility_percentile > 50:
+                # MEDIUM-HIGH VOLATILITY
+                sl_multiplier = 2.2
+                tp_multiplier = 2.8
+                volatility_regime = "MEDIUM_HIGH"
+            elif volatility_percentile > 25:
+                # MEDIUM VOLATILITY
+                sl_multiplier = 1.8
+                tp_multiplier = 2.3
+                volatility_regime = "MEDIUM"
+            else:
+                # LOW VOLATILITY: Use tighter stops for precision
+                sl_multiplier = 1.3
+                tp_multiplier = 1.7
+                volatility_regime = "LOW"
+            
+            # Calculate percentage distances
+            dynamic_sl_pct = atr_percentage * sl_multiplier
+            dynamic_tp_pct = atr_percentage * tp_multiplier
+            
+            # Calculate percentage distances
+            dynamic_sl_pct = atr_percentage * sl_multiplier
+            dynamic_tp_pct = atr_percentage * tp_multiplier
+            
+            # 2. Historical Performance Adjustment (Volatility-Aware)
+            try:
+                from sqlalchemy import select
+                from ..models.trade import Trade
+                
+                query = select(Trade).where(
+                    Trade.user_id == user_id,
+                    Trade.status == "closed"
+                ).order_by(Trade.closed_at.desc()).limit(50)
+                
+                result = await db.execute(query)
+                trades_list = result.scalars().all()
+                
+                if len(trades_list) >= 10:
+                    # Calculate average actual exit percentage for wins/losses
+                    winning_exits = [
+                        abs(float(t.profit_loss_percentage)) 
+                        for t in trades_list 
+                        if t.profit_loss and float(t.profit_loss) > 0 and t.profit_loss_percentage
+                    ]
+                    losing_exits = [
+                        abs(float(t.profit_loss_percentage))
+                        for t in trades_list
+                        if t.profit_loss and float(t.profit_loss) < 0 and t.profit_loss_percentage
+                    ]
+                    
+                    if winning_exits and len(winning_exits) >= 5:
+                        # TP: Take 75% of average winning exit (conservative)
+                        import numpy as np
+                        historical_tp = np.mean(winning_exits) * 0.75
+                        # Only adjust if historical is significantly larger
+                        if historical_tp > dynamic_tp_pct * 1.2:
+                            dynamic_tp_pct = min(dynamic_tp_pct * 1.3, historical_tp)
+                    
+                    if losing_exits and len(losing_exits) >= 5:
+                        # SL: Use 110% of average losing exit (slightly more room)
+                        import numpy as np
+                        historical_sl = np.mean(losing_exits) * 1.1
+                        # Only adjust if historical suggests wider stops needed
+                        if historical_sl > dynamic_sl_pct:
+                            dynamic_sl_pct = min(dynamic_sl_pct * 1.2, historical_sl)
+            
+            except Exception as hist_error:
+                logger.warning(f"⚠️ Could not fetch historical performance for adaptive exits: {hist_error}")
+                # Continue with ATR-based values
+            
+            # 3. Volatility-Adjusted Safety Caps
+            # High volatility periods need wider caps
+            if volatility_regime == "HIGH":
+                max_sl = 1.5  # Allow up to 1.5% SL in high volatility
+                min_sl = 0.5
+                max_tp = 2.5  # Allow up to 2.5% TP
+                min_tp = 0.8
+            elif volatility_regime in ["MEDIUM_HIGH", "MEDIUM"]:
+                max_sl = 1.0
+                min_sl = 0.4
+                max_tp = 1.8
+                min_tp = 0.6
+            else:  # LOW volatility
+                max_sl = 0.7  # Tighter caps in low volatility
+                min_sl = 0.25
+                max_tp = 1.0
+                min_tp = 0.4
+            
+            dynamic_sl_pct = min(dynamic_sl_pct, max_sl)
+            dynamic_sl_pct = max(dynamic_sl_pct, min_sl)
+            dynamic_tp_pct = min(dynamic_tp_pct, max_tp)
+            dynamic_tp_pct = max(dynamic_tp_pct, min_tp)
+            
+            # 4. Calculate actual prices based on side
+            if side.lower() == "buy":
+                stop_loss_price = entry_price * (1 - dynamic_sl_pct / 100)
+                take_profit_price = entry_price * (1 + dynamic_tp_pct / 100)
+            else:  # sell
+                stop_loss_price = entry_price * (1 + dynamic_sl_pct / 100)
+                take_profit_price = entry_price * (1 - dynamic_tp_pct / 100)
+            
+            result = {
+                "stop_loss_pct": dynamic_sl_pct,
+                "take_profit_pct": dynamic_tp_pct,
+                "stop_loss_price": stop_loss_price,
+                "take_profit_price": take_profit_price,
+                "source": "dynamic_atr",
+                "atr_value": float(atr),
+                "atr_pct": atr_percentage,
+                "risk_reward_ratio": dynamic_tp_pct / dynamic_sl_pct,
+                "volatility_regime": volatility_regime,
+                "volatility_percentile": volatility_percentile,
+                "sl_multiplier": sl_multiplier,
+                "tp_multiplier": tp_multiplier
+            }
+            
+            logger.info(
+                f"📊 [User {user_id}] Adaptive Exits ({volatility_regime} Vol): "
+                f"SL={dynamic_sl_pct:.2f}% (${stop_loss_price:.4f}) [{sl_multiplier}x ATR], "
+                f"TP={dynamic_tp_pct:.2f}% (${take_profit_price:.4f}) [{tp_multiplier}x ATR], "
+                f"R:R={result['risk_reward_ratio']:.2f}:1, "
+                f"ATR={atr_percentage:.3f}%, Vol_Pct={volatility_percentile:.0f}"
+            )
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ Error calculating adaptive exit levels: {e}")
+            # Fallback to fixed percentages
+            if side.lower() == "buy":
+                return {
+                    "stop_loss_pct": 0.5,
+                    "take_profit_pct": 0.3,
+                    "stop_loss_price": entry_price * 0.995,
+                    "take_profit_price": entry_price * 1.003,
+                    "source": "fallback_fixed",
+                    "atr_value": 0,
+                    "atr_pct": 0,
+                    "risk_reward_ratio": 0.6
+                }
+            else:
+                return {
+                    "stop_loss_pct": 0.5,
+                    "take_profit_pct": 0.3,
+                    "stop_loss_price": entry_price * 1.005,
+                    "take_profit_price": entry_price * 0.997,
+                    "source": "fallback_fixed",
+                    "atr_value": 0,
+                    "atr_pct": 0,
+                    "risk_reward_ratio": 0.6
+                }
 
     @staticmethod
     def _to_float(value: Union[float, Decimal, int]) -> float:
@@ -308,38 +485,6 @@ class RiskManager:
         )
         if today_count >= max_trades:
             raise RiskValidationError(f"Daily trade limit reached ({max_trades})")
-
-    def _find_position(self, user_id: int, trade_id: str) -> Optional[Tuple[int, Dict]]:
-        positions = self.open_positions.get(user_id)
-        if not positions:
-            return None
-        for index, position in enumerate(positions):
-            if position.get("trade_id") == trade_id:
-                return index, position
-        return None
-
-    def _compute_exit_metrics(
-        self, position: Dict, exit_price: float, fees_paid: float
-    ) -> Dict:
-        pnl = self._calculate_pnl(position, exit_price)
-        total_fees = position["fees_paid"] + fees_paid
-        net_pnl = pnl - total_fees
-        pnl_percentage = (net_pnl / position["entry_value"]) * 100
-
-        current_time = datetime.now(timezone.utc)
-        entry_time = self._ensure_timezone(position["entry_time"])
-        duration_seconds = (current_time - entry_time).total_seconds()
-
-        return {
-            "exit_price": exit_price,
-            "exit_time": current_time,
-            "exit_fees": fees_paid,
-            "total_fees": total_fees,
-            "gross_pnl": pnl,
-            "net_pnl": net_pnl,
-            "pnl_percentage": pnl_percentage,
-            "duration_seconds": duration_seconds,
-        }
 
     @staticmethod
     def _calculate_pnl(position: Dict, exit_price: float) -> float:
