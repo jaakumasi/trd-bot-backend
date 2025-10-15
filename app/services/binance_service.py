@@ -434,7 +434,6 @@ class BinanceService:
         - Execution details
         """
         try:
-            # Use v3_get_order_list as per python-binance API documentation
             result = self.client.v3_get_order_list(orderListId=int(order_list_id))
             return result
             
@@ -445,11 +444,11 @@ class BinanceService:
     def cancel_oco_order(self, symbol: str, order_list_id: str) -> bool:
         """Cancel an active OCO order on Binance"""
         try:
-            self.client.cancel_order_list(
-                symbol=symbol,
-                orderListId=int(order_list_id)
-            )
-            logger.info(f"✅ OCO order cancelled: {order_list_id}")
+            result = self.client._delete('orderList', True, data={
+                'symbol': symbol,
+                'orderListId': int(order_list_id)
+            })
+            logger.info(f"✅ OCO order cancelled: {order_list_id} - {result}")
             return True
             
         except Exception as e:
