@@ -203,9 +203,13 @@ class RiskManager:
     ) -> Dict:
         """
         Calculate optimal SL/TP based on:
-        1. Current market volatility (ATR)
+        1. Current market volatility (ATR) - inversely scaled
         2. Historical user performance in similar volatility
         3. Safety caps to prevent excessive risk
+        
+        Philosophy:
+        - High volatility → Wider stops (larger ATR multipliers) to avoid premature exits
+        - Low volatility → Tighter stops (smaller ATR multipliers) for precision
         
         Returns:
             {
@@ -216,21 +220,56 @@ class RiskManager:
                 "source": str,
                 "atr_value": float,
                 "atr_pct": float,
-                "risk_reward_ratio": float
+                "risk_reward_ratio": float,
+                "volatility_regime": str
             }
         """
         try:
-            # 1. ATR-Based Dynamic Stops
+            # 1. ATR-Based Dynamic Stops with Adaptive Multipliers
             atr = df['atr'].iloc[-1]
             current_price = df['close'].iloc[-1]
             atr_percentage = (atr / current_price) * 100
             
-            # SL = 1.5x ATR (gives breathing room for volatility)
-            # TP = 2.0x ATR (maintains 1.33:1 reward/risk)
-            dynamic_sl_pct = atr_percentage * 1.5
-            dynamic_tp_pct = atr_percentage * 2.0
+            # Calculate ATR percentile to determine volatility regime
+            atr_history = df['atr'].tail(100) if len(df) >= 100 else df['atr']
+            from scipy.stats import percentileofscore
+            volatility_percentile = percentileofscore(atr_history, atr)
             
-            # 2. Historical Performance Adjustment
+            # Adaptive Multipliers based on volatility regime
+            # High volatility (>75th percentile) → Wider stops (2.5-3x ATR)
+            # Medium volatility (25th-75th) → Standard stops (1.8-2.2x ATR)
+            # Low volatility (<25th percentile) → Tighter stops (1.2-1.5x ATR)
+            
+            if volatility_percentile > 75:
+                # HIGH VOLATILITY: Use wider stops to avoid noise
+                sl_multiplier = 2.8
+                tp_multiplier = 3.5
+                volatility_regime = "HIGH"
+            elif volatility_percentile > 50:
+                # MEDIUM-HIGH VOLATILITY
+                sl_multiplier = 2.2
+                tp_multiplier = 2.8
+                volatility_regime = "MEDIUM_HIGH"
+            elif volatility_percentile > 25:
+                # MEDIUM VOLATILITY
+                sl_multiplier = 1.8
+                tp_multiplier = 2.3
+                volatility_regime = "MEDIUM"
+            else:
+                # LOW VOLATILITY: Use tighter stops for precision
+                sl_multiplier = 1.3
+                tp_multiplier = 1.7
+                volatility_regime = "LOW"
+            
+            # Calculate percentage distances
+            dynamic_sl_pct = atr_percentage * sl_multiplier
+            dynamic_tp_pct = atr_percentage * tp_multiplier
+            
+            # Calculate percentage distances
+            dynamic_sl_pct = atr_percentage * sl_multiplier
+            dynamic_tp_pct = atr_percentage * tp_multiplier
+            
+            # 2. Historical Performance Adjustment (Volatility-Aware)
             try:
                 from sqlalchemy import select
                 from ..models.trade import Trade
@@ -256,27 +295,48 @@ class RiskManager:
                         if t.profit_loss and float(t.profit_loss) < 0 and t.profit_loss_percentage
                     ]
                     
-                    if winning_exits:
-                        # TP: 80% of average winning exit (be more conservative)
+                    if winning_exits and len(winning_exits) >= 5:
+                        # TP: Take 75% of average winning exit (conservative)
                         import numpy as np
-                        historical_tp = np.mean(winning_exits) * 0.8
-                        dynamic_tp_pct = max(dynamic_tp_pct, historical_tp)
+                        historical_tp = np.mean(winning_exits) * 0.75
+                        # Only adjust if historical is significantly larger
+                        if historical_tp > dynamic_tp_pct * 1.2:
+                            dynamic_tp_pct = min(dynamic_tp_pct * 1.3, historical_tp)
                     
-                    if losing_exits:
-                        # SL: 120% of average losing exit (give more room)
+                    if losing_exits and len(losing_exits) >= 5:
+                        # SL: Use 110% of average losing exit (slightly more room)
                         import numpy as np
-                        historical_sl = np.mean(losing_exits) * 1.2
-                        dynamic_sl_pct = max(dynamic_sl_pct, historical_sl)
+                        historical_sl = np.mean(losing_exits) * 1.1
+                        # Only adjust if historical suggests wider stops needed
+                        if historical_sl > dynamic_sl_pct:
+                            dynamic_sl_pct = min(dynamic_sl_pct * 1.2, historical_sl)
             
             except Exception as hist_error:
                 logger.warning(f"⚠️ Could not fetch historical performance for adaptive exits: {hist_error}")
                 # Continue with ATR-based values
             
-            # 3. Caps (Safety Limits)
-            dynamic_sl_pct = min(dynamic_sl_pct, 1.0)  # Max 1% loss
-            dynamic_sl_pct = max(dynamic_sl_pct, 0.3)  # Min 0.3% loss
-            dynamic_tp_pct = min(dynamic_tp_pct, 1.5)  # Max 1.5% profit
-            dynamic_tp_pct = max(dynamic_tp_pct, 0.4)  # Min 0.4% profit
+            # 3. Volatility-Adjusted Safety Caps
+            # High volatility periods need wider caps
+            if volatility_regime == "HIGH":
+                max_sl = 1.5  # Allow up to 1.5% SL in high volatility
+                min_sl = 0.5
+                max_tp = 2.5  # Allow up to 2.5% TP
+                min_tp = 0.8
+            elif volatility_regime in ["MEDIUM_HIGH", "MEDIUM"]:
+                max_sl = 1.0
+                min_sl = 0.4
+                max_tp = 1.8
+                min_tp = 0.6
+            else:  # LOW volatility
+                max_sl = 0.7  # Tighter caps in low volatility
+                min_sl = 0.25
+                max_tp = 1.0
+                min_tp = 0.4
+            
+            dynamic_sl_pct = min(dynamic_sl_pct, max_sl)
+            dynamic_sl_pct = max(dynamic_sl_pct, min_sl)
+            dynamic_tp_pct = min(dynamic_tp_pct, max_tp)
+            dynamic_tp_pct = max(dynamic_tp_pct, min_tp)
             
             # 4. Calculate actual prices based on side
             if side.lower() == "buy":
@@ -294,15 +354,19 @@ class RiskManager:
                 "source": "dynamic_atr",
                 "atr_value": float(atr),
                 "atr_pct": atr_percentage,
-                "risk_reward_ratio": dynamic_tp_pct / dynamic_sl_pct
+                "risk_reward_ratio": dynamic_tp_pct / dynamic_sl_pct,
+                "volatility_regime": volatility_regime,
+                "volatility_percentile": volatility_percentile,
+                "sl_multiplier": sl_multiplier,
+                "tp_multiplier": tp_multiplier
             }
             
             logger.info(
-                f"📊 [User {user_id}] Adaptive Exits: "
-                f"SL={dynamic_sl_pct:.2f}% (${stop_loss_price:.4f}), "
-                f"TP={dynamic_tp_pct:.2f}% (${take_profit_price:.4f}), "
+                f"📊 [User {user_id}] Adaptive Exits ({volatility_regime} Vol): "
+                f"SL={dynamic_sl_pct:.2f}% (${stop_loss_price:.4f}) [{sl_multiplier}x ATR], "
+                f"TP={dynamic_tp_pct:.2f}% (${take_profit_price:.4f}) [{tp_multiplier}x ATR], "
                 f"R:R={result['risk_reward_ratio']:.2f}:1, "
-                f"ATR={atr_percentage:.2f}%"
+                f"ATR={atr_percentage:.3f}%, Vol_Pct={volatility_percentile:.0f}"
             )
             
             return result

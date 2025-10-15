@@ -17,16 +17,20 @@ class MarketRegimeAnalyzer:
     """
     Classifies market into distinct regimes to filter trade opportunities.
     Only trades when conditions are optimal for scalping.
+    Uses adaptive thresholds based on recent market behavior.
     """
     
     def __init__(self):
         self.regime_history = []  # Last 20 regime classifications
-        self.volatility_threshold_low = 0.3  # ATR% threshold
-        self.volatility_threshold_high = 1.5
+        self.atr_history_window = 200  # Track longer history for better percentiles
+        
+        # These are dynamic and will be recalculated based on recent data
+        self.volatility_threshold_low = 0.05  # Will be updated to 20th percentile
+        self.volatility_threshold_high = 0.12  # Will be updated to 80th percentile
         
     async def classify_market_regime(self, df: pd.DataFrame, symbol: str) -> Dict:
         """
-        Primary regime classifier using multi-factor analysis.
+        Primary regime classifier using multi-factor analysis with adaptive thresholds.
         
         Args:
             df: DataFrame with OHLCV data and technical indicators
@@ -41,7 +45,9 @@ class MarketRegimeAnalyzer:
                 "atr_percentage": float,
                 "allow_scalping": True/False,
                 "sma_alignment": "BULL" | "BEAR" | "NEUTRAL",
-                "volume_trend": "INCREASING" | "DECREASING" | "STABLE"
+                "volume_trend": "INCREASING" | "DECREASING" | "STABLE",
+                "dynamic_vol_low": float,
+                "dynamic_vol_high": float
             }
         """
         
@@ -51,14 +57,26 @@ class MarketRegimeAnalyzer:
                 logger.error("❌ Missing required indicators for regime analysis")
                 return self._default_regime()
             
-            # 1. Volatility Analysis (ATR-based)
+            # 1. Volatility Analysis (ATR-based) with Dynamic Thresholds
             atr = df['atr'].iloc[-1]
             price = df['close'].iloc[-1]
             atr_percentage = (atr / price) * 100
             
-            # Calculate ATR percentile over last 100 periods
-            atr_history = df['atr'].tail(100)
+            # Calculate ATR percentile over available history (prefer 200, minimum 100)
+            lookback = min(self.atr_history_window, len(df))
+            atr_history = df['atr'].tail(lookback)
             volatility_percentile = percentileofscore(atr_history, atr)
+            
+            # Update dynamic thresholds based on recent market behavior
+            # Convert ATR to percentages for threshold comparison
+            atr_pct_history = (atr_history / df['close'].tail(lookback)) * 100
+            self.volatility_threshold_low = float(atr_pct_history.quantile(0.20))  # 20th percentile
+            self.volatility_threshold_high = float(atr_pct_history.quantile(0.80))  # 80th percentile
+            # Update dynamic thresholds based on recent market behavior
+            # Convert ATR to percentages for threshold comparison
+            atr_pct_history = (atr_history / df['close'].tail(lookback)) * 100
+            self.volatility_threshold_low = float(atr_pct_history.quantile(0.20))  # 20th percentile
+            self.volatility_threshold_high = float(atr_pct_history.quantile(0.80))  # 80th percentile
             
             # 2. Trend Strength (ADX + Price vs MAs)
             adx = df['adx'].iloc[-1] if 'adx' in df.columns else 0.0
@@ -85,7 +103,7 @@ class MarketRegimeAnalyzer:
                 volume_trend=volume_trend
             )
             
-            # 5. Scalping Permission Logic
+            # 5. Scalping Permission Logic (now considers dynamic thresholds)
             allow_scalping = self._should_allow_scalping(regime, trend_strength, atr_percentage)
             
             # 6. Calculate confidence
@@ -101,7 +119,9 @@ class MarketRegimeAnalyzer:
                 "sma_alignment": sma_alignment,
                 "volume_trend": volume_trend,
                 "adx": adx,
-                "price_vs_sma20": price_vs_sma20
+                "price_vs_sma20": price_vs_sma20,
+                "dynamic_vol_low": self.volatility_threshold_low,
+                "dynamic_vol_high": self.volatility_threshold_high
             }
             
             # Store in history
@@ -109,12 +129,13 @@ class MarketRegimeAnalyzer:
             if len(self.regime_history) > 20:
                 self.regime_history.pop(0)
             
-            # Log regime classification
+            # Log regime classification with dynamic thresholds
             emoji = "✅" if allow_scalping else "🚫"
             logger.info(
                 f"{emoji} [REGIME] {symbol} | {regime} | "
-                f"ADX={adx:.1f} | ATR%={atr_percentage:.2f}% | "
-                f"Vol_Percentile={volatility_percentile:.0f} | "
+                f"ADX={adx:.1f} | ATR%={atr_percentage:.3f}% | "
+                f"Vol_Pct={volatility_percentile:.0f} | "
+                f"Dynamic_Thresholds=[{self.volatility_threshold_low:.3f}%-{self.volatility_threshold_high:.3f}%] | "
                 f"Scalping={'ALLOWED' if allow_scalping else 'BLOCKED'}"
             )
             
@@ -154,40 +175,51 @@ class MarketRegimeAnalyzer:
                           trend_strength: float, price_vs_sma20: float, 
                           sma_alignment: str, volume_trend: str) -> str:
         """
-        Decision tree for regime classification.
+        Decision tree for regime classification with dynamic volatility thresholds.
         
         Priority Order:
-        1. High Volatility Check (safety first)
-        2. Low Volatility Check
+        1. High Volatility Check (safety first) - uses dynamic threshold
+        2. Low Volatility Check - uses dynamic threshold
         3. Trend Detection (strong trends + volume confirmation)
         4. Default to Range-Bound
         """
         
         # High Volatility Check (First Priority - Safety)
-        if atr_percentage > self.volatility_threshold_high or volatility_percentile > 90:
+        # Use BOTH percentile and dynamic threshold for robustness
+        if atr_percentage > self.volatility_threshold_high or volatility_percentile > 85:
             return "HIGH_VOLATILITY"
         
-        # Low Volatility Check
-        if atr_percentage < self.volatility_threshold_low and volatility_percentile < 20:
+        # Low Volatility Check - very tight conditions using dynamic threshold
+        if atr_percentage < self.volatility_threshold_low and volatility_percentile < 15:
             return "LOW_VOLATILITY"
         
         # Trend Detection (ADX > 25 indicates strong trend)
         if trend_strength > 25:
-            # Volume confirmation strengthens trend classification
-            # INCREASING volume confirms trend, DECREASING weakens it
-            
-            if sma_alignment == "BULL" and price_vs_sma20 > 0.3:
-                # Require higher price_vs_sma20 if volume is decreasing
-                if volume_trend == "DECREASING" and price_vs_sma20 < 0.5:
-                    return "RANGE_BOUND"  # Weak volume = questionable trend
-                return "BULL_TREND"
-            elif sma_alignment == "BEAR" and price_vs_sma20 < -0.3:
-                # Same logic for bearish trends
-                if volume_trend == "DECREASING" and price_vs_sma20 > -0.5:
-                    return "RANGE_BOUND"
-                return "BEAR_TREND"
+            return self._classify_trend_direction(
+                sma_alignment, price_vs_sma20, volume_trend
+            )
         
         # Default to range-bound if no clear trend
+        return "RANGE_BOUND"
+    
+    def _classify_trend_direction(self, sma_alignment: str, 
+                                   price_vs_sma20: float, 
+                                   volume_trend: str) -> str:
+        """Helper to classify trend direction with volume confirmation"""
+        # Volume confirmation strengthens trend classification
+        
+        if sma_alignment == "BULL" and price_vs_sma20 > 0.3:
+            # Require higher price_vs_sma20 if volume is decreasing
+            if volume_trend == "DECREASING" and price_vs_sma20 < 0.5:
+                return "RANGE_BOUND"  # Weak volume = questionable trend
+            return "BULL_TREND"
+        
+        if sma_alignment == "BEAR" and price_vs_sma20 < -0.3:
+            # Same logic for bearish trends
+            if volume_trend == "DECREASING" and price_vs_sma20 > -0.5:
+                return "RANGE_BOUND"
+            return "BEAR_TREND"
+        
         return "RANGE_BOUND"
     
     def _should_allow_scalping(self, regime: str, trend_strength: float, atr_percentage: float) -> bool:
