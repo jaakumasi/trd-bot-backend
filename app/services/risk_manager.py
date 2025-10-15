@@ -193,6 +193,146 @@ class RiskManager:
         self.daily_trade_count.clear()
         logger.info("Daily trade counters reset")
 
+    async def get_adaptive_exit_levels(
+        self, 
+        db, 
+        user_id: int, 
+        df, 
+        side: str,
+        entry_price: float
+    ) -> Dict:
+        """
+        Calculate optimal SL/TP based on:
+        1. Current market volatility (ATR)
+        2. Historical user performance in similar volatility
+        3. Safety caps to prevent excessive risk
+        
+        Returns:
+            {
+                "stop_loss_pct": float,
+                "take_profit_pct": float,
+                "stop_loss_price": float,
+                "take_profit_price": float,
+                "source": str,
+                "atr_value": float,
+                "atr_pct": float,
+                "risk_reward_ratio": float
+            }
+        """
+        try:
+            # 1. ATR-Based Dynamic Stops
+            atr = df['atr'].iloc[-1]
+            current_price = df['close'].iloc[-1]
+            atr_percentage = (atr / current_price) * 100
+            
+            # SL = 1.5x ATR (gives breathing room for volatility)
+            # TP = 2.0x ATR (maintains 1.33:1 reward/risk)
+            dynamic_sl_pct = atr_percentage * 1.5
+            dynamic_tp_pct = atr_percentage * 2.0
+            
+            # 2. Historical Performance Adjustment
+            try:
+                from sqlalchemy import select
+                from ..models.trade import Trade
+                
+                query = select(Trade).where(
+                    Trade.user_id == user_id,
+                    Trade.status == "closed"
+                ).order_by(Trade.closed_at.desc()).limit(50)
+                
+                result = await db.execute(query)
+                trades_list = result.scalars().all()
+                
+                if len(trades_list) >= 10:
+                    # Calculate average actual exit percentage for wins/losses
+                    winning_exits = [
+                        abs(float(t.profit_loss_percentage)) 
+                        for t in trades_list 
+                        if t.profit_loss and float(t.profit_loss) > 0 and t.profit_loss_percentage
+                    ]
+                    losing_exits = [
+                        abs(float(t.profit_loss_percentage))
+                        for t in trades_list
+                        if t.profit_loss and float(t.profit_loss) < 0 and t.profit_loss_percentage
+                    ]
+                    
+                    if winning_exits:
+                        # TP: 80% of average winning exit (be more conservative)
+                        import numpy as np
+                        historical_tp = np.mean(winning_exits) * 0.8
+                        dynamic_tp_pct = max(dynamic_tp_pct, historical_tp)
+                    
+                    if losing_exits:
+                        # SL: 120% of average losing exit (give more room)
+                        import numpy as np
+                        historical_sl = np.mean(losing_exits) * 1.2
+                        dynamic_sl_pct = max(dynamic_sl_pct, historical_sl)
+            
+            except Exception as hist_error:
+                logger.warning(f"⚠️ Could not fetch historical performance for adaptive exits: {hist_error}")
+                # Continue with ATR-based values
+            
+            # 3. Caps (Safety Limits)
+            dynamic_sl_pct = min(dynamic_sl_pct, 1.0)  # Max 1% loss
+            dynamic_sl_pct = max(dynamic_sl_pct, 0.3)  # Min 0.3% loss
+            dynamic_tp_pct = min(dynamic_tp_pct, 1.5)  # Max 1.5% profit
+            dynamic_tp_pct = max(dynamic_tp_pct, 0.4)  # Min 0.4% profit
+            
+            # 4. Calculate actual prices based on side
+            if side.lower() == "buy":
+                stop_loss_price = entry_price * (1 - dynamic_sl_pct / 100)
+                take_profit_price = entry_price * (1 + dynamic_tp_pct / 100)
+            else:  # sell
+                stop_loss_price = entry_price * (1 + dynamic_sl_pct / 100)
+                take_profit_price = entry_price * (1 - dynamic_tp_pct / 100)
+            
+            result = {
+                "stop_loss_pct": dynamic_sl_pct,
+                "take_profit_pct": dynamic_tp_pct,
+                "stop_loss_price": stop_loss_price,
+                "take_profit_price": take_profit_price,
+                "source": "dynamic_atr",
+                "atr_value": float(atr),
+                "atr_pct": atr_percentage,
+                "risk_reward_ratio": dynamic_tp_pct / dynamic_sl_pct
+            }
+            
+            logger.info(
+                f"📊 [User {user_id}] Adaptive Exits: "
+                f"SL={dynamic_sl_pct:.2f}% (${stop_loss_price:.4f}), "
+                f"TP={dynamic_tp_pct:.2f}% (${take_profit_price:.4f}), "
+                f"R:R={result['risk_reward_ratio']:.2f}:1, "
+                f"ATR={atr_percentage:.2f}%"
+            )
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ Error calculating adaptive exit levels: {e}")
+            # Fallback to fixed percentages
+            if side.lower() == "buy":
+                return {
+                    "stop_loss_pct": 0.5,
+                    "take_profit_pct": 0.3,
+                    "stop_loss_price": entry_price * 0.995,
+                    "take_profit_price": entry_price * 1.003,
+                    "source": "fallback_fixed",
+                    "atr_value": 0,
+                    "atr_pct": 0,
+                    "risk_reward_ratio": 0.6
+                }
+            else:
+                return {
+                    "stop_loss_pct": 0.5,
+                    "take_profit_pct": 0.3,
+                    "stop_loss_price": entry_price * 1.005,
+                    "take_profit_price": entry_price * 0.997,
+                    "source": "fallback_fixed",
+                    "atr_value": 0,
+                    "atr_pct": 0,
+                    "risk_reward_ratio": 0.6
+                }
+
     @staticmethod
     def _to_float(value: Union[float, Decimal, int]) -> float:
         return float(value)

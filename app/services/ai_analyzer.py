@@ -79,6 +79,50 @@ class AIAnalyzer:
         tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
         df["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
 
+        # Average Directional Index (ADX) for trend strength
+        df = self._calculate_adx(df, period=14)
+
+        return df
+
+    def _calculate_adx(self, df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+        """
+        Calculate Average Directional Index (ADX) for trend strength.
+        ADX > 25 indicates strong trend, < 20 indicates weak/ranging market.
+        """
+        high = df['high']
+        low = df['low']
+        close = df['close']
+        
+        # True Range
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=period).mean()
+        
+        # Directional Movement
+        up_move = high - high.shift()
+        down_move = low.shift() - low
+        
+        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+        
+        plus_dm_smooth = pd.Series(plus_dm).rolling(window=period).mean()
+        minus_dm_smooth = pd.Series(minus_dm).rolling(window=period).mean()
+        
+        # Directional Indicators
+        df['plus_di'] = 100 * (plus_dm_smooth / atr)
+        df['minus_di'] = 100 * (minus_dm_smooth / atr)
+        
+        # ADX Calculation
+        dx = 100 * abs(df['plus_di'] - df['minus_di']) / (df['plus_di'] + df['minus_di'])
+        df['adx'] = dx.rolling(window=period).mean()
+        
+        # Fill NaN values with 0
+        df['adx'] = df['adx'].fillna(0)
+        df['plus_di'] = df['plus_di'].fillna(0)
+        df['minus_di'] = df['minus_di'].fillna(0)
+        
         return df
 
     async def get_user_trade_history_context(
@@ -174,7 +218,11 @@ class AIAnalyzer:
             return None
 
     async def analyze_market_data(
-        self, symbol: str, df: pd.DataFrame, user_trade_history: Optional[Dict] = None
+        self, 
+        symbol: str, 
+        df: pd.DataFrame, 
+        user_trade_history: Optional[Dict] = None,
+        regime_analysis: Optional[Dict] = None
     ) -> Dict:
         """Use Gemini AI to analyze market data and provide trading signals."""
         try:
@@ -195,10 +243,31 @@ class AIAnalyzer:
             prev = df_with_indicators.iloc[-2]
             self._latest_data = latest
 
+            # Step 1: Check if we should even analyze (regime filter)
+            if regime_analysis and not regime_analysis.get("allow_scalping"):
+                logger.info(f"🚫 Scalping blocked - Market regime: {regime_analysis.get('regime')}")
+                return self._fallback_analysis(
+                    f"Market regime {regime_analysis.get('regime')} not suitable for scalping. "
+                    f"ADX: {regime_analysis.get('trend_strength', 0):.1f}, "
+                    f"ATR%: {regime_analysis.get('atr_percentage', 0):.2f}%",
+                    float(latest["close"])
+                )
+            
+            # Step 2: Signal Confluence Check
+            confluence_score = self._calculate_signal_confluence(df_with_indicators, regime_analysis)
+            
+            if confluence_score < 60:
+                logger.info(f"⚠️ Low signal confluence: {confluence_score}/100 - Recommending HOLD")
+                return self._fallback_analysis(
+                    f"Insufficient signal confluence ({confluence_score}/100). "
+                    f"Trend alignment, momentum, volume, or regime not aligned.",
+                    float(latest["close"])
+                )
+
             market_summary = self._build_market_summary(
                 symbol, df_with_indicators, latest, prev
             )
-            prompt = self._generate_prompt(latest, market_summary, user_trade_history)
+            prompt = self._generate_prompt(latest, market_summary, user_trade_history, regime_analysis)
 
             try:
                 response = await self.model.generate_content_async(prompt)
@@ -225,6 +294,7 @@ class AIAnalyzer:
             technical_score = self._calculate_technical_score(latest)
             enriched["technical_score"] = technical_score
             enriched["final_confidence"] = min(enriched["confidence"], technical_score)
+            enriched["signal_confluence"] = confluence_score
 
             logger.info(f"🎯 Final AI Analysis: {enriched}")
             return enriched
@@ -267,11 +337,99 @@ class AIAnalyzer:
         }
         return summary
 
+    def _calculate_signal_confluence(self, df: pd.DataFrame, regime_analysis: Optional[Dict]) -> int:
+        """
+        Multi-factor signal confluence scoring.
+        
+        Checks for alignment across multiple indicators:
+        - Trend alignment (price vs SMAs) - 25 points
+        - Momentum confirmation (MACD + RSI) - 25 points
+        - Volume confirmation - 20 points
+        - Volatility regime appropriateness - 30 points
+        
+        Returns: 0-100 score (>60 required for trade)
+        """
+        score = 0
+        latest = df.iloc[-1]
+        
+        # Factor 1: Trend Alignment (25 points)
+        sma_20 = latest.get('sma_20', np.nan)
+        sma_50 = latest.get('sma_50', np.nan)
+        price = latest.get('close', 0)
+        
+        if not pd.isna(sma_20) and not pd.isna(sma_50):
+            if sma_20 > sma_50 and price > sma_20:  # Bullish alignment
+                score += 25
+            elif sma_20 < sma_50 and price < sma_20:  # Bearish alignment
+                score += 25
+            elif sma_20 > sma_50 and price > sma_50:  # Partial bull
+                score += 15
+            elif sma_20 < sma_50 and price < sma_50:  # Partial bear
+                score += 15
+        
+        # Factor 2: Momentum Confirmation (25 points)
+        rsi = latest.get('rsi', 50)
+        macd = latest.get('macd', 0)
+        macd_signal = latest.get('macd_signal', 0)
+        
+        if not pd.isna(rsi) and not pd.isna(macd):
+            # RSI in valid range (not extreme)
+            if 30 < rsi < 70:
+                score += 10
+            
+            # MACD aligned with trend
+            if macd > macd_signal and rsi > 50:  # Bullish momentum
+                score += 15
+            elif macd < macd_signal and rsi < 50:  # Bearish momentum
+                score += 15
+        
+        # Factor 3: Volume Confirmation (20 points)
+        volume = latest.get('volume', 0)
+        volume_sma = latest.get('volume_sma', 1)
+        
+        if not pd.isna(volume_sma) and volume_sma > 0:
+            volume_ratio = volume / volume_sma
+            
+            if volume_ratio > 1.2:  # Above-average volume
+                score += 20
+            elif volume_ratio > 1.0:
+                score += 10
+        
+        # Factor 4: Regime Appropriateness (30 points)
+        if regime_analysis:
+            regime = regime_analysis.get('regime')
+            trend_strength = regime_analysis.get('trend_strength', 0)
+            atr_percentage = regime_analysis.get('atr_percentage', 0)
+            
+            if regime in ['BULL_TREND', 'BEAR_TREND'] and trend_strength > 25:
+                score += 30
+                
+                # Bonus for optimal volatility range (not too high, not too low)
+                if 0.4 < atr_percentage < 1.2:  # Sweet spot for scalping
+                    score += 5
+            elif regime == 'RANGE_BOUND':
+                score += 0  # Penalize ranging markets
+            elif regime == 'HIGH_VOLATILITY':
+                score -= 20  # Penalize volatile markets
+                
+                # Extra penalty for extreme volatility
+                if atr_percentage > 2.0:
+                    score -= 10
+            elif regime == 'LOW_VOLATILITY':
+                score -= 10  # Penalize low volatility (insufficient movement)
+        
+        final_score = max(0, min(100, score))
+        
+        logger.info(f"📊 Signal Confluence Score: {final_score}/100")
+        
+        return final_score
+
     def _generate_prompt(
         self,
         latest: pd.Series,
         market_summary: Dict,
         user_trade_history: Optional[Dict] = None,
+        regime_analysis: Optional[Dict] = None
     ) -> str:
         # Build historical context section if available
         history_context = ""
@@ -295,6 +453,29 @@ class AIAnalyzer:
             
             Your confidence score should reflect this historical performance. A user with poor recent performance should receive lower confidence scores even on decent signals.
             """
+        
+        # Build regime context section if available
+        regime_context = ""
+        if regime_analysis:
+            r = regime_analysis
+            regime_context = f"""
+            Market Regime Analysis:
+            - Current Regime: {r.get('regime', 'UNKNOWN')}
+            - Trend Strength (ADX): {r.get('trend_strength', 0):.1f} (>25 = strong trend)
+            - Volatility Percentile: {r.get('volatility_percentile', 50):.0f}% (percentile among last 100 periods)
+            - ATR Percentage: {r.get('atr_percentage', 0):.2f}% (current volatility level)
+            - SMA Alignment: {r.get('sma_alignment', 'NEUTRAL')}
+            - Volume Trend: {r.get('volume_trend', 'STABLE')}
+            - Scalping Status: {'ALLOWED' if r.get('allow_scalping') else 'BLOCKED'}
+
+            REGIME-BASED TRADING RULES:
+            - BULL_TREND/BEAR_TREND with ADX>25: Favorable for scalping - trade in direction of trend
+            - RANGE_BOUND: Not suitable for scalping - recommend 'hold' unless exceptionally strong signal
+            - HIGH_VOLATILITY: Too risky for scalping - recommend 'hold' to avoid whipsaw
+            - LOW_VOLATILITY: Insufficient movement - recommend 'hold' to wait for better opportunity
+            
+            Respect the regime classification. If scalping is BLOCKED, only recommend 'hold' unless there's an exceptionally clear setup (confidence >90).
+            """
 
         return f"""
             You are an expert cryptocurrency scalping analyst. Analyze this BTC/USDT market data for a 1-minute scalping strategy:
@@ -302,12 +483,13 @@ class AIAnalyzer:
             Market Data:
             {json.dumps(market_summary, indent=2)}
             {history_context}
+            {regime_context}
             Scalping Strategy Context:
             - Target: 0.3% profit per trade
             - Stop loss: 0.5% maximum loss
             - Risk tolerance: Very conservative (1% account risk)
             - Trading timeframe: 1-5 minutes
-            - Market session: High volume hours (8AM-4PM GMT)
+            - Market session: 24/7 trading enabled
 
             Based on this data, provide a JSON response with ALL 6 required fields:
             1. "signal": "buy", "sell", or "hold" 

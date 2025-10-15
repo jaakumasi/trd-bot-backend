@@ -27,7 +27,7 @@ class Trade(Base):
     closed_at = Column(DateTime(timezone=True))
     exit_price = Column(DECIMAL(20, 8))
     exit_fee = Column(DECIMAL(20, 8), default=0)
-    exit_reason = Column(String(50))  # 'TAKE_PROFIT', 'STOP_LOSS', 'MANUAL', 'TIMEOUT'
+    exit_reason = Column(String(50))  # 'TAKE_PROFIT', 'STOP_LOSS', 'MANUAL', 'TIMEOUT', 'QUICK_PROFIT', 'BREAKEVEN_TIMEOUT', 'TIME_STOP_LOSS'
     
     # P&L tracking fields
     profit_loss = Column(DECIMAL(20, 8))  # Net P&L after all fees
