@@ -991,60 +991,81 @@ class TradingBot:
         """
         logger.debug("🔍 Extracting exit details from OCO status")
         
-        filled_order = None
-        expired_order = None
-        
-        for order in oco_status.get("orders", []):
-            order_status = order.get("status", "")
-            order_type = order.get("type", "")
-            order_id = order.get("orderId", "")
-            
-            logger.debug(f"   📋 Order {order_id}: type={order_type}, status={order_status}")
-            
-            if order_status == "FILLED":
-                filled_order = order
-            elif order_status == "EXPIRED":
-                expired_order = order
-        
-        # Primary: Use the FILLED order
+        filled_order = TradingBot._find_filled_order(oco_status)
         if filled_order:
-            price = float(filled_order.get("price", 0))
-            order_type = filled_order.get("type", "")
-            
-            if "STOP" in order_type.upper():
-                logger.info(f"🛑 Stop Loss triggered at ${price:.4f}")
-                return "STOP_LOSS", price
-            
-            logger.info(f"🎯 Take Profit triggered at ${price:.4f}")
-            return "TAKE_PROFIT", price
+            return TradingBot._process_filled_order(filled_order)
         
-        # Fallback: If no FILLED order found but we have an EXPIRED order,
-        # infer that the OTHER leg (not expired) must have filled
+        expired_order = TradingBot._find_expired_order(oco_status)
         if expired_order:
-            expired_type = expired_order.get("type", "")
-            logger.debug(f"   🔄 No FILLED order found, but found EXPIRED {expired_type}")
-            
-            # If STOP_LOSS expired, then TAKE_PROFIT filled
-            # If LIMIT_MAKER expired, then STOP_LOSS filled
-            if "STOP" in expired_type.upper():
-                logger.info("✅ Inferred: Take Profit filled (Stop Loss expired)")
-                # Find the take profit order price
-                for order in oco_status.get("orders", []):
-                    if order.get("orderId") != expired_order.get("orderId"):
-                        tp_price = float(order.get("price", 0))
-                        return "TAKE_PROFIT", tp_price
-            else:
-                logger.info("✅ Inferred: Stop Loss filled (Take Profit expired)")
-                # Find the stop loss order price
-                for order in oco_status.get("orders", []):
-                    if order.get("orderId") != expired_order.get("orderId"):
-                        sl_price = float(order.get("stopPrice") or order.get("price", 0))
-                        return "STOP_LOSS", sl_price
+            return TradingBot._infer_from_expired_order(oco_status, expired_order)
         
         logger.warning("⚠️  No FILLED or EXPIRED order found in OCO status")
         return None, None
+    
+    @staticmethod
+    def _find_filled_order(oco_status: Dict) -> Optional[Dict]:
+        """Find the FILLED order in OCO status"""
+        for order in oco_status.get("orders", []):
+            if order.get("status") == "FILLED":
+                logger.debug(f"   📋 Found FILLED order {order.get('orderId')}")
+                return order
+        return None
+    
+    @staticmethod
+    def _find_expired_order(oco_status: Dict) -> Optional[Dict]:
+        """Find the EXPIRED order in OCO status"""
+        for order in oco_status.get("orders", []):
+            if order.get("status") == "EXPIRED":
+                logger.debug(f"   📋 Found EXPIRED order {order.get('orderId')}")
+                return order
+        return None
+    
+    @staticmethod
+    def _process_filled_order(filled_order: Dict) -> Tuple[str, float]:
+        """Process a filled order to determine exit reason and price"""
+        price = float(filled_order.get("price", 0))
+        order_type = filled_order.get("type", "")
+        
+        if "STOP" in order_type.upper():
+            logger.info(f"🛑 Stop Loss triggered at ${price:.4f}")
+            return "STOP_LOSS", price
+        
+        logger.info(f"🎯 Take Profit triggered at ${price:.4f}")
+        return "TAKE_PROFIT", price
+    
+    @staticmethod
+    def _infer_from_expired_order(oco_status: Dict, expired_order: Dict) -> Tuple[Optional[str], Optional[float]]:
+        """Infer which leg filled based on which one expired"""
+        expired_type = expired_order.get("type", "")
+        logger.debug(f"   🔄 No FILLED order found, inferring from EXPIRED {expired_type}")
+        
+        # If STOP expired, then TAKE_PROFIT filled (and vice versa)
+        if "STOP" in expired_type.upper():
+            return TradingBot._find_take_profit_price(oco_status, expired_order)
+        else:
+            return TradingBot._find_stop_loss_price(oco_status, expired_order)
+    
+    @staticmethod
+    def _find_take_profit_price(oco_status: Dict, expired_order: Dict) -> Tuple[str, float]:
+        """Find take profit price from non-expired order"""
+        logger.info("✅ Inferred: Take Profit filled (Stop Loss expired)")
+        for order in oco_status.get("orders", []):
+            if order.get("orderId") != expired_order.get("orderId"):
+                tp_price = float(order.get("price", 0))
+                return "TAKE_PROFIT", tp_price
+        return None, None
+    
+    @staticmethod
+    def _find_stop_loss_price(oco_status: Dict, expired_order: Dict) -> Tuple[str, float]:
+        """Find stop loss price from non-expired order"""
+        logger.info("✅ Inferred: Stop Loss filled (Take Profit expired)")
+        for order in oco_status.get("orders", []):
+            if order.get("orderId") != expired_order.get("orderId"):
+                sl_price = float(order.get("stopPrice") or order.get("price", 0))
+                return "STOP_LOSS", sl_price
+        return None, None
 
-    async def _fallback_extract_exit_details(
+    def _fallback_extract_exit_details(
         self, position: OpenPosition, oco_status: Dict
     ) -> Tuple[Optional[str], Optional[float]]:
         """
@@ -1053,62 +1074,87 @@ class TradingBot:
         """
         logger.info(f"🔄 [User {position.user_id}] Attempting fallback extraction for OCO {position.oco_order_id}")
         
-        # Strategy 1: Check if one order is EXPIRED - the other must have filled
-        filled_order = None
-        expired_order = None
+        # Strategy 1: Direct check for filled order
+        filled_result = self._check_for_filled_order(oco_status)
+        if filled_result:
+            return filled_result
         
-        for order in oco_status.get("orders", []):
-            status = order.get("status", "")
-            if status == "EXPIRED":
-                expired_order = order
-            elif status == "FILLED":
-                filled_order = order
-        
-        # If we have a filled order that we missed before, use it
-        if filled_order:
-            price = float(filled_order.get("price", 0))
-            order_type = filled_order.get("type", "")
-            
-            if "STOP" in order_type.upper():
-                logger.info(f"✅ Fallback found: Stop Loss at ${price:.4f}")
-                return "STOP_LOSS", price
-            else:
-                logger.info(f"✅ Fallback found: Take Profit at ${price:.4f}")
-                return "TAKE_PROFIT", price
-        
-        # Strategy 2: If one is expired, check its price vs current price to infer which one filled
-        if expired_order:
-            try:
-                expired_price = float(expired_order.get("stopPrice") or expired_order.get("price", 0))
-                expired_type = expired_order.get("type", "")
-                
-                # Get current market price
-                current_price = self.binance.get_symbol_price(position.symbol)
-                
-                logger.debug(f"📊 Expired order: type={expired_type}, price=${expired_price:.4f}, current=${current_price:.4f}")
-                
-                # If stop order was expired, TP must have filled, and vice versa
-                if "STOP" in expired_type.upper():
-                    # Stop was expired, so Take Profit filled
-                    # Find the other order's price
-                    for order in oco_status.get("orders", []):
-                        if order.get("orderId") != expired_order.get("orderId"):
-                            tp_price = float(order.get("price", 0))
-                            logger.info(f"✅ Fallback inferred: Take Profit at ${tp_price:.4f}")
-                            return "TAKE_PROFIT", tp_price
-                else:
-                    # Limit was expired, so Stop Loss filled
-                    for order in oco_status.get("orders", []):
-                        if order.get("orderId") != expired_order.get("orderId"):
-                            sl_price = float(order.get("stopPrice") or order.get("price", 0))
-                            logger.info(f"✅ Fallback inferred: Stop Loss at ${sl_price:.4f}")
-                            return "STOP_LOSS", sl_price
-                            
-            except Exception as e:
-                logger.error(f"❌ Error in fallback inference: {e}")
+        # Strategy 2: Infer from expired order
+        expired_result = self._infer_from_expired_order_fallback(position, oco_status)
+        if expired_result:
+            return expired_result
         
         logger.warning(f"⚠️  Fallback extraction also failed for OCO {position.oco_order_id}")
         return None, None
+    
+    @staticmethod
+    def _check_for_filled_order(oco_status: Dict) -> Optional[Tuple[str, float]]:
+        """Check if we can find a filled order directly"""
+        for order in oco_status.get("orders", []):
+            if order.get("status") == "FILLED":
+                price = float(order.get("price", 0))
+                order_type = order.get("type", "")
+                
+                if "STOP" in order_type.upper():
+                    logger.info(f"✅ Fallback found: Stop Loss at ${price:.4f}")
+                    return "STOP_LOSS", price
+                else:
+                    logger.info(f"✅ Fallback found: Take Profit at ${price:.4f}")
+                    return "TAKE_PROFIT", price
+        return None
+    
+    def _infer_from_expired_order_fallback(
+        self, position: OpenPosition, oco_status: Dict
+    ) -> Optional[Tuple[str, float]]:
+        """Infer exit details from expired order in fallback scenario"""
+        expired_order = self._find_expired_order_in_fallback(oco_status)
+        if not expired_order:
+            return None
+        
+        try:
+            expired_type = expired_order.get("type", "")
+            current_price = self.binance.get_symbol_price(position.symbol)
+            expired_price = float(expired_order.get("stopPrice") or expired_order.get("price", 0))
+            
+            logger.debug(f"📊 Expired order: type={expired_type}, price=${expired_price:.4f}, current=${current_price:.4f}")
+            
+            # Determine which leg filled based on which expired
+            if "STOP" in expired_type.upper():
+                return self._extract_take_profit_from_orders(oco_status, expired_order)
+            else:
+                return self._extract_stop_loss_from_orders(oco_status, expired_order)
+                
+        except Exception as e:
+            logger.error(f"❌ Error in fallback inference: {e}")
+            return None
+    
+    @staticmethod
+    def _find_expired_order_in_fallback(oco_status: Dict) -> Optional[Dict]:
+        """Find expired order in fallback scenario"""
+        for order in oco_status.get("orders", []):
+            if order.get("status") == "EXPIRED":
+                return order
+        return None
+    
+    @staticmethod
+    def _extract_take_profit_from_orders(oco_status: Dict, expired_order: Dict) -> Optional[Tuple[str, float]]:
+        """Extract take profit price from non-expired order"""
+        for order in oco_status.get("orders", []):
+            if order.get("orderId") != expired_order.get("orderId"):
+                tp_price = float(order.get("price", 0))
+                logger.info(f"✅ Fallback inferred: Take Profit at ${tp_price:.4f}")
+                return "TAKE_PROFIT", tp_price
+        return None
+    
+    @staticmethod
+    def _extract_stop_loss_from_orders(oco_status: Dict, expired_order: Dict) -> Optional[Tuple[str, float]]:
+        """Extract stop loss price from non-expired order"""
+        for order in oco_status.get("orders", []):
+            if order.get("orderId") != expired_order.get("orderId"):
+                sl_price = float(order.get("stopPrice") or order.get("price", 0))
+                logger.info(f"✅ Fallback inferred: Stop Loss at ${sl_price:.4f}")
+                return "STOP_LOSS", sl_price
+        return None
 
     async def _manually_close_stale_position(
         self, db: AsyncSession, position: OpenPosition
