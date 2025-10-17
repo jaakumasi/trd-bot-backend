@@ -1,7 +1,7 @@
 """
 Market Regime Analyzer
 Classifies market conditions to filter trading opportunities.
-Only allows scalping in favorable trending conditions.
+Supports configurable strictness levels for different trading environments.
 """
 
 import pandas as pd
@@ -16,13 +16,24 @@ logger = logging.getLogger(__name__)
 class MarketRegimeAnalyzer:
     """
     Classifies market into distinct regimes to filter trade opportunities.
-    Only trades when conditions are optimal for scalping.
+    Supports three filtering modes:
+    - STRICT: Only trending markets with ADX > 25 (production safeguard)
+    - BALANCED: Trending + favorable range-bound with ADX > 20 (recommended)
+    - PERMISSIVE: Most conditions except extreme volatility (testnet/development)
     Uses adaptive thresholds based on recent market behavior.
     """
     
-    def __init__(self):
+    def __init__(self, filter_mode: str = "balanced"):
         self.regime_history = []  # Last 20 regime classifications
         self.atr_history_window = 200  # Track longer history for better percentiles
+        self.filter_mode = filter_mode.lower()
+        
+        # Validate filter mode
+        if self.filter_mode not in ["strict", "balanced", "permissive"]:
+            logger.warning(f"⚠️  Invalid filter mode '{filter_mode}', defaulting to 'balanced'")
+            self.filter_mode = "balanced"
+        
+        logger.info(f"🔧 Market Regime Analyzer initialized in {self.filter_mode.upper()} mode")
         
         # These are dynamic and will be recalculated based on recent data
         self.volatility_threshold_low = 0.05  # Will be updated to 20th percentile
@@ -132,7 +143,7 @@ class MarketRegimeAnalyzer:
             # Log regime classification with dynamic thresholds
             emoji = "✅" if allow_scalping else "🚫"
             logger.info(
-                f"{emoji} [REGIME] {symbol} | {regime} | "
+                f"{emoji} [REGIME-{self.filter_mode.upper()}] {symbol} | {regime} | "
                 f"ADX={adx:.1f} | ATR%={atr_percentage:.3f}% | "
                 f"Vol_Pct={volatility_percentile:.0f} | "
                 f"Dynamic_Thresholds=[{self.volatility_threshold_low:.3f}%-{self.volatility_threshold_high:.3f}%] | "
@@ -224,25 +235,67 @@ class MarketRegimeAnalyzer:
     
     def _should_allow_scalping(self, regime: str, trend_strength: float, atr_percentage: float) -> bool:
         """
-        Determines if scalping is permitted in current regime.
+        Determines if scalping is permitted in current regime based on filter mode.
         
-        Scalping Rules:
-        - ALLOWED: BULL_TREND, BEAR_TREND (with ADX > 25 and reasonable volatility)
-        - FORBIDDEN: HIGH_VOLATILITY, RANGE_BOUND, LOW_VOLATILITY
+        STRICT MODE (Production):
+        - Only BULL_TREND, BEAR_TREND with ADX > 25
+        - Blocks: HIGH_VOLATILITY, RANGE_BOUND, LOW_VOLATILITY
         
-        Philosophy: Only trade when there's a clear directional bias with momentum.
+        BALANCED MODE (Recommended):
+        - Trending markets: ADX > 20
+        - Favorable range-bound: ADX 15-25 with moderate volatility
+        - Blocks: HIGH_VOLATILITY, LOW_VOLATILITY with ADX < 15
+        
+        PERMISSIVE MODE (Testing/Development):
+        - Allows most conditions except HIGH_VOLATILITY
+        - Only requires ADX > 12 for basic trend validation
+        - Ideal for testing AI signals in various conditions
         """
         
-        if regime in ["BULL_TREND", "BEAR_TREND"]:
-            # Only scalp in direction of trend with sufficient momentum
-            # and volatility within acceptable range
-            return (
-                trend_strength > 25 and 
-                self.volatility_threshold_low < atr_percentage < self.volatility_threshold_high
-            )
+        # Always block extreme high volatility (safety first)
+        if regime == "HIGH_VOLATILITY":
+            return False
         
-        # Block all other conditions
-        return False
+        if self.filter_mode == "strict":
+            # Only strong trends
+            if regime in ["BULL_TREND", "BEAR_TREND"]:
+                return (
+                    trend_strength > 25 and 
+                    self.volatility_threshold_low < atr_percentage < self.volatility_threshold_high
+                )
+            return False
+        
+        elif self.filter_mode == "balanced":
+            # Allow trending markets with slightly lower ADX
+            if regime in ["BULL_TREND", "BEAR_TREND"]:
+                return (
+                    trend_strength > 20 and 
+                    self.volatility_threshold_low < atr_percentage < self.volatility_threshold_high
+                )
+            
+            # Allow range-bound markets with decent momentum
+            # More forgiving than strict - just needs some ADX and reasonable volatility
+            if regime == "RANGE_BOUND":
+                # Must have some momentum (ADX 15-30) and not be in extreme zones
+                has_momentum = 15 <= trend_strength <= 35
+                reasonable_volatility = atr_percentage > 0.02  # At least 0.02% ATR
+                return has_momentum and reasonable_volatility
+            
+            # Allow LOW_VOLATILITY if there's trend strength
+            if regime == "LOW_VOLATILITY":
+                return trend_strength > 18
+            
+            # Block HIGH_VOLATILITY only
+            return False
+        
+        else:  # permissive mode
+            # Allow almost everything except HIGH_VOLATILITY and dead markets
+            if regime == "LOW_VOLATILITY":
+                # Even low volatility is ok if there's some trend
+                return trend_strength > 12
+            
+            # All other regimes allowed with minimal trend validation
+            return trend_strength > 12
     
     def _calculate_regime_confidence(self, df: pd.DataFrame, regime: str, 
                                      trend_strength: float, volatility_percentile: float) -> float:

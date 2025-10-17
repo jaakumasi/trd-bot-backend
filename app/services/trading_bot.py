@@ -15,6 +15,7 @@ from .ai_analyzer import AIAnalyzer
 from .risk_manager import RiskManager
 from .websocket_manager import WebSocketManager
 from .market_regime_analyzer import MarketRegimeAnalyzer
+from .circuit_breaker import CircuitBreaker, CircuitBreakerTriggered
 from ..logging_config import get_trading_metrics_logger
 from ..config import settings
 from .service_constants import (
@@ -33,7 +34,8 @@ class TradingBot:
         self.binance = self._create_binance_service()
         self.ai_analyzer = AIAnalyzer()
         self.risk_manager = RiskManager()
-        self.regime_analyzer = MarketRegimeAnalyzer()
+        self.regime_analyzer = MarketRegimeAnalyzer(filter_mode=settings.regime_filter_mode)
+        self.circuit_breaker = CircuitBreaker()
         self.ws_manager = ws_manager
         self.is_running = False
         self.active_users = {}
@@ -61,6 +63,7 @@ class TradingBot:
         logger.info("✅ AI Analyzer ready")
         logger.info("🛡️  Initializing Risk Manager...")
         logger.info("✅ Risk Manager ready")
+        logger.info("🛡️  Circuit Breaker System ready")
         logger.info("🌐 WebSocket Manager ready")
 
     def _log_initialization_success(self) -> None:
@@ -319,6 +322,26 @@ class TradingBot:
 
             usdt_balance = self._fetch_usdt_balance(user_id)
 
+            # 🛡️ Circuit Breaker Check - BEFORE trade validation
+            try:
+                self.circuit_breaker.check_before_trade(user_id, usdt_balance)
+            except CircuitBreakerTriggered as cb_error:
+                logger.critical(f"🛑 [User {user_id}] CIRCUIT BREAKER TRIGGERED: {cb_error.reason}")
+                metrics_logger.info(f"CIRCUIT_BREAKER_HALT | USER={user_id} | REASON={cb_error.reason}")
+                
+                # Get detailed status for user notification
+                cb_status = self.circuit_breaker.get_user_status(user_id, usdt_balance)
+                await self.ws_manager.send_to_user(
+                    user_id,
+                    {
+                        "type": "circuit_breaker_triggered",
+                        "reason": cb_error.reason,
+                        "status": cb_status,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+                return
+
             is_valid, message, trade_params = self.risk_manager.validate_trade_signal(
                 user_id, ai_signal, usdt_balance, config.__dict__
             )
@@ -331,6 +354,9 @@ class TradingBot:
 
             await self._execute_trade(db, config, ai_signal, trade_params)
 
+        except CircuitBreakerTriggered:
+            # Already handled above, don't log as generic error
+            pass
         except Exception as e:
             logger.error(f"❌ [User {user_id}] Error in trading process: {e}")
             metrics_logger.info(f"TRADING_ERROR | USER={user_id} | ERROR={str(e)}")
@@ -345,14 +371,23 @@ class TradingBot:
 
     def _fetch_market_snapshot(self, symbol: str, user_id: int):
         logger.debug(f"📈 [User {user_id}] Fetching market data for {symbol}...")
-        kline_data = self.binance.get_kline_data(symbol, "1m", 100)
-        if kline_data.empty:
-            logger.warning(f"⚠️  [User {user_id}] No market data available for {symbol}")
-            return None
+        try:
+            kline_data = self.binance.get_kline_data(symbol, "1m", 100)
+            if kline_data.empty:
+                logger.warning(f"⚠️  [User {user_id}] No market data available for {symbol}")
+                self.circuit_breaker.record_api_failure(f"Empty kline data for {symbol}")
+                return None
 
-        current_price = float(kline_data.iloc[-1]["close"])
-        logger.debug(f"💰 [User {user_id}] Current {symbol} price: ${current_price:.4f}")
-        return kline_data, current_price
+            # API call successful
+            self.circuit_breaker.record_api_success()
+            
+            current_price = float(kline_data.iloc[-1]["close"])
+            logger.debug(f"💰 [User {user_id}] Current {symbol} price: ${current_price:.4f}")
+            return kline_data, current_price
+        except Exception as e:
+            logger.error(f"❌ [User {user_id}] API error fetching market data: {e}")
+            self.circuit_breaker.record_api_failure(f"get_kline_data failed: {str(e)}")
+            return None
 
     async def _request_ai_signal(self, symbol, kline_data, user_id: int, user_trade_history=None, regime_analysis=None):
         logger.debug(f"🤖 [User {user_id}] Running AI analysis...")
@@ -601,6 +636,14 @@ class TradingBot:
             f"POSITION_CLOSED | USER={user_id} | SYMBOL={symbol} | REASON={exit_reason} | PNL=${closed_position['net_pnl']:+.2f} | PCT={closed_position['pnl_percentage']:+.2f}% | DURATION={closed_position['duration_seconds']:.0f}s | RESULT={profit_label}"
         )
 
+        # 🛡️ Record trade result in Circuit Breaker
+        is_winner = closed_position["net_pnl"] > 0
+        self.circuit_breaker.record_trade_result(
+            user_id=user_id,
+            pnl=closed_position["net_pnl"],
+            is_winner=is_winner
+        )
+
         # ✅ FIX: Update original trade record with exit details (consistent with OCO/timeout exits)
         await self._update_trade_record_after_exit(
             db,
@@ -835,6 +878,14 @@ class TradingBot:
 
         metrics_logger.info(
             f"OCO_POSITION_CLOSED | USER={user_id} | SYMBOL={symbol} | REASON={exit_reason} | ENTRY=${entry_price:.4f} | EXIT=${exit_price:.4f} | PL=${profit_loss:.2f} | PL_PCT={profit_loss_pct:+.2f} | DURATION={duration:.0f}s | BALANCE=${actual_usdt_balance:.2f}"
+        )
+
+        # 🛡️ Record trade result in Circuit Breaker
+        is_winner = profit_loss > 0
+        self.circuit_breaker.record_trade_result(
+            user_id=user_id,
+            pnl=profit_loss,
+            is_winner=is_winner
         )
 
         await self._notify_oco_position_closed(
@@ -1356,6 +1407,14 @@ class TradingBot:
                 f"PL_PCT={profit_loss_pct:+.2f} | DURATION={duration_seconds:.0f}s | BALANCE=${actual_usdt_balance:.2f}"
             )
             
+            # 🛡️ Record trade result in Circuit Breaker
+            is_winner = profit_loss > 0
+            self.circuit_breaker.record_trade_result(
+                user_id=user_id,
+                pnl=profit_loss,
+                is_winner=is_winner
+            )
+            
             # Step 9: Notify user via WebSocket
             await self._notify_oco_position_closed(
                 user_id,
@@ -1779,6 +1838,21 @@ class TradingBot:
                     logger.info("🔄 Performing daily reset...")
                     self.risk_manager.reset_daily_counters()
                     self.last_analysis_time.clear()  # Reset analysis timers
+                    
+                    # 🛡️ Log Circuit Breaker daily summaries before reset
+                    for user_id in self.circuit_breaker.daily_pnl.keys():
+                        prev_pnl = self.circuit_breaker.daily_pnl.get(user_id, 0)
+                        prev_trades = self.circuit_breaker.daily_trade_count.get(user_id, 0)
+                        
+                        if prev_trades > 0:
+                            logger.info(
+                                f"📊 [User {user_id}] Daily Summary: "
+                                f"{prev_trades} trades, ${prev_pnl:+.2f} P&L"
+                            )
+                            metrics_logger.info(
+                                f"DAILY_SUMMARY | USER={user_id} | TRADES={prev_trades} | PNL=${prev_pnl:+.2f}"
+                            )
+                    
                     logger.info("🔄 Daily counters and analysis timers reset")
                     metrics_logger.info("DAILY_RESET | STATUS=COMPLETED")
                     
