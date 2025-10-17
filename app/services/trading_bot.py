@@ -907,11 +907,11 @@ class TradingBot:
         """
         Enhanced position monitoring with time-based exit rules.
         
-        Exit Rules:
+        Exit Rules (optimized for scalping):
         1. Quick Profit: 5min + 0.2% profit → close immediately
-        2. Breakeven Timeout: 15min + stagnant (-0.1% to +0.1%) → close at breakeven
-        3. Time Stop-Loss: 20min + any loss → force close
-        4. Original Timeout: 30min → force close (legacy rule)
+        2. Breakeven Timeout: 20min + stagnant (-0.1% to +0.1%) → close at breakeven
+        3. Time Stop-Loss: 45min + losing >0.5% → force close
+        4. Original Timeout: 60min → force close (final backstop)
         """
         user_id = position.user_id
         symbol = position.symbol
@@ -943,8 +943,8 @@ class TradingBot:
             return
         
         # Rule 2: Breakeven Exit for Stagnant Positions
-        # If position is 15+ minutes old and still near breakeven (-0.1% to +0.1%), exit
-        if duration_seconds > 900 and -0.1 < current_pnl_pct < 0.1:
+        # If position is 20+ minutes old and still near breakeven (-0.1% to +0.1%), exit
+        if duration_seconds > 1200 and -0.1 < current_pnl_pct < 0.1:
             logger.warning(
                 f"⚠️  [User {user_id}] BREAKEVEN TIMEOUT EXIT: {duration_minutes:.1f}min old, "
                 f"stagnant at {current_pnl_pct:+.2f}%"
@@ -952,9 +952,9 @@ class TradingBot:
             await self._manually_close_position_early(db, position, "BREAKEVEN_TIMEOUT", current_price)
             return
         
-        # Rule 3: Force Exit for Losing Positions
-        # If position is 20+ minutes old and showing any loss, cut it
-        if duration_seconds > 1200 and current_pnl_pct < 0:
+        # Rule 3: Force Exit for Significant Losing Positions
+        # If position is 45+ minutes old and losing >0.5%, cut it to prevent bigger losses
+        if duration_seconds > 2700 and current_pnl_pct < -0.5:
             logger.error(
                 f"❌ [User {user_id}] TIME STOP-LOSS EXIT: {duration_minutes:.1f}min old, "
                 f"losing {current_pnl_pct:.2f}%"

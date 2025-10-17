@@ -445,13 +445,15 @@ class AIAnalyzer:
             - Take Profit Hit Rate: {h['take_profit_rate']:.1f}%
             - Recent Trend: {h['recent_trend'].upper()} ({h['recent_wins']} wins in last {h['recent_total']} trades)
 
-            CRITICAL INSTRUCTIONS BASED ON USER HISTORY:
-            - If win_rate < 40% OR recent_trend is "losing": BE VERY CONSERVATIVE. Only recommend 'buy' or 'sell' if confidence would naturally be >85%. Consider recommending 'hold' more often.
-            - If stop_loss_rate > 60%: This user frequently hits stop losses. Be extra cautious and only trade on very strong signals.
-            - If recent_trend is "losing": The user is on a losing streak. Prioritize capital preservation. Reduce your confidence score by 15-20 points.
-            - If win_rate > 60% AND recent_trend is "winning": You can be slightly more confident, but still maintain discipline.
+            INSTRUCTIONS BASED ON USER HISTORY (USE WITH MODERATION):
+            - If win_rate < 30% OR (win_rate < 40% AND recent_trend is "losing"): Be more conservative. Reduce confidence by 10-15 points if considering a trade.
+            - If stop_loss_rate > 70%: User frequently hits stop losses. Focus on higher-quality setups with stronger confluence.
+            - If recent_trend is "losing" (only 0-1 wins in last 5 trades): Reduce confidence by 5-10 points to encourage caution.
+            - If win_rate > 55% AND recent_trend is "winning": You can maintain normal confidence levels.
             
-            Your confidence score should reflect this historical performance. A user with poor recent performance should receive lower confidence scores even on decent signals.
+            IMPORTANT: Historical performance should influence confidence scores moderately, NOT cause complete avoidance of trading.
+            For scalping strategies, some losses are normal. Do not over-penalize recent losses - focus on technical setup quality.
+            Your primary job is to analyze current market conditions, with history as a secondary factor.
             """
         
         # Build regime context section if available
@@ -482,7 +484,7 @@ class AIAnalyzer:
 
             Market Data:
             {json.dumps(market_summary, indent=2)}
-            {history_context}
+            
             {regime_context}
             Scalping Strategy Context:
             - Target: 0.3% profit per trade

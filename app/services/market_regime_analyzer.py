@@ -190,28 +190,38 @@ class MarketRegimeAnalyzer:
         Decision tree for regime classification with dynamic volatility thresholds.
         
         Priority Order:
-        1. High Volatility Check (safety first) - uses dynamic threshold
-        2. Low Volatility Check - uses dynamic threshold
-        3. Trend Detection (strong trends + volume confirmation)
+        1. Trend Detection FIRST (strong ADX = trend, not volatility)
+        2. High Volatility Check (safety for genuinely chaotic markets)
+        3. Low Volatility Check
         4. Default to Range-Bound
+        
+        Key Fix: High ADX (40+) indicates STRONG TREND, not necessarily high volatility.
+        Only classify as HIGH_VOLATILITY if ATR is genuinely extreme AND no clear trend.
         """
         
-        # High Volatility Check (First Priority - Safety)
-        # Use BOTH percentile and dynamic threshold for robustness
-        if atr_percentage > self.volatility_threshold_high or volatility_percentile > 90:
-            return "HIGH_VOLATILITY"
-        
-        # Low Volatility Check - very tight conditions using dynamic threshold
-        if atr_percentage < self.volatility_threshold_low and volatility_percentile < 20:
-            return "LOW_VOLATILITY"
-        
-        # Trend Detection (ADX > 25 indicates strong trend)
-        if trend_strength > 25:
+        # PRIORITY 1: Strong Trend Detection (ADX > 35 = definite trend)
+        # This prevents misclassifying strong trends as "high volatility"
+        if trend_strength > 35:
             return self._classify_trend_direction(
                 sma_alignment, price_vs_sma20, volume_trend
             )
         
-        # Default to range-bound if no clear trend
+        # PRIORITY 2: High Volatility Check (genuinely chaotic markets)
+        # Only flag HIGH_VOLATILITY if ATR is extreme AND we don't have a clear trend
+        if volatility_percentile > 95 and trend_strength < 25:
+            return "HIGH_VOLATILITY"
+        
+        # PRIORITY 3: Low Volatility Check
+        if atr_percentage < self.volatility_threshold_low and volatility_percentile < 20:
+            return "LOW_VOLATILITY"
+        
+        # PRIORITY 4: Moderate Trend Detection (ADX 20-35)
+        if trend_strength > 20:
+            return self._classify_trend_direction(
+                sma_alignment, price_vs_sma20, volume_trend
+            )
+        
+        # Default to range-bound if no clear pattern
         return "RANGE_BOUND"
     
     def _classify_trend_direction(self, sma_alignment: str, 
@@ -238,47 +248,31 @@ class MarketRegimeAnalyzer:
         """
         Determines if scalping is permitted in current regime based on filter mode.
         
-        STRICT MODE (Production):
-        - Only BULL_TREND, BEAR_TREND with ADX > 25
-        - Blocks: HIGH_VOLATILITY, RANGE_BOUND, LOW_VOLATILITY
-        
-        BALANCED MODE (Recommended):
-        - Trending markets: ADX > 20
-        - Favorable range-bound: ADX 15-25 with moderate volatility
-        - Blocks: HIGH_VOLATILITY, LOW_VOLATILITY with ADX < 15
-        
-        PERMISSIVE MODE (Testing/Development):
-        - Allows most conditions except HIGH_VOLATILITY
-        - Only requires ADX > 12 for basic trend validation
-        - Ideal for testing AI signals in various conditions
-        
-        SCALPING MODE (High-Frequency):
-        - Allows LOW_VOLATILITY and RANGE_BOUND if ADX > 15
-        - Requires tight ATR (not in HIGH_VOLATILITY)
-        - Optimized for capturing small, quick movements
+        Key Changes:
+        - HIGH_VOLATILITY with strong trend (ADX>35) now ALLOWED for trend-following
+        - Removed blanket ban on HIGH_VOLATILITY since strong trends often have high ATR
         """
         
-        # Always block extreme high volatility (safety first)
-        if regime == "HIGH_VOLATILITY":
-            return False
-            
+        # For scalping mode, allow almost everything except genuinely chaotic markets
         if self.filter_mode == "scalping":
-            # For scalping, we need *some* volatility, but not too much.
-            # Allow low volatility and range-bound if there's enough momentum.
-            is_tradable_volatility = self.volatility_threshold_low * 0.8 < atr_percentage < self.volatility_threshold_high * 1.2
-            has_momentum = trend_strength > 15
+            # Block only if HIGH_VOLATILITY with weak trend (choppy/chaotic)
+            if regime == "HIGH_VOLATILITY" and trend_strength < 20:
+                return False
             
+            # Allow trends regardless of volatility if ADX strong
+            if regime in ["BULL_TREND", "BEAR_TREND"] and trend_strength > 20:
+                return True
+            
+            # Allow range-bound/low volatility with momentum
             if regime in ["LOW_VOLATILITY", "RANGE_BOUND"]:
+                is_tradable_volatility = self.volatility_threshold_low * 0.8 < atr_percentage < self.volatility_threshold_high * 1.5
+                has_momentum = trend_strength > 15
                 return is_tradable_volatility and has_momentum
             
-            # Also allow trends if they aren't excessively volatile
-            if regime in ["BULL_TREND", "BEAR_TREND"]:
-                return trend_strength > 20 and is_tradable_volatility
-            
-            return False
+            return True  # Default allow for scalping mode
         
+        # Strict mode - only strong trends
         if self.filter_mode == "strict":
-            # Only strong trends
             if regime in ["BULL_TREND", "BEAR_TREND"]:
                 return (
                     trend_strength > 25 and 
@@ -286,36 +280,35 @@ class MarketRegimeAnalyzer:
                 )
             return False
         
+        # Balanced mode - allow trends and favorable range conditions
         elif self.filter_mode == "balanced":
-            # Allow trending markets with slightly lower ADX
-            if regime in ["BULL_TREND", "BEAR_TREND"]:
-                return (
-                    trend_strength > 20 and 
-                    self.volatility_threshold_low < atr_percentage < self.volatility_threshold_high
-                )
+            # Always allow strong trends
+            if regime in ["BULL_TREND", "BEAR_TREND"] and trend_strength > 20:
+                return True
             
-            # Allow range-bound markets with decent momentum
-            # More forgiving than strict - just needs some ADX and reasonable volatility
+            # Allow range-bound with momentum
             if regime == "RANGE_BOUND":
-                # Must have some momentum (ADX 15-30) and not be in extreme zones
                 has_momentum = 15 <= trend_strength <= 35
-                reasonable_volatility = atr_percentage > 0.02  # At least 0.02% ATR
+                reasonable_volatility = atr_percentage > 0.02
                 return has_momentum and reasonable_volatility
             
-            # Allow LOW_VOLATILITY if there's trend strength
+            # Allow LOW_VOLATILITY with trend strength
             if regime == "LOW_VOLATILITY":
                 return trend_strength > 18
             
-            # Block HIGH_VOLATILITY only
+            # Block HIGH_VOLATILITY without clear trend
+            if regime == "HIGH_VOLATILITY":
+                return trend_strength > 30
+            
             return False
         
-        else:  # permissive mode
-            # Allow almost everything except HIGH_VOLATILITY and dead markets
+        else:  # permissive mode - allow almost everything
             if regime == "LOW_VOLATILITY":
-                # Even low volatility is ok if there's some trend
                 return trend_strength > 12
             
-            # All other regimes allowed with minimal trend validation
+            if regime == "HIGH_VOLATILITY":
+                return trend_strength > 25  # Need decent trend to trade high volatility
+            
             return trend_strength > 12
     
     def _calculate_regime_confidence(self, df: pd.DataFrame, regime: str, 
