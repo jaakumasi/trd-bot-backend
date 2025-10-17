@@ -16,22 +16,23 @@ logger = logging.getLogger(__name__)
 class MarketRegimeAnalyzer:
     """
     Classifies market into distinct regimes to filter trade opportunities.
-    Supports three filtering modes:
+    Supports four filtering modes:
     - STRICT: Only trending markets with ADX > 25 (production safeguard)
     - BALANCED: Trending + favorable range-bound with ADX > 20 (recommended)
     - PERMISSIVE: Most conditions except extreme volatility (testnet/development)
+    - SCALPING: Optimized for high-frequency trading, allows low volatility
     Uses adaptive thresholds based on recent market behavior.
     """
     
-    def __init__(self, filter_mode: str = "balanced"):
+    def __init__(self, filter_mode: str = "scalping"):
         self.regime_history = []  # Last 20 regime classifications
         self.atr_history_window = 200  # Track longer history for better percentiles
         self.filter_mode = filter_mode.lower()
         
         # Validate filter mode
-        if self.filter_mode not in ["strict", "balanced", "permissive"]:
-            logger.warning(f"⚠️  Invalid filter mode '{filter_mode}', defaulting to 'balanced'")
-            self.filter_mode = "balanced"
+        if self.filter_mode not in ["strict", "balanced", "permissive", "scalping"]:
+            logger.warning(f"⚠️  Invalid filter mode '{filter_mode}', defaulting to 'scalping'")
+            self.filter_mode = "scalping"
         
         logger.info(f"🔧 Market Regime Analyzer initialized in {self.filter_mode.upper()} mode")
         
@@ -197,11 +198,11 @@ class MarketRegimeAnalyzer:
         
         # High Volatility Check (First Priority - Safety)
         # Use BOTH percentile and dynamic threshold for robustness
-        if atr_percentage > self.volatility_threshold_high or volatility_percentile > 85:
+        if atr_percentage > self.volatility_threshold_high or volatility_percentile > 90:
             return "HIGH_VOLATILITY"
         
         # Low Volatility Check - very tight conditions using dynamic threshold
-        if atr_percentage < self.volatility_threshold_low and volatility_percentile < 15:
+        if atr_percentage < self.volatility_threshold_low and volatility_percentile < 20:
             return "LOW_VOLATILITY"
         
         # Trend Detection (ADX > 25 indicates strong trend)
@@ -250,10 +251,30 @@ class MarketRegimeAnalyzer:
         - Allows most conditions except HIGH_VOLATILITY
         - Only requires ADX > 12 for basic trend validation
         - Ideal for testing AI signals in various conditions
+        
+        SCALPING MODE (High-Frequency):
+        - Allows LOW_VOLATILITY and RANGE_BOUND if ADX > 15
+        - Requires tight ATR (not in HIGH_VOLATILITY)
+        - Optimized for capturing small, quick movements
         """
         
         # Always block extreme high volatility (safety first)
         if regime == "HIGH_VOLATILITY":
+            return False
+            
+        if self.filter_mode == "scalping":
+            # For scalping, we need *some* volatility, but not too much.
+            # Allow low volatility and range-bound if there's enough momentum.
+            is_tradable_volatility = self.volatility_threshold_low * 0.8 < atr_percentage < self.volatility_threshold_high * 1.2
+            has_momentum = trend_strength > 15
+            
+            if regime in ["LOW_VOLATILITY", "RANGE_BOUND"]:
+                return is_tradable_volatility and has_momentum
+            
+            # Also allow trends if they aren't excessively volatile
+            if regime in ["BULL_TREND", "BEAR_TREND"]:
+                return trend_strength > 20 and is_tradable_volatility
+            
             return False
         
         if self.filter_mode == "strict":
