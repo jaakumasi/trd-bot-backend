@@ -253,13 +253,19 @@ class AIAnalyzer:
                     float(latest["close"])
                 )
             
-            # Step 2: Signal Confluence Check
+            # Step 2: Signal Confluence Check (now with dynamic thresholds!)
             confluence_score = self._calculate_signal_confluence(df_with_indicators, regime_analysis)
             
-            if confluence_score < 60:
-                logger.info(f"⚠️ Low signal confluence: {confluence_score}/100 - Recommending HOLD")
+            # Get dynamic threshold from advanced regime analysis (if available)
+            dynamic_threshold = regime_analysis.get('dynamic_confluence_threshold', 60) if regime_analysis else 60
+            
+            if confluence_score < dynamic_threshold:
+                logger.info(
+                    f"⚠️ Low signal confluence: {confluence_score}/{dynamic_threshold} "
+                    f"(dynamic threshold) - Recommending HOLD"
+                )
                 return self._fallback_analysis(
-                    f"Insufficient signal confluence ({confluence_score}/100). "
+                    f"Insufficient signal confluence ({confluence_score}/{dynamic_threshold}). "
                     f"Trend alignment, momentum, volume, or regime not aligned.",
                     float(latest["close"])
                 )
@@ -395,28 +401,47 @@ class AIAnalyzer:
             elif volume_ratio > 1.0:
                 score += 10
         
-        # Factor 4: Regime Appropriateness (30 points)
+        # Factor 4: Regime Appropriateness (30 points + bonuses from advanced metrics)
         if regime_analysis:
             regime = regime_analysis.get('regime')
             trend_strength = regime_analysis.get('trend_strength', 0)
             atr_percentage = regime_analysis.get('atr_percentage', 0)
             
-            if regime in ['BULL_TREND', 'BEAR_TREND'] and trend_strength > 25:
-                score += 30
+            # Use scalping quality score if available (from advanced analyzer)
+            scalping_quality = regime_analysis.get('scalping_quality_score')
+            
+            if scalping_quality is not None:
+                # REVOLUTIONARY: Use quality score instead of binary regime check
+                score += int(scalping_quality * 0.5)  # 0-50 points based on quality
                 
-                # Bonus for optimal volatility range (not too high, not too low)
-                if 0.4 < atr_percentage < 1.2:  # Sweet spot for scalping
-                    score += 5
-            elif regime == 'RANGE_BOUND':
-                score += 0  # Penalize ranging markets
-            elif regime == 'HIGH_VOLATILITY':
-                score -= 20  # Penalize volatile markets
+                # Bonus for high-quality microstructure
+                mean_reversion = regime_analysis.get('mean_reversion_score', 0)
+                if mean_reversion > 70:
+                    score += 15  # Excellent mean reversion setup
                 
-                # Extra penalty for extreme volatility
-                if atr_percentage > 2.0:
-                    score -= 10
-            elif regime == 'LOW_VOLATILITY':
-                score -= 10  # Penalize low volatility (insufficient movement)
+            else:
+                # Legacy scoring (for non-scalping modes)
+                if regime in ['BULL_TREND', 'BEAR_TREND'] and trend_strength > 25:
+                    score += 30
+                    
+                    # Bonus for optimal volatility range
+                    if 0.1 < atr_percentage < 1.2:
+                        score += 5
+                        
+                elif regime == 'RANGE_BOUND':
+                    # Don't penalize range-bound anymore! Can be great for scalping
+                    score += 10  # Give some credit
+                    
+                elif regime == 'HIGH_VOLATILITY':
+                    # Less harsh penalty
+                    if atr_percentage > 2.0:
+                        score -= 15
+                    else:
+                        score -= 5
+                        
+                elif regime == 'LOW_VOLATILITY':
+                    # Less harsh penalty - low vol can work!
+                    score -= 5
         
         final_score = max(0, min(100, score))
         

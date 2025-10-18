@@ -907,11 +907,15 @@ class TradingBot:
         """
         Enhanced position monitoring with time-based exit rules.
         
-        Exit Rules (optimized for scalping):
-        1. Quick Profit: 5min + 0.2% profit → close immediately
-        2. Breakeven Timeout: 20min + stagnant (-0.1% to +0.1%) → close at breakeven
+        Exit Rules (optimized for scalping with microstructure analysis):
+        1. Quick Profit: 5min + 0.2% profit → close immediately (lock gains)
+        2. Breakeven Timeout: 40min + stagnant (-0.2% to 0%) → close at small loss
+           (MODIFIED: Longer timeout allows consolidation before breakouts)
         3. Time Stop-Loss: 45min + losing >0.5% → force close
         4. Original Timeout: 60min → force close (final backstop)
+        
+        Note: Advanced microstructure analysis identifies quality setups.
+        Positions need 20-30min to develop through consolidation phases.
         """
         user_id = position.user_id
         symbol = position.symbol
@@ -942,9 +946,12 @@ class TradingBot:
             await self._manually_close_position_early(db, position, "QUICK_PROFIT", current_price)
             return
         
-        # Rule 2: Breakeven Exit for Stagnant Positions
-        # If position is 20+ minutes old and still near breakeven (-0.1% to +0.1%), exit
-        if duration_seconds > 1200 and -0.1 < current_pnl_pct < 0.1:
+        # Rule 2: Breakeven Exit for Very Stagnant Positions (DISABLED - too aggressive)
+        # Reasoning: Scalping setups often consolidate 20-30min before moving.
+        # The advanced analyzer identifies quality setups - give them time to develop.
+        # Stagnation at breakeven is NOT failure - it's capital preservation.
+        # Only exit if truly stuck (40+ min) AND losing slightly
+        if duration_seconds > 2400 and -0.2 < current_pnl_pct < 0.0:
             logger.warning(
                 f"⚠️  [User {user_id}] BREAKEVEN TIMEOUT EXIT: {duration_minutes:.1f}min old, "
                 f"stagnant at {current_pnl_pct:+.2f}%"
