@@ -16,6 +16,8 @@ from .risk_manager import RiskManager
 from .websocket_manager import WebSocketManager
 from .market_regime_analyzer import MarketRegimeAnalyzer
 from .circuit_breaker import CircuitBreaker, CircuitBreakerTriggered
+from .dynamic_risk_calculator import DynamicRiskCalculator
+from .mtf_analyzer import MultiTimeframeAnalyzer
 from ..logging_config import get_trading_metrics_logger
 from ..config import settings
 from .service_constants import (
@@ -36,6 +38,8 @@ class TradingBot:
         self.risk_manager = RiskManager()
         self.regime_analyzer = MarketRegimeAnalyzer(filter_mode=settings.regime_filter_mode)
         self.circuit_breaker = CircuitBreaker()
+        self.risk_calculator = DynamicRiskCalculator()
+        self.mtf_analyzer = MultiTimeframeAnalyzer()
         self.ws_manager = ws_manager
         self.is_running = False
         self.active_users = {}
@@ -402,6 +406,60 @@ class TradingBot:
                 f"❌ [User {user_id}] AI analyzer returned invalid type: {type(ai_signal)}"
             )
             return None
+
+        # Multi-timeframe confirmation for non-HOLD signals
+        signal_action = ai_signal.get("signal", "hold").upper()
+        if signal_action in ["BUY", "SELL"]:
+            logger.info(f"🔍 [User {user_id}] Confirming {signal_action} signal with multi-timeframe analysis...")
+            
+            # Calculate technical indicators for 1-minute timeframe
+            df_1min = self.ai_analyzer.calculate_technical_indicators(kline_data)
+            
+            # Fetch 5-minute and 15-minute data for confirmation
+            kline_data_5min = self.binance.get_kline_data(symbol, "5m", 100)
+            df_5min = self.ai_analyzer.calculate_technical_indicators(kline_data_5min)
+            
+            kline_data_15min = self.binance.get_kline_data(symbol, "15m", 100)
+            df_15min = self.ai_analyzer.calculate_technical_indicators(kline_data_15min)
+            
+            # Confirm signal across multiple timeframes
+            mtf_result = self.mtf_analyzer.confirm_signal(
+                signal=signal_action,
+                df_1min=df_1min,
+                df_5min=df_5min,
+                df_15min=df_15min
+            )
+            
+            if not mtf_result['confirmed']:
+                logger.info(
+                    f"❌ [User {user_id}] Multi-timeframe REJECTED {signal_action}: "
+                    f"{mtf_result['reasoning']} "
+                    f"(Aligned: {mtf_result['aligned_count']}/3, Confidence: {mtf_result['confidence']:.1f}%)"
+                )
+                metrics_logger.info(
+                    f"MTF_REJECTION | USER={user_id} | SIGNAL={signal_action} | "
+                    f"ALIGNED={mtf_result['aligned_count']}/3 | REASON={mtf_result['reasoning']}"
+                )
+                # Convert to HOLD signal
+                ai_signal["signal"] = "hold"
+                ai_signal["mtf_rejected"] = True
+                ai_signal["mtf_reasoning"] = mtf_result['reasoning']
+            else:
+                logger.info(
+                    f"✅ [User {user_id}] Multi-timeframe CONFIRMED {signal_action}: "
+                    f"{mtf_result['reasoning']} "
+                    f"(Aligned: {mtf_result['aligned_count']}/3, Confidence: {mtf_result['confidence']:.1f}%)"
+                )
+                metrics_logger.info(
+                    f"MTF_CONFIRMATION | USER={user_id} | SIGNAL={signal_action} | "
+                    f"ALIGNED={mtf_result['aligned_count']}/3 | CONFIDENCE={mtf_result['confidence']:.1f}"
+                )
+                # Boost confidence with MTF confirmation
+                original_confidence = ai_signal.get("final_confidence", ai_signal.get("confidence", 0))
+                boosted_confidence = min(100, original_confidence * 1.1)  # 10% boost, capped at 100
+                ai_signal["final_confidence"] = boosted_confidence
+                ai_signal["mtf_confirmed"] = True
+                ai_signal["mtf_confidence"] = mtf_result['confidence']
 
         return ai_signal
 
@@ -933,6 +991,64 @@ class TradingBot:
             current_pnl_pct = ((current_price - entry_price) / entry_price) * 100
         else:  # sell
             current_pnl_pct = ((entry_price - current_price) / entry_price) * 100
+        
+        # PROGRESSIVE TRAILING STOP LOGIC
+        # Protects capital early while letting winners run
+        take_profit_price = float(position.take_profit) if position.take_profit else None
+        
+        if take_profit_price:
+            trailing_info = self.risk_calculator.calculate_progressive_trailing_stops(
+                entry_price=entry_price,
+                current_price=current_price,
+                direction=position.side.upper(),
+                take_profit=take_profit_price
+            )
+            
+            if trailing_info['should_trail']:
+                logger.info(
+                    f"🛡️  [User {user_id}] {trailing_info['phase']}: {trailing_info['phase_description']} "
+                    f"(Current: {current_pnl_pct:+.2f}%, Trailing Stop: {trailing_info['trailing_stop']:.4f})"
+                )
+                
+                metrics_logger.info(
+                    f"TRAILING_STOP_ACTIVE | USER={user_id} | PHASE={trailing_info['phase']} | "
+                    f"CURRENT_PNL={current_pnl_pct:.2f} | TRAILING_STOP={trailing_info['trailing_stop']:.4f} | "
+                    f"SYMBOL={symbol}"
+                )
+                
+                # Check if price hit trailing stop
+                if position.side.lower() == 'buy':
+                    # For BUY positions, close if price dropped below trailing stop
+                    if current_price <= trailing_info['trailing_stop']:
+                        logger.info(
+                            f"🛡️  [User {user_id}] PROGRESSIVE TRAILING STOP HIT: "
+                            f"Price ${current_price:.4f} <= Stop ${trailing_info['trailing_stop']:.4f}"
+                        )
+                        metrics_logger.info(
+                            f"TRAILING_STOP_HIT | USER={user_id} | PHASE={trailing_info['phase']} | "
+                            f"PRICE={current_price:.4f} | STOP={trailing_info['trailing_stop']:.4f} | "
+                            f"PNL={current_pnl_pct:.2f}"
+                        )
+                        await self._manually_close_position_early(
+                            db, position, f"TRAILING_{trailing_info['phase']}", current_price
+                        )
+                        return
+                else:  # sell
+                    # For SELL positions, close if price rose above trailing stop
+                    if current_price >= trailing_info['trailing_stop']:
+                        logger.info(
+                            f"🛡️  [User {user_id}] PROGRESSIVE TRAILING STOP HIT: "
+                            f"Price ${current_price:.4f} >= Stop ${trailing_info['trailing_stop']:.4f}"
+                        )
+                        metrics_logger.info(
+                            f"TRAILING_STOP_HIT | USER={user_id} | PHASE={trailing_info['phase']} | "
+                            f"PRICE={current_price:.4f} | STOP={trailing_info['trailing_stop']:.4f} | "
+                            f"PNL={current_pnl_pct:.2f}"
+                        )
+                        await self._manually_close_position_early(
+                            db, position, f"TRAILING_{trailing_info['phase']}", current_price
+                        )
+                        return
         
         # TIME-BASED EXIT RULES
         
@@ -1610,28 +1726,42 @@ class TradingBot:
             logger.info(f"   🌐 Binance Network: {'Testnet' if settings.binance_testnet else 'Mainnet (REAL MONEY)'}")
             logger.info(f"   🎯 AI Confidence: {signal.get('final_confidence', signal.get('confidence', 0)):.1f}%")
 
-            # Calculate take profit and stop loss prices using ADAPTIVE approach
+            # Calculate take profit and stop loss prices using DYNAMIC ATR-BASED 1:2 R/R approach
             current_price = self.binance.get_symbol_price(symbol)
             
-            # Fetch market data for adaptive exit calculations
+            # Fetch market data for ATR calculation
             kline_data = self.binance.get_kline_data(symbol, "1m", 100)
             df_with_indicators = self.ai_analyzer.calculate_technical_indicators(kline_data)
             
-            # Get adaptive exit levels based on ATR and historical performance
-            adaptive_exits = await self.risk_manager.get_adaptive_exit_levels(
-                db, user_id, df_with_indicators, side.lower(), current_price
+            # Get ATR value for dynamic risk calculation
+            atr = df_with_indicators['atr'].iloc[-1]
+            atr_pct = (atr / current_price) * 100
+            
+            # Calculate dynamic SL/TP with strict 1:2 risk/reward ratio
+            risk_levels = self.risk_calculator.calculate_levels(
+                entry_price=current_price,
+                atr=atr,
+                direction=side.upper()
             )
             
-            take_profit_price = adaptive_exits['take_profit_price']
-            stop_loss_price = adaptive_exits['stop_loss_price']
+            stop_loss_price = risk_levels['stop_loss']
+            take_profit_price = risk_levels['take_profit']
             
             logger.info(
-                f"🎯 [User {user_id}] Adaptive Exit Levels: "
+                f"🎯 [User {user_id}] Dynamic ATR-Based Levels (1:2 R/R): "
                 f"Entry=${current_price:.4f}, "
-                f"TP=${take_profit_price:.4f} ({adaptive_exits['take_profit_pct']:.2f}%), "
-                f"SL=${stop_loss_price:.4f} ({adaptive_exits['stop_loss_pct']:.2f}%), "
-                f"R:R={adaptive_exits['risk_reward_ratio']:.2f}:1, "
-                f"Source={adaptive_exits['source']}"
+                f"ATR={atr:.4f} ({atr_pct:.3f}%), "
+                f"TP=${take_profit_price:.4f} (+{risk_levels['take_profit_pct']:.2f}%), "
+                f"SL=${stop_loss_price:.4f} ({risk_levels['stop_loss_pct']:.2f}%), "
+                f"R:R={risk_levels['risk_reward_ratio']:.2f}:1"
+            )
+            
+            metrics_logger.info(
+                f"DYNAMIC_ATR_LEVELS | USER={user_id} | ENTRY={current_price:.4f} | "
+                f"ATR={atr:.4f} | ATR_PCT={atr_pct:.3f} | "
+                f"TP={take_profit_price:.4f} | TP_PCT={risk_levels['take_profit_pct']:.2f} | "
+                f"SL={stop_loss_price:.4f} | SL_PCT={risk_levels['stop_loss_pct']:.2f} | "
+                f"RR_RATIO={risk_levels['risk_reward_ratio']:.2f}"
             )
 
             # Place order with OCO (entry + automatic TP/SL)

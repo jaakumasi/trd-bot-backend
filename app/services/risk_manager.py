@@ -12,6 +12,7 @@ from .service_constants import (
     MIN_SIGNAL_CONFIDENCE,
     MIN_TRADE_VALUE,
 )
+from .dynamic_risk_calculator import DynamicRiskCalculator
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ class RiskManager:
         self.daily_trade_count = {}
         self.open_positions = {}  # {user_id: [position_objects]}
         self.current_volatility_percentile = None  # Store latest volatility reading
+        self.risk_calculator = DynamicRiskCalculator()  # For dynamic ATR-based calculations
 
     def calculate_position_size(
         self,

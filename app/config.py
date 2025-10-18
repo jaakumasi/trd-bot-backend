@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     trading_active_hours_start: str = Field(default="08:00")
     trading_active_hours_end: str = Field(default="16:00")
     use_mock_binance: bool = Field(default=False)
-    regime_filter_mode: str = Field(default="balanced")  # strict, balanced, permissive 
+    regime_filter_mode: str = Field(default="scalping")  # strict, balanced, permissive, scalping (with advanced microstructure) 
     
     # CORS - accepts both string and list
     cors_origins: Union[str, List[str]] = Field(
