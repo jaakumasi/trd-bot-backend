@@ -6,7 +6,7 @@ import json
 from typing import List
 from .config import settings
 from .database import engine, Base
-from .api import trading, portfolio, auth
+from .api import trading, portfolio, auth, circuit_breaker
 from .services.trading_bot import TradingBot
 from .services.websocket_manager import WebSocketManager
 from .logging_config import setup_logging
@@ -56,6 +56,9 @@ async def startup_event():
     global trading_bot
     trading_bot = TradingBot(ws_manager)
     
+    # Register circuit breaker with API endpoints
+    circuit_breaker.set_circuit_breaker_instance(trading_bot.circuit_breaker)
+    
     # Start the trading bot
     bot_started = await trading_bot.start()
     if bot_started:
@@ -80,6 +83,7 @@ async def shutdown_event():
 app.include_router(auth.router, prefix="/auth", tags=["Authentication"])
 app.include_router(trading.router, prefix="/trading", tags=["Trading"])
 app.include_router(portfolio.router, prefix="/portfolio", tags=["Portfolio"])
+app.include_router(circuit_breaker.router, tags=["Circuit Breaker"])
 
 
 @app.get("/health")

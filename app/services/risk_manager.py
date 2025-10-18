@@ -29,6 +29,7 @@ class RiskManager:
         self.max_daily_trades = {}
         self.daily_trade_count = {}
         self.open_positions = {}  # {user_id: [position_objects]}
+        self.current_volatility_percentile = None  # Store latest volatility reading
 
     def calculate_position_size(
         self,
@@ -37,7 +38,23 @@ class RiskManager:
         entry_price: Union[float, Decimal],
         stop_loss_price: Union[float, Decimal],
     ) -> float:
-        """Calculate safe position size based on risk management rules"""
+        """
+        Calculate safe position size for SPOT TRADING (no leverage).
+
+        FIXED FORMULA for spot-only trading:
+        - Ensures position never exceeds available capital
+        - Applies both risk-based and capital-based constraints
+        - Adds absolute safety caps for scalping
+
+        Args:
+            account_balance: Total account balance in USDT
+            risk_percentage: Max % of balance to risk (e.g., 1.0 = 1%)
+            entry_price: Expected entry price
+            stop_loss_price: Stop-loss price
+
+        Returns:
+            Position size in base currency (e.g., BTC)
+        """
         try:
             balance = self._to_float(account_balance)
             risk = self._to_float(risk_percentage)
@@ -57,17 +74,91 @@ class RiskManager:
                 logger.warning("Price risk is zero - entry price equals stop loss price")
                 return 0.0
 
-            position_size = self._risk_amount(balance, risk) / price_risk
-            logger.debug("Initial position size: %.8f", position_size)
+            # Method 1: Risk-based sizing (how much to buy based on acceptable loss)
+            risk_amount = balance * (risk / 100)
+            risk_based_position = risk_amount / price_risk
 
-            position_size = self._enforce_max_position(position_size, entry, balance)
+            # Method 2: Capital-based cap with VOLATILITY ADJUSTMENT
+            # SAFETY FEATURE: Reduce position size in high-volatility periods
+            #
+            # Base position sizes:
+            #   - 0.03 (3%) = Very conservative, ~$1.50 loss on $10K if SL hits
+            #   - 0.05 (5%) = Conservative (DEFAULT), ~$2.50 loss on $10K if SL hits
+            #   - 0.08 (8%) = Moderate, ~$4.00 loss on $10K if SL hits
+            #   - 0.10 (10%) = Aggressive, ~$5.00 loss on $10K if SL hits
+
+            # Check if we have volatility data available (set by get_adaptive_exit_levels)
+            if self.current_volatility_percentile is not None and self.current_volatility_percentile > 75:
+                # HIGH VOLATILITY DETECTED (>75th percentile)
+                # Reduce position size to 3% for safety
+                max_position_pct = 0.03
+                logger.info(
+                    f"🔻 Position size REDUCED to 3% (HIGH volatility: "
+                    f"{self.current_volatility_percentile:.0f}th percentile) - SAFETY OVERRIDE"
+                )
+            else:
+                # NORMAL or LOW volatility: Use standard 5%
+                max_position_pct = 0.05
+                if self.current_volatility_percentile is not None:
+                    logger.debug(
+                        f"📊 Position size: 5% (volatility: {self.current_volatility_percentile:.0f}th percentile)"
+                    )
+
+            capital_based_position = (balance * max_position_pct) / entry
+
+            # Method 3: Absolute position value cap (for safety)
+            # Never risk more than 10% of balance in a single position
+            absolute_max_position_value = balance * MAX_BALANCE_TRADE_RATIO  # 10%
+            absolute_position_limit = absolute_max_position_value / entry
+
+            # Take the MINIMUM of all three methods (most conservative)
+            position_size = min(
+                risk_based_position,
+                capital_based_position,
+                absolute_position_limit
+            )
+
+            logger.debug(
+                "Position sizing breakdown:\n"
+                "  Risk-based: %.8f (risk $%.2f / $%.2f price movement)\n"
+                "  Capital-based: %.8f (5%% of balance)\n"
+                "  Absolute limit: %.8f (10%% max position)\n"
+                "  FINAL: %.8f",
+                risk_based_position,
+                risk_amount,
+                price_risk,
+                capital_based_position,
+                absolute_position_limit,
+                position_size
+            )
+
+            # Additional safety: Check stop-loss percentage is reasonable for scalping
+            stop_loss_pct = (price_risk / entry) * 100
+            if stop_loss_pct > 0.5:  # More than 0.5% stop for scalping is aggressive
+                logger.warning(
+                    f"⚠️  Wide stop-loss detected: {stop_loss_pct:.2f}% "
+                    f"(>0.5% not ideal for scalping)"
+                )
+
+            # Truncate to exchange precision
             position_size = self._truncate(position_size)
 
+            position_value = position_size * entry
             logger.info(
-                "✅ Calculated position size: %.8f ($%.2f)",
+                "✅ Calculated position size: %.8f (value: $%.2f, %.1f%% of balance)",
                 position_size,
-                position_size * entry,
+                position_value,
+                (position_value / balance * 100) if balance > 0 else 0
             )
+
+            # Final validation: position should never exceed balance
+            if position_value > balance:
+                logger.error(
+                    f"❌ CRITICAL: Position value (${position_value:.2f}) exceeds balance (${balance:.2f})! "
+                    f"This should never happen with corrected formula."
+                )
+                return 0.0
+
             return position_size
 
         except Exception as e:
@@ -234,6 +325,9 @@ class RiskManager:
             atr_history = df['atr'].tail(100) if len(df) >= 100 else df['atr']
             from scipy.stats import percentileofscore
             volatility_percentile = percentileofscore(atr_history, atr)
+
+            # Store volatility percentile for use by position sizing
+            self.current_volatility_percentile = volatility_percentile
             
             # Adaptive Multipliers based on volatility regime
             # High volatility (>75th percentile) → Wider stops (2.5-3x ATR)
@@ -316,27 +410,48 @@ class RiskManager:
                 # Continue with ATR-based values
             
             # 3. Volatility-Adjusted Safety Caps
-            # High volatility periods need wider caps
+            # TIGHTENED for scalping - prioritize capital preservation
+            # High volatility periods need wider caps BUT with absolute maximum
+
+            # ABSOLUTE MAXIMUM CAPS (regardless of volatility)
+            ABSOLUTE_MAX_STOP_LOSS = 0.5  # Never risk more than 0.5% per trade
+            ABSOLUTE_MAX_TAKE_PROFIT = 1.5  # Never target more than 1.5% profit
+
             if volatility_regime == "HIGH":
-                max_sl = 1.5  # Allow up to 1.5% SL in high volatility
-                min_sl = 0.5
-                max_tp = 2.5  # Allow up to 2.5% TP
-                min_tp = 0.8
-            elif volatility_regime in ["MEDIUM_HIGH", "MEDIUM"]:
-                max_sl = 1.0
-                min_sl = 0.4
-                max_tp = 1.8
+                # High volatility: wider stops but capped
+                max_sl = 0.5  # Reduced from 1.5% - too risky for scalping
+                min_sl = 0.3
+                max_tp = 1.2  # Reduced from 2.5%
                 min_tp = 0.6
-            else:  # LOW volatility
-                max_sl = 0.7  # Tighter caps in low volatility
+            elif volatility_regime in ["MEDIUM_HIGH", "MEDIUM"]:
+                max_sl = 0.4  # Reduced from 1.0%
                 min_sl = 0.25
-                max_tp = 1.0
+                max_tp = 0.8  # Reduced from 1.8%
                 min_tp = 0.4
-            
+            else:  # LOW volatility
+                max_sl = 0.35  # Reduced from 0.7%
+                min_sl = 0.2
+                max_tp = 0.6  # Reduced from 1.0%
+                min_tp = 0.3
+
+            # Apply volatility-specific caps
             dynamic_sl_pct = min(dynamic_sl_pct, max_sl)
             dynamic_sl_pct = max(dynamic_sl_pct, min_sl)
             dynamic_tp_pct = min(dynamic_tp_pct, max_tp)
             dynamic_tp_pct = max(dynamic_tp_pct, min_tp)
+
+            # Apply absolute maximum caps (safety override)
+            dynamic_sl_pct = min(dynamic_sl_pct, ABSOLUTE_MAX_STOP_LOSS)
+            dynamic_tp_pct = min(dynamic_tp_pct, ABSOLUTE_MAX_TAKE_PROFIT)
+
+            # Ensure minimum risk:reward ratio of 1.2:1 for profitability
+            min_risk_reward = 1.2
+            if dynamic_tp_pct / dynamic_sl_pct < min_risk_reward:
+                logger.warning(
+                    f"⚠️  Risk:reward ratio too low ({dynamic_tp_pct/dynamic_sl_pct:.2f}:1). "
+                    f"Adjusting TP to maintain {min_risk_reward}:1"
+                )
+                dynamic_tp_pct = max(dynamic_tp_pct, dynamic_sl_pct * min_risk_reward)
             
             # 4. Calculate actual prices based on side
             if side.lower() == "buy":

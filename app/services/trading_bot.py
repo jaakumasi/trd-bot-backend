@@ -15,6 +15,7 @@ from .ai_analyzer import AIAnalyzer
 from .risk_manager import RiskManager
 from .websocket_manager import WebSocketManager
 from .market_regime_analyzer import MarketRegimeAnalyzer
+from .circuit_breaker import CircuitBreaker, CircuitBreakerTriggered
 from ..logging_config import get_trading_metrics_logger
 from ..config import settings
 from .service_constants import (
@@ -33,7 +34,8 @@ class TradingBot:
         self.binance = self._create_binance_service()
         self.ai_analyzer = AIAnalyzer()
         self.risk_manager = RiskManager()
-        self.regime_analyzer = MarketRegimeAnalyzer()
+        self.regime_analyzer = MarketRegimeAnalyzer(filter_mode=settings.regime_filter_mode)
+        self.circuit_breaker = CircuitBreaker()
         self.ws_manager = ws_manager
         self.is_running = False
         self.active_users = {}
@@ -61,6 +63,7 @@ class TradingBot:
         logger.info("✅ AI Analyzer ready")
         logger.info("🛡️  Initializing Risk Manager...")
         logger.info("✅ Risk Manager ready")
+        logger.info("🛡️  Circuit Breaker System ready")
         logger.info("🌐 WebSocket Manager ready")
 
     def _log_initialization_success(self) -> None:
@@ -319,6 +322,26 @@ class TradingBot:
 
             usdt_balance = self._fetch_usdt_balance(user_id)
 
+            # 🛡️ Circuit Breaker Check - BEFORE trade validation
+            try:
+                self.circuit_breaker.check_before_trade(user_id, usdt_balance)
+            except CircuitBreakerTriggered as cb_error:
+                logger.critical(f"🛑 [User {user_id}] CIRCUIT BREAKER TRIGGERED: {cb_error.reason}")
+                metrics_logger.info(f"CIRCUIT_BREAKER_HALT | USER={user_id} | REASON={cb_error.reason}")
+                
+                # Get detailed status for user notification
+                cb_status = self.circuit_breaker.get_user_status(user_id, usdt_balance)
+                await self.ws_manager.send_to_user(
+                    user_id,
+                    {
+                        "type": "circuit_breaker_triggered",
+                        "reason": cb_error.reason,
+                        "status": cb_status,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+                return
+
             is_valid, message, trade_params = self.risk_manager.validate_trade_signal(
                 user_id, ai_signal, usdt_balance, config.__dict__
             )
@@ -331,6 +354,9 @@ class TradingBot:
 
             await self._execute_trade(db, config, ai_signal, trade_params)
 
+        except CircuitBreakerTriggered:
+            # Already handled above, don't log as generic error
+            pass
         except Exception as e:
             logger.error(f"❌ [User {user_id}] Error in trading process: {e}")
             metrics_logger.info(f"TRADING_ERROR | USER={user_id} | ERROR={str(e)}")
@@ -345,14 +371,23 @@ class TradingBot:
 
     def _fetch_market_snapshot(self, symbol: str, user_id: int):
         logger.debug(f"📈 [User {user_id}] Fetching market data for {symbol}...")
-        kline_data = self.binance.get_kline_data(symbol, "1m", 100)
-        if kline_data.empty:
-            logger.warning(f"⚠️  [User {user_id}] No market data available for {symbol}")
-            return None
+        try:
+            kline_data = self.binance.get_kline_data(symbol, "1m", 100)
+            if kline_data.empty:
+                logger.warning(f"⚠️  [User {user_id}] No market data available for {symbol}")
+                self.circuit_breaker.record_api_failure(f"Empty kline data for {symbol}")
+                return None
 
-        current_price = float(kline_data.iloc[-1]["close"])
-        logger.debug(f"💰 [User {user_id}] Current {symbol} price: ${current_price:.4f}")
-        return kline_data, current_price
+            # API call successful
+            self.circuit_breaker.record_api_success()
+            
+            current_price = float(kline_data.iloc[-1]["close"])
+            logger.debug(f"💰 [User {user_id}] Current {symbol} price: ${current_price:.4f}")
+            return kline_data, current_price
+        except Exception as e:
+            logger.error(f"❌ [User {user_id}] API error fetching market data: {e}")
+            self.circuit_breaker.record_api_failure(f"get_kline_data failed: {str(e)}")
+            return None
 
     async def _request_ai_signal(self, symbol, kline_data, user_id: int, user_trade_history=None, regime_analysis=None):
         logger.debug(f"🤖 [User {user_id}] Running AI analysis...")
@@ -601,6 +636,14 @@ class TradingBot:
             f"POSITION_CLOSED | USER={user_id} | SYMBOL={symbol} | REASON={exit_reason} | PNL=${closed_position['net_pnl']:+.2f} | PCT={closed_position['pnl_percentage']:+.2f}% | DURATION={closed_position['duration_seconds']:.0f}s | RESULT={profit_label}"
         )
 
+        # 🛡️ Record trade result in Circuit Breaker
+        is_winner = closed_position["net_pnl"] > 0
+        self.circuit_breaker.record_trade_result(
+            user_id=user_id,
+            pnl=closed_position["net_pnl"],
+            is_winner=is_winner
+        )
+
         # ✅ FIX: Update original trade record with exit details (consistent with OCO/timeout exits)
         await self._update_trade_record_after_exit(
             db,
@@ -837,6 +880,14 @@ class TradingBot:
             f"OCO_POSITION_CLOSED | USER={user_id} | SYMBOL={symbol} | REASON={exit_reason} | ENTRY=${entry_price:.4f} | EXIT=${exit_price:.4f} | PL=${profit_loss:.2f} | PL_PCT={profit_loss_pct:+.2f} | DURATION={duration:.0f}s | BALANCE=${actual_usdt_balance:.2f}"
         )
 
+        # 🛡️ Record trade result in Circuit Breaker
+        is_winner = profit_loss > 0
+        self.circuit_breaker.record_trade_result(
+            user_id=user_id,
+            pnl=profit_loss,
+            is_winner=is_winner
+        )
+
         await self._notify_oco_position_closed(
             user_id,
             symbol,
@@ -856,11 +907,15 @@ class TradingBot:
         """
         Enhanced position monitoring with time-based exit rules.
         
-        Exit Rules:
-        1. Quick Profit: 5min + 0.2% profit → close immediately
-        2. Breakeven Timeout: 15min + stagnant (-0.1% to +0.1%) → close at breakeven
-        3. Time Stop-Loss: 20min + any loss → force close
-        4. Original Timeout: 30min → force close (legacy rule)
+        Exit Rules (optimized for scalping with microstructure analysis):
+        1. Quick Profit: 5min + 0.2% profit → close immediately (lock gains)
+        2. Breakeven Timeout: 40min + stagnant (-0.2% to 0%) → close at small loss
+           (MODIFIED: Longer timeout allows consolidation before breakouts)
+        3. Time Stop-Loss: 45min + losing >0.5% → force close
+        4. Original Timeout: 60min → force close (final backstop)
+        
+        Note: Advanced microstructure analysis identifies quality setups.
+        Positions need 20-30min to develop through consolidation phases.
         """
         user_id = position.user_id
         symbol = position.symbol
@@ -891,9 +946,12 @@ class TradingBot:
             await self._manually_close_position_early(db, position, "QUICK_PROFIT", current_price)
             return
         
-        # Rule 2: Breakeven Exit for Stagnant Positions
-        # If position is 15+ minutes old and still near breakeven (-0.1% to +0.1%), exit
-        if duration_seconds > 900 and -0.1 < current_pnl_pct < 0.1:
+        # Rule 2: Breakeven Exit for Very Stagnant Positions (DISABLED - too aggressive)
+        # Reasoning: Scalping setups often consolidate 20-30min before moving.
+        # The advanced analyzer identifies quality setups - give them time to develop.
+        # Stagnation at breakeven is NOT failure - it's capital preservation.
+        # Only exit if truly stuck (40+ min) AND losing slightly
+        if duration_seconds > 2400 and -0.2 < current_pnl_pct < 0.0:
             logger.warning(
                 f"⚠️  [User {user_id}] BREAKEVEN TIMEOUT EXIT: {duration_minutes:.1f}min old, "
                 f"stagnant at {current_pnl_pct:+.2f}%"
@@ -901,9 +959,9 @@ class TradingBot:
             await self._manually_close_position_early(db, position, "BREAKEVEN_TIMEOUT", current_price)
             return
         
-        # Rule 3: Force Exit for Losing Positions
-        # If position is 20+ minutes old and showing any loss, cut it
-        if duration_seconds > 1200 and current_pnl_pct < 0:
+        # Rule 3: Force Exit for Significant Losing Positions
+        # If position is 45+ minutes old and losing >0.5%, cut it to prevent bigger losses
+        if duration_seconds > 2700 and current_pnl_pct < -0.5:
             logger.error(
                 f"❌ [User {user_id}] TIME STOP-LOSS EXIT: {duration_minutes:.1f}min old, "
                 f"losing {current_pnl_pct:.2f}%"
@@ -940,60 +998,81 @@ class TradingBot:
         """
         logger.debug("🔍 Extracting exit details from OCO status")
         
-        filled_order = None
-        expired_order = None
-        
-        for order in oco_status.get("orders", []):
-            order_status = order.get("status", "")
-            order_type = order.get("type", "")
-            order_id = order.get("orderId", "")
-            
-            logger.debug(f"   📋 Order {order_id}: type={order_type}, status={order_status}")
-            
-            if order_status == "FILLED":
-                filled_order = order
-            elif order_status == "EXPIRED":
-                expired_order = order
-        
-        # Primary: Use the FILLED order
+        filled_order = TradingBot._find_filled_order(oco_status)
         if filled_order:
-            price = float(filled_order.get("price", 0))
-            order_type = filled_order.get("type", "")
-            
-            if "STOP" in order_type.upper():
-                logger.info(f"🛑 Stop Loss triggered at ${price:.4f}")
-                return "STOP_LOSS", price
-            
-            logger.info(f"🎯 Take Profit triggered at ${price:.4f}")
-            return "TAKE_PROFIT", price
+            return TradingBot._process_filled_order(filled_order)
         
-        # Fallback: If no FILLED order found but we have an EXPIRED order,
-        # infer that the OTHER leg (not expired) must have filled
+        expired_order = TradingBot._find_expired_order(oco_status)
         if expired_order:
-            expired_type = expired_order.get("type", "")
-            logger.debug(f"   🔄 No FILLED order found, but found EXPIRED {expired_type}")
-            
-            # If STOP_LOSS expired, then TAKE_PROFIT filled
-            # If LIMIT_MAKER expired, then STOP_LOSS filled
-            if "STOP" in expired_type.upper():
-                logger.info("✅ Inferred: Take Profit filled (Stop Loss expired)")
-                # Find the take profit order price
-                for order in oco_status.get("orders", []):
-                    if order.get("orderId") != expired_order.get("orderId"):
-                        tp_price = float(order.get("price", 0))
-                        return "TAKE_PROFIT", tp_price
-            else:
-                logger.info("✅ Inferred: Stop Loss filled (Take Profit expired)")
-                # Find the stop loss order price
-                for order in oco_status.get("orders", []):
-                    if order.get("orderId") != expired_order.get("orderId"):
-                        sl_price = float(order.get("stopPrice") or order.get("price", 0))
-                        return "STOP_LOSS", sl_price
+            return TradingBot._infer_from_expired_order(oco_status, expired_order)
         
         logger.warning("⚠️  No FILLED or EXPIRED order found in OCO status")
         return None, None
+    
+    @staticmethod
+    def _find_filled_order(oco_status: Dict) -> Optional[Dict]:
+        """Find the FILLED order in OCO status"""
+        for order in oco_status.get("orders", []):
+            if order.get("status") == "FILLED":
+                logger.debug(f"   📋 Found FILLED order {order.get('orderId')}")
+                return order
+        return None
+    
+    @staticmethod
+    def _find_expired_order(oco_status: Dict) -> Optional[Dict]:
+        """Find the EXPIRED order in OCO status"""
+        for order in oco_status.get("orders", []):
+            if order.get("status") == "EXPIRED":
+                logger.debug(f"   📋 Found EXPIRED order {order.get('orderId')}")
+                return order
+        return None
+    
+    @staticmethod
+    def _process_filled_order(filled_order: Dict) -> Tuple[str, float]:
+        """Process a filled order to determine exit reason and price"""
+        price = float(filled_order.get("price", 0))
+        order_type = filled_order.get("type", "")
+        
+        if "STOP" in order_type.upper():
+            logger.info(f"🛑 Stop Loss triggered at ${price:.4f}")
+            return "STOP_LOSS", price
+        
+        logger.info(f"🎯 Take Profit triggered at ${price:.4f}")
+        return "TAKE_PROFIT", price
+    
+    @staticmethod
+    def _infer_from_expired_order(oco_status: Dict, expired_order: Dict) -> Tuple[Optional[str], Optional[float]]:
+        """Infer which leg filled based on which one expired"""
+        expired_type = expired_order.get("type", "")
+        logger.debug(f"   🔄 No FILLED order found, inferring from EXPIRED {expired_type}")
+        
+        # If STOP expired, then TAKE_PROFIT filled (and vice versa)
+        if "STOP" in expired_type.upper():
+            return TradingBot._find_take_profit_price(oco_status, expired_order)
+        else:
+            return TradingBot._find_stop_loss_price(oco_status, expired_order)
+    
+    @staticmethod
+    def _find_take_profit_price(oco_status: Dict, expired_order: Dict) -> Tuple[str, float]:
+        """Find take profit price from non-expired order"""
+        logger.info("✅ Inferred: Take Profit filled (Stop Loss expired)")
+        for order in oco_status.get("orders", []):
+            if order.get("orderId") != expired_order.get("orderId"):
+                tp_price = float(order.get("price", 0))
+                return "TAKE_PROFIT", tp_price
+        return None, None
+    
+    @staticmethod
+    def _find_stop_loss_price(oco_status: Dict, expired_order: Dict) -> Tuple[str, float]:
+        """Find stop loss price from non-expired order"""
+        logger.info("✅ Inferred: Stop Loss filled (Take Profit expired)")
+        for order in oco_status.get("orders", []):
+            if order.get("orderId") != expired_order.get("orderId"):
+                sl_price = float(order.get("stopPrice") or order.get("price", 0))
+                return "STOP_LOSS", sl_price
+        return None, None
 
-    async def _fallback_extract_exit_details(
+    def _fallback_extract_exit_details(
         self, position: OpenPosition, oco_status: Dict
     ) -> Tuple[Optional[str], Optional[float]]:
         """
@@ -1002,62 +1081,87 @@ class TradingBot:
         """
         logger.info(f"🔄 [User {position.user_id}] Attempting fallback extraction for OCO {position.oco_order_id}")
         
-        # Strategy 1: Check if one order is EXPIRED - the other must have filled
-        filled_order = None
-        expired_order = None
+        # Strategy 1: Direct check for filled order
+        filled_result = self._check_for_filled_order(oco_status)
+        if filled_result:
+            return filled_result
         
-        for order in oco_status.get("orders", []):
-            status = order.get("status", "")
-            if status == "EXPIRED":
-                expired_order = order
-            elif status == "FILLED":
-                filled_order = order
-        
-        # If we have a filled order that we missed before, use it
-        if filled_order:
-            price = float(filled_order.get("price", 0))
-            order_type = filled_order.get("type", "")
-            
-            if "STOP" in order_type.upper():
-                logger.info(f"✅ Fallback found: Stop Loss at ${price:.4f}")
-                return "STOP_LOSS", price
-            else:
-                logger.info(f"✅ Fallback found: Take Profit at ${price:.4f}")
-                return "TAKE_PROFIT", price
-        
-        # Strategy 2: If one is expired, check its price vs current price to infer which one filled
-        if expired_order:
-            try:
-                expired_price = float(expired_order.get("stopPrice") or expired_order.get("price", 0))
-                expired_type = expired_order.get("type", "")
-                
-                # Get current market price
-                current_price = self.binance.get_symbol_price(position.symbol)
-                
-                logger.debug(f"📊 Expired order: type={expired_type}, price=${expired_price:.4f}, current=${current_price:.4f}")
-                
-                # If stop order was expired, TP must have filled, and vice versa
-                if "STOP" in expired_type.upper():
-                    # Stop was expired, so Take Profit filled
-                    # Find the other order's price
-                    for order in oco_status.get("orders", []):
-                        if order.get("orderId") != expired_order.get("orderId"):
-                            tp_price = float(order.get("price", 0))
-                            logger.info(f"✅ Fallback inferred: Take Profit at ${tp_price:.4f}")
-                            return "TAKE_PROFIT", tp_price
-                else:
-                    # Limit was expired, so Stop Loss filled
-                    for order in oco_status.get("orders", []):
-                        if order.get("orderId") != expired_order.get("orderId"):
-                            sl_price = float(order.get("stopPrice") or order.get("price", 0))
-                            logger.info(f"✅ Fallback inferred: Stop Loss at ${sl_price:.4f}")
-                            return "STOP_LOSS", sl_price
-                            
-            except Exception as e:
-                logger.error(f"❌ Error in fallback inference: {e}")
+        # Strategy 2: Infer from expired order
+        expired_result = self._infer_from_expired_order_fallback(position, oco_status)
+        if expired_result:
+            return expired_result
         
         logger.warning(f"⚠️  Fallback extraction also failed for OCO {position.oco_order_id}")
         return None, None
+    
+    @staticmethod
+    def _check_for_filled_order(oco_status: Dict) -> Optional[Tuple[str, float]]:
+        """Check if we can find a filled order directly"""
+        for order in oco_status.get("orders", []):
+            if order.get("status") == "FILLED":
+                price = float(order.get("price", 0))
+                order_type = order.get("type", "")
+                
+                if "STOP" in order_type.upper():
+                    logger.info(f"✅ Fallback found: Stop Loss at ${price:.4f}")
+                    return "STOP_LOSS", price
+                else:
+                    logger.info(f"✅ Fallback found: Take Profit at ${price:.4f}")
+                    return "TAKE_PROFIT", price
+        return None
+    
+    def _infer_from_expired_order_fallback(
+        self, position: OpenPosition, oco_status: Dict
+    ) -> Optional[Tuple[str, float]]:
+        """Infer exit details from expired order in fallback scenario"""
+        expired_order = self._find_expired_order_in_fallback(oco_status)
+        if not expired_order:
+            return None
+        
+        try:
+            expired_type = expired_order.get("type", "")
+            current_price = self.binance.get_symbol_price(position.symbol)
+            expired_price = float(expired_order.get("stopPrice") or expired_order.get("price", 0))
+            
+            logger.debug(f"📊 Expired order: type={expired_type}, price=${expired_price:.4f}, current=${current_price:.4f}")
+            
+            # Determine which leg filled based on which expired
+            if "STOP" in expired_type.upper():
+                return self._extract_take_profit_from_orders(oco_status, expired_order)
+            else:
+                return self._extract_stop_loss_from_orders(oco_status, expired_order)
+                
+        except Exception as e:
+            logger.error(f"❌ Error in fallback inference: {e}")
+            return None
+    
+    @staticmethod
+    def _find_expired_order_in_fallback(oco_status: Dict) -> Optional[Dict]:
+        """Find expired order in fallback scenario"""
+        for order in oco_status.get("orders", []):
+            if order.get("status") == "EXPIRED":
+                return order
+        return None
+    
+    @staticmethod
+    def _extract_take_profit_from_orders(oco_status: Dict, expired_order: Dict) -> Optional[Tuple[str, float]]:
+        """Extract take profit price from non-expired order"""
+        for order in oco_status.get("orders", []):
+            if order.get("orderId") != expired_order.get("orderId"):
+                tp_price = float(order.get("price", 0))
+                logger.info(f"✅ Fallback inferred: Take Profit at ${tp_price:.4f}")
+                return "TAKE_PROFIT", tp_price
+        return None
+    
+    @staticmethod
+    def _extract_stop_loss_from_orders(oco_status: Dict, expired_order: Dict) -> Optional[Tuple[str, float]]:
+        """Extract stop loss price from non-expired order"""
+        for order in oco_status.get("orders", []):
+            if order.get("orderId") != expired_order.get("orderId"):
+                sl_price = float(order.get("stopPrice") or order.get("price", 0))
+                logger.info(f"✅ Fallback inferred: Stop Loss at ${sl_price:.4f}")
+                return "STOP_LOSS", sl_price
+        return None
 
     async def _manually_close_stale_position(
         self, db: AsyncSession, position: OpenPosition
@@ -1354,6 +1458,14 @@ class TradingBot:
                 f"EARLY_EXIT | USER={user_id} | SYMBOL={symbol} | REASON={exit_reason} | "
                 f"ENTRY=${entry_price:.4f} | EXIT=${exit_price:.4f} | PL=${profit_loss:+.2f} | "
                 f"PL_PCT={profit_loss_pct:+.2f} | DURATION={duration_seconds:.0f}s | BALANCE=${actual_usdt_balance:.2f}"
+            )
+            
+            # 🛡️ Record trade result in Circuit Breaker
+            is_winner = profit_loss > 0
+            self.circuit_breaker.record_trade_result(
+                user_id=user_id,
+                pnl=profit_loss,
+                is_winner=is_winner
             )
             
             # Step 9: Notify user via WebSocket
@@ -1779,6 +1891,21 @@ class TradingBot:
                     logger.info("🔄 Performing daily reset...")
                     self.risk_manager.reset_daily_counters()
                     self.last_analysis_time.clear()  # Reset analysis timers
+                    
+                    # 🛡️ Log Circuit Breaker daily summaries before reset
+                    for user_id in self.circuit_breaker.daily_pnl.keys():
+                        prev_pnl = self.circuit_breaker.daily_pnl.get(user_id, 0)
+                        prev_trades = self.circuit_breaker.daily_trade_count.get(user_id, 0)
+                        
+                        if prev_trades > 0:
+                            logger.info(
+                                f"📊 [User {user_id}] Daily Summary: "
+                                f"{prev_trades} trades, ${prev_pnl:+.2f} P&L"
+                            )
+                            metrics_logger.info(
+                                f"DAILY_SUMMARY | USER={user_id} | TRADES={prev_trades} | PNL=${prev_pnl:+.2f}"
+                            )
+                    
                     logger.info("🔄 Daily counters and analysis timers reset")
                     metrics_logger.info("DAILY_RESET | STATUS=COMPLETED")
                     
