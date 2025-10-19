@@ -21,10 +21,11 @@ AI_HOLD_TAKE_PROFIT_RATIO = 1.015
 # Risk management thresholds - DAY TRADING
 MIN_SIGNAL_CONFIDENCE = 75  # High-quality setups only (was 60)
 MIN_ACCOUNT_BALANCE = 10.0
-MAX_BALANCE_TRADE_RATIO = 0.03  # Max 3% of balance per position (conservative)
+MAX_BALANCE_TRADE_RATIO = 0.01  # Max 1% of balance per position (safety first)
 MIN_TRADE_VALUE = 10.0
 DEFAULT_RISK_PERCENTAGE = 1.0  # 1% rule: max risk per trade
 DEFAULT_MAX_DAILY_TRADES = 5  # Quality over quantity (was 10)
+MAX_OPEN_POSITIONS = 3  # Maximum concurrent open positions per user
 
 # Trading cadence - DAY TRADING
 ANALYSIS_RATE_LIMIT_SECONDS = 300  # 5 minutes between analyses (was 30s)
@@ -75,6 +76,7 @@ __all__ = [
     "MIN_TRADE_VALUE",
     "DEFAULT_RISK_PERCENTAGE",
     "DEFAULT_MAX_DAILY_TRADES",
+    "MAX_OPEN_POSITIONS",
     "ANALYSIS_RATE_LIMIT_SECONDS",
     "TRADING_CYCLE_DELAY_SECONDS",
     "POSITION_TIMEOUT_MINUTES",

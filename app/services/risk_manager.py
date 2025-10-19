@@ -8,6 +8,7 @@ from .service_constants import (
     DEFAULT_RISK_PERCENTAGE,
     EIGHT_DECIMAL_PLACES,
     MAX_BALANCE_TRADE_RATIO,
+    MAX_OPEN_POSITIONS,
     MIN_ACCOUNT_BALANCE,
     MIN_SIGNAL_CONFIDENCE,
     MIN_TRADE_VALUE,
@@ -660,12 +661,13 @@ class RiskManager:
             raise RiskValidationError("Trading bot is not active")
 
     def _assert_no_open_positions(self, positions: List[Dict]) -> None:
-        if not positions:
-            return
-        position_details = positions[0]
-        raise RiskValidationError(
-            f"User already has {len(positions)} open position(s) for {position_details['symbol']}. Only one trade allowed at a time."
-        )
+        """Check if user has reached the maximum number of open positions."""
+        if len(positions) >= MAX_OPEN_POSITIONS:
+            position_symbols = [p['symbol'] for p in positions]
+            raise RiskValidationError(
+                f"User already has {len(positions)} open position(s) ({', '.join(position_symbols)}). "
+                f"Maximum allowed: {MAX_OPEN_POSITIONS}."
+            )
 
     def _assert_daily_limit(self, user_id: int, today_count: int, config: Dict) -> None:
         max_trades = self.max_daily_trades.get(

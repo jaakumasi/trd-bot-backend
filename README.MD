@@ -165,16 +165,17 @@ closed_at = <timestamp>
 
 ### **Core Rules**
 
-1. **Single Trade Rule**
+1. **Multiple Position Management**
    - Method: `validate_trade_signal()` checks `get_open_positions(user_id)`
-   - Only 1 open position per user at a time
-   - New trades blocked until current position closes
+   - Maximum 3 concurrent open positions per user (configurable via `MAX_OPEN_POSITIONS`)
+   - No duplicate positions on the same trading pair (symbol)
+   - Each position can be on a different symbol (e.g., BTCUSDT, ETHUSDT, SOLUSDT)
 
 2. **Position Sizing**
    - Method: `calculate_position_size()`
    - Formula: `position_size = (balance * risk_pct / 100) / |entry_price - stop_loss_price|`
    - Default: 1% account risk per trade
-   - Max: 10% of balance per trade
+   - Max: 1% of balance per position (strict safety limit)
 
 3. **Daily Trade Limits**
    - Default: 5 trades per day per user (quality over quantity)
