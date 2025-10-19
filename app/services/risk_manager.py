@@ -39,16 +39,19 @@ class RiskManager:
         stop_loss_price: Union[float, Decimal],
     ) -> float:
         """
-        Calculate safe position size for SPOT TRADING (no leverage).
+        Calculate position size using the 1% RULE for DAY TRADING.
 
-        FIXED FORMULA for spot-only trading:
-        - Ensures position never exceeds available capital
-        - Applies both risk-based and capital-based constraints
-        - Adds absolute safety caps for scalping
+        Formula: Position Size = (Account Balance × Risk %) / (Entry Price - Stop Loss Price)
+
+        This ensures:
+        - Maximum loss per trade = 1% of account balance
+        - Position size dynamically adjusts based on stop loss distance
+        - Wider stops = smaller positions, tighter stops = larger positions
+        - Never exceeds available capital (safety cap applied)
 
         Args:
             account_balance: Total account balance in USDT
-            risk_percentage: Max % of balance to risk (e.g., 1.0 = 1%)
+            risk_percentage: Max % of balance to risk (typically 1.0 = 1%)
             entry_price: Expected entry price
             stop_loss_price: Stop-loss price
 
@@ -62,7 +65,7 @@ class RiskManager:
             stop = self._to_float(stop_loss_price)
 
             logger.debug(
-                "Position calc inputs: balance=$%.2f, risk=%s%%, entry=$%.2f, stop=$%.2f",
+                "🔢 Position calc inputs: balance=$%.2f, risk=%.1f%%, entry=$%.2f, stop=$%.2f",
                 balance,
                 risk,
                 entry,
@@ -71,98 +74,87 @@ class RiskManager:
 
             price_risk = abs(entry - stop)
             if price_risk == 0:
-                logger.warning("Price risk is zero - entry price equals stop loss price")
+                logger.warning("⚠️ Price risk is zero - entry equals stop loss")
                 return 0.0
 
-            # Method 1: Risk-based sizing (how much to buy based on acceptable loss)
+            # PRIMARY METHOD: 1% Rule (Risk-Based Position Sizing)
+            # This is the gold standard for day trading risk management
             risk_amount = balance * (risk / 100)
-            risk_based_position = risk_amount / price_risk
-
-            # Method 2: Capital-based cap with VOLATILITY ADJUSTMENT
-            # SAFETY FEATURE: Reduce position size in high-volatility periods
-            #
-            # Base position sizes:
-            #   - 0.03 (3%) = Very conservative, ~$1.50 loss on $10K if SL hits
-            #   - 0.05 (5%) = Conservative (DEFAULT), ~$2.50 loss on $10K if SL hits
-            #   - 0.08 (8%) = Moderate, ~$4.00 loss on $10K if SL hits
-            #   - 0.10 (10%) = Aggressive, ~$5.00 loss on $10K if SL hits
-
-            # Check if we have volatility data available (set by get_adaptive_exit_levels)
-            if self.current_volatility_percentile is not None and self.current_volatility_percentile > 75:
-                # HIGH VOLATILITY DETECTED (>75th percentile)
-                # Reduce position size to 3% for safety
-                max_position_pct = 0.03
-                logger.info(
-                    f"🔻 Position size REDUCED to 3% (HIGH volatility: "
-                    f"{self.current_volatility_percentile:.0f}th percentile) - SAFETY OVERRIDE"
-                )
-            else:
-                # NORMAL or LOW volatility: Use standard 5%
-                max_position_pct = 0.05
-                if self.current_volatility_percentile is not None:
-                    logger.debug(
-                        f"📊 Position size: 5% (volatility: {self.current_volatility_percentile:.0f}th percentile)"
-                    )
-
-            capital_based_position = (balance * max_position_pct) / entry
-
-            # Method 3: Absolute position value cap (for safety)
-            # Never risk more than 10% of balance in a single position
-            absolute_max_position_value = balance * MAX_BALANCE_TRADE_RATIO  # 10%
-            absolute_position_limit = absolute_max_position_value / entry
-
-            # Take the MINIMUM of all three methods (most conservative)
-            position_size = min(
-                risk_based_position,
-                capital_based_position,
-                absolute_position_limit
-            )
+            position_size = risk_amount / price_risk
 
             logger.debug(
-                "Position sizing breakdown:\n"
-                "  Risk-based: %.8f (risk $%.2f / $%.2f price movement)\n"
-                "  Capital-based: %.8f (5%% of balance)\n"
-                "  Absolute limit: %.8f (10%% max position)\n"
-                "  FINAL: %.8f",
-                risk_based_position,
+                "📊 1%% Rule calculation:\n"
+                "   Risk amount: $%.2f (%.1f%% of $%.2f)\n"
+                "   Price risk: $%.2f per unit\n"
+                "   Initial position: %.8f units",
                 risk_amount,
+                risk,
+                balance,
                 price_risk,
-                capital_based_position,
-                absolute_position_limit,
-                position_size
+                position_size,
             )
 
-            # Additional safety: Check stop-loss percentage is reasonable for scalping
-            stop_loss_pct = (price_risk / entry) * 100
-            if stop_loss_pct > 0.5:  # More than 0.5% stop for scalping is aggressive
+            # SAFETY CAP: Position value should not exceed 3% of balance
+            # This prevents over-concentration in a single trade
+            position_value = position_size * entry
+            max_position_value = balance * MAX_BALANCE_TRADE_RATIO  # 3% from constants
+
+            if position_value > max_position_value:
                 logger.warning(
-                    f"⚠️  Wide stop-loss detected: {stop_loss_pct:.2f}% "
-                    f"(>0.5% not ideal for scalping)"
+                    f"⚠️ Position value (${position_value:.2f}) exceeds 3%% cap (${max_position_value:.2f})"
+                )
+                position_size = max_position_value / entry
+                position_value = position_size * entry
+                logger.info(
+                    "🔻 Position reduced to: %.8f (value: $%.2f, %.1f%% of balance)",
+                    position_size,
+                    position_value,
+                    (position_value / balance * 100),
                 )
 
-            # Truncate to exchange precision
-            position_size = self._truncate(position_size)
+            # Validate stop loss percentage is reasonable for day trading
+            stop_loss_pct = (price_risk / entry) * 100
+            if stop_loss_pct < 0.5:
+                logger.warning(
+                    f"⚠️ Very tight stop: {stop_loss_pct:.2f}% (<0.5% may be too tight for day trading)"
+                )
+            elif stop_loss_pct > 3.0:
+                logger.warning(
+                    f"⚠️ Wide stop: {stop_loss_pct:.2f}% (>3% may be too wide for intraday)"
+                )
+            else:
+                logger.debug(
+                    f"✅ Stop loss distance: {stop_loss_pct:.2f}% (acceptable range)"
+                )
 
+            # Truncate to exchange precision (8 decimals)
+            position_size = self._truncate(position_size)
             position_value = position_size * entry
+
             logger.info(
-                "✅ Calculated position size: %.8f (value: $%.2f, %.1f%% of balance)",
+                "✅ FINAL position size: %.8f units\n"
+                "   Position value: $%.2f (%.2f%% of balance)\n"
+                "   Max risk if SL hits: $%.2f (%.2f%% of balance)\n"
+                "   Stop distance: %.2f%%",
                 position_size,
                 position_value,
-                (position_value / balance * 100) if balance > 0 else 0
+                (position_value / balance * 100) if balance > 0 else 0,
+                risk_amount,
+                risk,
+                stop_loss_pct,
             )
 
             # Final validation: position should never exceed balance
             if position_value > balance:
                 logger.error(
-                    f"❌ CRITICAL: Position value (${position_value:.2f}) exceeds balance (${balance:.2f})! "
-                    f"This should never happen with corrected formula."
+                    f"❌ CRITICAL: Position value (${position_value:.2f}) exceeds balance (${balance:.2f})!"
                 )
                 return 0.0
 
             return position_size
 
         except Exception as e:
-            logger.error(f"Position size calculation error: {e}")
+            logger.error(f"❌ Position size calculation error: {e}")
             logger.error(
                 "Inputs - balance: %s (%s), risk: %s (%s), entry: %s (%s), stop: %s (%s)",
                 account_balance,
@@ -177,9 +169,24 @@ class RiskManager:
             return 0.0
 
     def validate_trade_signal(
-        self, user_id: int, signal: Dict, account_balance: float, config: Dict
+        self,
+        user_id: int,
+        signal: Dict,
+        account_balance: float,
+        config: Dict,
+        market_df=None,
     ) -> Tuple[bool, str, Dict]:
-        """Validate if a trade signal meets risk management criteria"""
+        """
+        Validate if a trade signal meets risk management criteria.
+        Enhanced for day trading with adaptive R:R based on market structure.
+
+        Args:
+            user_id: User identifier
+            signal: AI trading signal
+            account_balance: Current account balance
+            config: Trading configuration
+            market_df: Optional DataFrame for S/R detection and adaptive R:R
+        """
         try:
             self._assert_trading_active(config)
 
@@ -195,9 +202,55 @@ class RiskManager:
             balance = self._to_float(account_balance)
             self._assert_sufficient_balance(balance)
 
-            entry_price, stop_loss = self._extract_prices(signal)
+            # Get signal details
+            entry_price = self._extract_entry_price(signal)
+            side = signal.get("signal", "buy").lower()
             risk_percentage = self._resolve_risk_percentage(config)
 
+            # Use adaptive R:R if market data available, otherwise use AI suggestions
+            if market_df is not None and not market_df.empty:
+                logger.info(
+                    f"🎯 [User {user_id}] Using adaptive R:R based on market structure"
+                )
+
+                # Detect support/resistance levels
+                sr_levels = self.detect_support_resistance_levels(
+                    market_df, entry_price
+                )
+
+                # Get ATR for volatility context
+                atr = market_df.iloc[-1].get(
+                    "atr", entry_price * 0.02
+                )  # Default 2% if missing
+
+                # Calculate adaptive stop loss and take profit
+                adaptive_rr = self.calculate_adaptive_risk_reward(
+                    side, entry_price, sr_levels, atr
+                )
+
+                stop_loss = adaptive_rr["stop_loss"]
+                take_profit = adaptive_rr["take_profit"]
+                risk_reward_ratio = adaptive_rr["risk_reward_ratio"]
+
+                logger.info(
+                    f"📊 [User {user_id}] Adaptive R:R applied:\n"
+                    f"   Entry: ${entry_price:.2f}\n"
+                    f"   Stop Loss: ${stop_loss:.2f} (S/R: ${sr_levels['nearest_support']:.2f})\n"
+                    f"   Take Profit: ${take_profit:.2f} (S/R: ${sr_levels['nearest_resistance']:.2f})\n"
+                    f"   R:R Ratio: 1:{risk_reward_ratio:.2f}"
+                )
+            else:
+                # Fallback to AI-suggested levels
+                logger.warning(
+                    f"⚠️ [User {user_id}] No market data for adaptive R:R, using AI suggestions"
+                )
+                entry_price, stop_loss = self._extract_prices(signal)
+                take_profit = self._resolve_take_profit(signal, entry_price)
+                risk_reward_ratio = abs(take_profit - entry_price) / abs(
+                    entry_price - stop_loss
+                )
+
+            # Calculate position size using 1% rule
             position_size = self.calculate_position_size(
                 balance,
                 risk_percentage,
@@ -216,7 +269,9 @@ class RiskManager:
                 "risk_amount": self._risk_amount(balance, risk_percentage),
                 "entry_price": entry_price,
                 "stop_loss": stop_loss,
-                "take_profit": self._resolve_take_profit(signal, entry_price),
+                "take_profit": take_profit,
+                "risk_reward_ratio": risk_reward_ratio,
+                "side": side,
             }
 
             return True, "Trade approved", trade_params
@@ -224,7 +279,7 @@ class RiskManager:
         except RiskValidationError as err:
             return False, err.message, {}
         except Exception as e:
-            logger.error(f"Trade validation error: {e}")
+            logger.error(f"❌ Trade validation error: {e}")
             return False, f"Validation error: {str(e)}", {}
 
     def record_trade(self, user_id: int):
@@ -235,36 +290,40 @@ class RiskManager:
         """Add a new open position for tracking"""
         if user_id not in self.open_positions:
             self.open_positions[user_id] = []
-        
+
         position = {
-            'trade_id': position_data['trade_id'],
-            'symbol': position_data['symbol'],
-            'side': position_data['side'],
-            'amount': position_data['amount'],
-            'entry_price': position_data['entry_price'],
-            'stop_loss': position_data['stop_loss'],
-            'take_profit': position_data['take_profit'],
-            'entry_time': position_data['entry_time'],
-            'entry_value': position_data['entry_value'],
-            'fees_paid': position_data['fees_paid']
+            "trade_id": position_data["trade_id"],
+            "symbol": position_data["symbol"],
+            "side": position_data["side"],
+            "amount": position_data["amount"],
+            "entry_price": position_data["entry_price"],
+            "stop_loss": position_data["stop_loss"],
+            "take_profit": position_data["take_profit"],
+            "entry_time": position_data["entry_time"],
+            "entry_value": position_data["entry_value"],
+            "fees_paid": position_data["fees_paid"],
         }
-        
+
         self.open_positions[user_id].append(position)
-        logger.info(f"📋 [User {user_id}] Position added: {position['side']} {position['amount']:.6f} {position['symbol']} @ ${position['entry_price']:.4f}")
+        logger.info(
+            f"📋 [User {user_id}] Position added: {position['side']} {position['amount']:.6f} {position['symbol']} @ ${position['entry_price']:.4f}"
+        )
 
     def get_open_positions(self, user_id: int) -> list:
         """Get all open positions for a user"""
         return self.open_positions.get(user_id, [])
 
-    def check_exit_conditions(self, user_id: int, current_price: float, symbol: str) -> list:
+    def check_exit_conditions(
+        self, user_id: int, current_price: float, symbol: str
+    ) -> list:
         """Check if any positions should be closed based on current price"""
         positions_to_close = []
-        
+
         if user_id not in self.open_positions:
             return positions_to_close
 
         for position in self.open_positions[user_id]:
-            if position['symbol'] != symbol:
+            if position["symbol"] != symbol:
                 continue
 
             exit_reason = self._determine_exit_reason(position, current_price)
@@ -285,23 +344,18 @@ class RiskManager:
         logger.info("Daily trade counters reset")
 
     async def get_adaptive_exit_levels(
-        self, 
-        db, 
-        user_id: int, 
-        df, 
-        side: str,
-        entry_price: float
+        self, db, user_id: int, df, side: str, entry_price: float
     ) -> Dict:
         """
         Calculate optimal SL/TP based on:
         1. Current market volatility (ATR) - inversely scaled
         2. Historical user performance in similar volatility
         3. Safety caps to prevent excessive risk
-        
+
         Philosophy:
         - High volatility → Wider stops (larger ATR multipliers) to avoid premature exits
         - Low volatility → Tighter stops (smaller ATR multipliers) for precision
-        
+
         Returns:
             {
                 "stop_loss_pct": float,
@@ -317,23 +371,24 @@ class RiskManager:
         """
         try:
             # 1. ATR-Based Dynamic Stops with Adaptive Multipliers
-            atr = df['atr'].iloc[-1]
-            current_price = df['close'].iloc[-1]
+            atr = df["atr"].iloc[-1]
+            current_price = df["close"].iloc[-1]
             atr_percentage = (atr / current_price) * 100
-            
+
             # Calculate ATR percentile to determine volatility regime
-            atr_history = df['atr'].tail(100) if len(df) >= 100 else df['atr']
+            atr_history = df["atr"].tail(100) if len(df) >= 100 else df["atr"]
             from scipy.stats import percentileofscore
+
             volatility_percentile = percentileofscore(atr_history, atr)
 
             # Store volatility percentile for use by position sizing
             self.current_volatility_percentile = volatility_percentile
-            
+
             # Adaptive Multipliers based on volatility regime
             # High volatility (>75th percentile) → Wider stops (2.5-3x ATR)
             # Medium volatility (25th-75th) → Standard stops (1.8-2.2x ATR)
             # Low volatility (<25th percentile) → Tighter stops (1.2-1.5x ATR)
-            
+
             if volatility_percentile > 75:
                 # HIGH VOLATILITY: Use wider stops to avoid noise
                 sl_multiplier = 2.8
@@ -354,63 +409,73 @@ class RiskManager:
                 sl_multiplier = 1.3
                 tp_multiplier = 1.7
                 volatility_regime = "LOW"
-            
+
             # Calculate percentage distances
             dynamic_sl_pct = atr_percentage * sl_multiplier
             dynamic_tp_pct = atr_percentage * tp_multiplier
-            
+
             # Calculate percentage distances
             dynamic_sl_pct = atr_percentage * sl_multiplier
             dynamic_tp_pct = atr_percentage * tp_multiplier
-            
+
             # 2. Historical Performance Adjustment (Volatility-Aware)
             try:
                 from sqlalchemy import select
                 from ..models.trade import Trade
-                
-                query = select(Trade).where(
-                    Trade.user_id == user_id,
-                    Trade.status == "closed"
-                ).order_by(Trade.closed_at.desc()).limit(50)
-                
+
+                query = (
+                    select(Trade)
+                    .where(Trade.user_id == user_id, Trade.status == "closed")
+                    .order_by(Trade.closed_at.desc())
+                    .limit(50)
+                )
+
                 result = await db.execute(query)
                 trades_list = result.scalars().all()
-                
+
                 if len(trades_list) >= 10:
                     # Calculate average actual exit percentage for wins/losses
                     winning_exits = [
-                        abs(float(t.profit_loss_percentage)) 
-                        for t in trades_list 
-                        if t.profit_loss and float(t.profit_loss) > 0 and t.profit_loss_percentage
+                        abs(float(t.profit_loss_percentage))
+                        for t in trades_list
+                        if t.profit_loss
+                        and float(t.profit_loss) > 0
+                        and t.profit_loss_percentage
                     ]
                     losing_exits = [
                         abs(float(t.profit_loss_percentage))
                         for t in trades_list
-                        if t.profit_loss and float(t.profit_loss) < 0 and t.profit_loss_percentage
+                        if t.profit_loss
+                        and float(t.profit_loss) < 0
+                        and t.profit_loss_percentage
                     ]
-                    
+
                     if winning_exits and len(winning_exits) >= 5:
                         # TP: Take 75% of average winning exit (conservative)
                         import numpy as np
+
                         historical_tp = np.mean(winning_exits) * 0.75
                         # Only adjust if historical is significantly larger
                         if historical_tp > dynamic_tp_pct * 1.2:
                             dynamic_tp_pct = min(dynamic_tp_pct * 1.3, historical_tp)
-                    
+
                     if losing_exits and len(losing_exits) >= 5:
                         # SL: Use 110% of average losing exit (slightly more room)
                         import numpy as np
+
                         historical_sl = np.mean(losing_exits) * 1.1
                         # Only adjust if historical suggests wider stops needed
                         if historical_sl > dynamic_sl_pct:
                             dynamic_sl_pct = min(dynamic_sl_pct * 1.2, historical_sl)
-            
+
             except Exception as hist_error:
-                logger.warning(f"⚠️ Could not fetch historical performance for adaptive exits: {hist_error}")
+                logger.warning(
+                    f"⚠️ Could not fetch historical performance for adaptive exits: {hist_error}"
+                )
                 # Continue with ATR-based values
-            
+
             # 3. Volatility-Adjusted Safety Caps
-            # TIGHTENED for scalping - prioritize capital preservation
+            # Day trading risk management - adaptive to market structure
             # High volatility periods need wider caps BUT with absolute maximum
 
             # ABSOLUTE MAXIMUM CAPS (regardless of volatility)
@@ -419,7 +484,7 @@ class RiskManager:
 
             if volatility_regime == "HIGH":
                 # High volatility: wider stops but capped
-                max_sl = 0.5  # Reduced from 1.5% - too risky for scalping
+                max_sl = 2.5  # Day trading maximum stop loss (adaptive)
                 min_sl = 0.3
                 max_tp = 1.2  # Reduced from 2.5%
                 min_tp = 0.6
@@ -452,7 +517,7 @@ class RiskManager:
                     f"Adjusting TP to maintain {min_risk_reward}:1"
                 )
                 dynamic_tp_pct = max(dynamic_tp_pct, dynamic_sl_pct * min_risk_reward)
-            
+
             # 4. Calculate actual prices based on side
             if side.lower() == "buy":
                 stop_loss_price = entry_price * (1 - dynamic_sl_pct / 100)
@@ -460,7 +525,7 @@ class RiskManager:
             else:  # sell
                 stop_loss_price = entry_price * (1 + dynamic_sl_pct / 100)
                 take_profit_price = entry_price * (1 - dynamic_tp_pct / 100)
-            
+
             result = {
                 "stop_loss_pct": dynamic_sl_pct,
                 "take_profit_pct": dynamic_tp_pct,
@@ -473,9 +538,9 @@ class RiskManager:
                 "volatility_regime": volatility_regime,
                 "volatility_percentile": volatility_percentile,
                 "sl_multiplier": sl_multiplier,
-                "tp_multiplier": tp_multiplier
+                "tp_multiplier": tp_multiplier,
             }
-            
+
             logger.info(
                 f"📊 [User {user_id}] Adaptive Exits ({volatility_regime} Vol): "
                 f"SL={dynamic_sl_pct:.2f}% (${stop_loss_price:.4f}) [{sl_multiplier}x ATR], "
@@ -483,9 +548,9 @@ class RiskManager:
                 f"R:R={result['risk_reward_ratio']:.2f}:1, "
                 f"ATR={atr_percentage:.3f}%, Vol_Pct={volatility_percentile:.0f}"
             )
-            
+
             return result
-            
+
         except Exception as e:
             logger.error(f"❌ Error calculating adaptive exit levels: {e}")
             # Fallback to fixed percentages
@@ -498,7 +563,7 @@ class RiskManager:
                     "source": "fallback_fixed",
                     "atr_value": 0,
                     "atr_pct": 0,
-                    "risk_reward_ratio": 0.6
+                    "risk_reward_ratio": 0.6,
                 }
             else:
                 return {
@@ -509,7 +574,7 @@ class RiskManager:
                     "source": "fallback_fixed",
                     "atr_value": 0,
                     "atr_pct": 0,
-                    "risk_reward_ratio": 0.6
+                    "risk_reward_ratio": 0.6,
                 }
 
     @staticmethod
@@ -546,6 +611,14 @@ class RiskManager:
     @staticmethod
     def _extract_confidence(signal: Dict) -> float:
         return float(signal.get("final_confidence", 0))
+
+    @staticmethod
+    def _extract_entry_price(signal: Dict) -> float:
+        """Extract entry price from signal."""
+        entry_price = float(signal.get("entry_price", 0))
+        if entry_price <= 0:
+            raise RiskValidationError("Missing or invalid entry price in signal")
+        return entry_price
 
     @staticmethod
     def _extract_prices(signal: Dict) -> Tuple[float, float]:
@@ -638,4 +711,267 @@ class RiskManager:
     def _resolve_take_profit(signal: Dict, entry_price: float) -> float:
         return float(signal.get("take_profit") or (entry_price * 1.003))
 
+    def detect_support_resistance_levels(self, df, current_price: float) -> Dict:
+        """
+        Detect key support and resistance levels using pivot points and price action.
 
+        Returns dict with:
+            - nearest_support: Closest support level below current price
+            - nearest_resistance: Closest resistance level above current price
+            - support_strength: Number of times support was tested
+            - resistance_strength: Number of times resistance was tested
+        """
+        from .service_constants import (
+            SR_LOOKBACK_PERIODS,
+            SR_TOUCH_THRESHOLD,
+            SR_MIN_TOUCHES,
+        )
+
+        try:
+            if df.empty or len(df) < 20:
+                return self._default_sr_levels(current_price)
+
+            lookback = min(SR_LOOKBACK_PERIODS, len(df))
+            df_analysis = df.tail(lookback).copy()
+
+            # Identify pivot points (local highs and lows)
+            df_analysis["pivot_high"] = (
+                df_analysis["high"] > df_analysis["high"].shift(1)
+            ) & (df_analysis["high"] > df_analysis["high"].shift(-1))
+            df_analysis["pivot_low"] = (
+                df_analysis["low"] < df_analysis["low"].shift(1)
+            ) & (df_analysis["low"] < df_analysis["low"].shift(-1))
+
+            # Extract pivot levels
+            resistance_candidates = df_analysis[df_analysis["pivot_high"]][
+                "high"
+            ].tolist()
+            support_candidates = df_analysis[df_analysis["pivot_low"]]["low"].tolist()
+
+            # Cluster nearby levels (within 0.2% of each other)
+            resistance_levels = self._cluster_price_levels(
+                resistance_candidates, current_price, SR_TOUCH_THRESHOLD
+            )
+            support_levels = self._cluster_price_levels(
+                support_candidates, current_price, SR_TOUCH_THRESHOLD
+            )
+
+            # Find nearest levels
+            nearest_resistance = self._find_nearest_above(
+                resistance_levels, current_price
+            )
+            nearest_support = self._find_nearest_below(support_levels, current_price)
+
+            # Calculate strength (number of touches)
+            resistance_strength = self._count_touches(
+                df_analysis, nearest_resistance, SR_TOUCH_THRESHOLD
+            )
+            support_strength = self._count_touches(
+                df_analysis, nearest_support, SR_TOUCH_THRESHOLD
+            )
+
+            logger.debug(
+                f"📍 S/R Levels: Support=${nearest_support:.2f} (strength:{support_strength}), "
+                f"Resistance=${nearest_resistance:.2f} (strength:{resistance_strength}), "
+                f"Current=${current_price:.2f}"
+            )
+
+            return {
+                "nearest_support": nearest_support,
+                "nearest_resistance": nearest_resistance,
+                "support_strength": support_strength,
+                "resistance_strength": resistance_strength,
+                "support_distance_pct": abs(current_price - nearest_support)
+                / current_price
+                * 100,
+                "resistance_distance_pct": abs(nearest_resistance - current_price)
+                / current_price
+                * 100,
+            }
+
+        except Exception as e:
+            logger.error(f"❌ Error detecting S/R levels: {e}")
+            return self._default_sr_levels(current_price)
+
+    def _cluster_price_levels(
+        self, levels: List[float], current_price: float, threshold: float
+    ) -> List[float]:
+        """Cluster nearby price levels to identify significant zones."""
+        if not levels:
+            return []
+
+        clustered = []
+        sorted_levels = sorted(levels)
+
+        for level in sorted_levels:
+            if not clustered:
+                clustered.append(level)
+                continue
+
+            # Check if this level is close to the last clustered level
+            if abs(level - clustered[-1]) / current_price < threshold:
+                # Update cluster with average
+                clustered[-1] = (clustered[-1] + level) / 2
+            else:
+                clustered.append(level)
+
+        return clustered
+
+    def _find_nearest_above(self, levels: List[float], price: float) -> float:
+        """Find nearest level above current price."""
+        above = [l for l in levels if l > price]
+        return min(above) if above else price * 1.05  # Default 5% above
+
+    def _find_nearest_below(self, levels: List[float], price: float) -> float:
+        """Find nearest level below current price."""
+        below = [l for l in levels if l < price]
+        return max(below) if below else price * 0.95  # Default 5% below
+
+    def _count_touches(self, df, level: float, threshold: float) -> int:
+        """Count how many times price touched a level."""
+        if df.empty:
+            return 0
+
+        touches = 0
+        for _, row in df.iterrows():
+            high = row["high"]
+            low = row["low"]
+            if (
+                abs(high - level) / level < threshold
+                or abs(low - level) / level < threshold
+            ):
+                touches += 1
+
+        return touches
+
+    def _default_sr_levels(self, current_price: float) -> Dict:
+        """Default S/R levels when detection fails."""
+        return {
+            "nearest_support": current_price * 0.98,  # 2% below
+            "nearest_resistance": current_price * 1.02,  # 2% above
+            "support_strength": 1,
+            "resistance_strength": 1,
+            "support_distance_pct": 2.0,
+            "resistance_distance_pct": 2.0,
+        }
+
+    def calculate_adaptive_risk_reward(
+        self, side: str, entry_price: float, sr_levels: Dict, atr: float
+    ) -> Dict:
+        """
+        Calculate adaptive stop-loss and take-profit based on market structure.
+
+        Implements minimum 1:1.5 R:R with dynamic adjustment based on:
+        - Support/resistance levels
+        - Market volatility (ATR)
+        - Side of trade (buy/sell)
+
+        Returns dict with stop_loss, take_profit, and actual risk_reward_ratio
+        """
+        from .service_constants import (
+            MIN_RISK_REWARD_RATIO,
+            TARGET_RISK_REWARD_RATIO,
+            MAX_RISK_REWARD_RATIO,
+        )
+
+        try:
+            side = side.lower()
+
+            if side == "buy":
+                # Stop loss: Just below nearest support
+                support = sr_levels["nearest_support"]
+                buffer = atr * 0.5  # Half ATR below support for breathing room
+                stop_loss = support - buffer
+
+                # Take profit: Just below nearest resistance
+                resistance = sr_levels["nearest_resistance"]
+                take_profit = resistance - (atr * 0.3)  # Slightly below resistance
+
+            else:  # sell
+                # Stop loss: Just above nearest resistance
+                resistance = sr_levels["nearest_resistance"]
+                buffer = atr * 0.5
+                stop_loss = resistance + buffer
+
+                # Take profit: Just above nearest support
+                support = sr_levels["nearest_support"]
+                take_profit = support + (atr * 0.3)
+
+            # Calculate actual R:R ratio
+            risk = abs(entry_price - stop_loss)
+            reward = abs(take_profit - entry_price)
+
+            if risk == 0:
+                logger.warning("⚠️ Risk is zero, using default levels")
+                return self._default_exit_levels(side, entry_price, atr)
+
+            risk_reward_ratio = reward / risk
+
+            # Validate minimum R:R (1:1.5)
+            if risk_reward_ratio < MIN_RISK_REWARD_RATIO:
+                logger.warning(
+                    f"⚠️ R:R too low ({risk_reward_ratio:.2f}), adjusting to minimum {MIN_RISK_REWARD_RATIO}"
+                )
+                # Extend take profit to meet minimum R:R
+                if side == "buy":
+                    take_profit = entry_price + (risk * MIN_RISK_REWARD_RATIO)
+                else:
+                    take_profit = entry_price - (risk * MIN_RISK_REWARD_RATIO)
+
+                risk_reward_ratio = MIN_RISK_REWARD_RATIO
+
+            # Cap at maximum R:R (1:4) - beyond this is often unrealistic
+            if risk_reward_ratio > MAX_RISK_REWARD_RATIO:
+                logger.info(
+                    f"📊 R:R very high ({risk_reward_ratio:.2f}), capping at {MAX_RISK_REWARD_RATIO}"
+                )
+                if side == "buy":
+                    take_profit = entry_price + (risk * MAX_RISK_REWARD_RATIO)
+                else:
+                    take_profit = entry_price - (risk * MAX_RISK_REWARD_RATIO)
+
+                risk_reward_ratio = MAX_RISK_REWARD_RATIO
+
+            risk_pct = (risk / entry_price) * 100
+            reward_pct = (reward / entry_price) * 100
+
+            logger.info(
+                f"🎯 Adaptive R:R - {side.upper()}\n"
+                f"   Entry: ${entry_price:.2f}\n"
+                f"   Stop Loss: ${stop_loss:.2f} (-{risk_pct:.2f}%)\n"
+                f"   Take Profit: ${take_profit:.2f} (+{reward_pct:.2f}%)\n"
+                f"   Risk:Reward = 1:{risk_reward_ratio:.2f}"
+            )
+
+            return {
+                "stop_loss": stop_loss,
+                "take_profit": take_profit,
+                "risk_reward_ratio": risk_reward_ratio,
+                "risk_amount": risk,
+                "reward_amount": reward,
+                "risk_percentage": risk_pct,
+                "reward_percentage": reward_pct,
+            }
+
+        except Exception as e:
+            logger.error(f"❌ Error calculating adaptive R:R: {e}")
+            return self._default_exit_levels(side, entry_price, atr)
+
+    def _default_exit_levels(self, side: str, entry_price: float, atr: float) -> Dict:
+        """Default exit levels when adaptive calculation fails."""
+        if side == "buy":
+            stop_loss = entry_price - (atr * 1.5)
+            take_profit = entry_price + (atr * 3.0)
+        else:
+            stop_loss = entry_price + (atr * 1.5)
+            take_profit = entry_price - (atr * 3.0)
+
+        return {
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "risk_reward_ratio": 2.0,
+            "risk_amount": atr * 1.5,
+            "reward_amount": atr * 3.0,
+            "risk_percentage": 1.5,
+            "reward_percentage": 3.0,
+        }

@@ -1,6 +1,6 @@
 """
 Advanced Market Regime Analyzer with Microstructure Analysis
-Industry-leading scalping strategy using momentum persistence, order flow, and volatility clustering.
+Advanced day trading strategy using momentum persistence, order flow, and volatility clustering.
 """
 
 import pandas as pd
@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 class AdvancedRegimeAnalyzer:
     """
-    Next-generation market regime analyzer optimized for scalping with:
+    Next-generation market regime analyzer optimized for day trading with:
     - Momentum Persistence Analysis
     - Order Flow Imbalance Detection
     - Volatility Clustering (GARCH-style)
@@ -22,15 +22,15 @@ class AdvancedRegimeAnalyzer:
     - Dynamic Confluence Thresholds
     """
     
-    def __init__(self, filter_mode: str = "scalping"):
+    def __init__(self, filter_mode: str = "day_trading"):
         self.regime_history = []
         self.atr_history_window = 200
         self.filter_mode = filter_mode.lower()
         
         # Validate filter mode
-        if self.filter_mode not in ["strict", "balanced", "permissive", "scalping"]:
-            logger.warning(f"⚠️  Invalid filter mode '{filter_mode}', defaulting to 'scalping'")
-            self.filter_mode = "scalping"
+        if self.filter_mode not in ["strict", "balanced", "permissive", "day_trading"]:
+            logger.warning(f"⚠️  Invalid filter mode '{filter_mode}', defaulting to 'day_trading'")
+            self.filter_mode = "day_trading"
         
         logger.info(f"🚀 Advanced Market Regime Analyzer initialized in {self.filter_mode.upper()} mode")
         
@@ -52,7 +52,7 @@ class AdvancedRegimeAnalyzer:
         - Order flow imbalance (-100 to +100)
         - Volatility clustering factor
         - Mean reversion opportunity score
-        - Dynamic scalping quality score (0-100)
+        - Dynamic trading quality score (0-100)
         """
         
         try:
@@ -106,24 +106,24 @@ class AdvancedRegimeAnalyzer:
             # 4. Mean Reversion Opportunity Score (0-100)
             mean_reversion_score = self._calculate_mean_reversion_opportunity(df)
             
-            # 5. Dynamic Scalping Quality Score (0-100)
-            scalping_quality = self._calculate_scalping_quality(
+            # 5. Dynamic Trading Quality Score (0-100)
+            trading_quality = self._calculate_trading_quality(
                 regime, trend_strength, atr_percentage, momentum_persistence,
                 order_flow_imbalance, volatility_clustering, mean_reversion_score
             )
             
             # 6. Adaptive Confluence Threshold
             dynamic_threshold = self._calculate_dynamic_confluence_threshold(
-                scalping_quality, volatility_clustering
+                trading_quality, volatility_clustering
             )
             
-            # === SCALPING PERMISSION (now based on quality score) ===
-            allow_scalping = scalping_quality >= 50  # Quality-based, not binary regime check
+            # === TRADING PERMISSION (now based on quality score) ===
+            allow_trading = trading_quality >= 50  # Quality-based, not binary regime check
             
             # Calculate confidence
             confidence = self._calculate_advanced_confidence(
                 df, regime, trend_strength, volatility_percentile,
-                scalping_quality, momentum_persistence
+                trading_quality, momentum_persistence
             )
             
             result = {
@@ -133,7 +133,7 @@ class AdvancedRegimeAnalyzer:
                 "volatility_percentile": volatility_percentile,
                 "trend_strength": trend_strength,
                 "atr_percentage": atr_percentage,
-                "allow_scalping": allow_scalping,
+                "allow_trading": allow_trading,
                 "sma_alignment": sma_alignment,
                 "volume_trend": volume_trend,
                 "adx": adx,
@@ -146,11 +146,11 @@ class AdvancedRegimeAnalyzer:
                 "order_flow_imbalance": order_flow_imbalance,
                 "volatility_clustering": volatility_clustering,
                 "mean_reversion_score": mean_reversion_score,
-                "scalping_quality_score": scalping_quality,
+                "trading_quality_score": trading_quality,
                 "dynamic_confluence_threshold": dynamic_threshold,
                 
                 # Trading recommendations
-                "scalping_edge": self._determine_scalping_edge(
+                "trading_edge": self._determine_trading_edge(
                     order_flow_imbalance, mean_reversion_score, momentum_persistence
                 ),
                 "optimal_hold_time": self._estimate_optimal_hold_time(
@@ -164,15 +164,15 @@ class AdvancedRegimeAnalyzer:
                 self.regime_history.pop(0)
             
             # Enhanced logging
-            emoji = "✅" if allow_scalping else "🚫"
-            quality_emoji = "🔥" if scalping_quality > 70 else "⚡" if scalping_quality > 50 else "❄️"
+            emoji = "✅" if allow_trading else "🚫"
+            quality_emoji = "🔥" if trading_quality > 70 else "⚡" if trading_quality > 50 else "❄️"
             
             logger.info(
                 f"{emoji}{quality_emoji} [ADVANCED-{self.filter_mode.upper()}] {symbol} | {regime} | "
-                f"Quality={scalping_quality:.0f} | MomPersist={momentum_persistence:.0f} | "
+                f"Quality={trading_quality:.0f} | MomPersist={momentum_persistence:.0f} | "
                 f"OrderFlow={order_flow_imbalance:+.0f} | VolCluster={volatility_clustering:.0f} | "
                 f"MeanRev={mean_reversion_score:.0f} | Threshold={dynamic_threshold:.0f} | "
-                f"Edge={result['scalping_edge']} | HoldTime={result['optimal_hold_time']}min"
+                f"Edge={result['trading_edge']} | HoldTime={result['optimal_hold_time']}min"
             )
             
             return result
@@ -183,11 +183,11 @@ class AdvancedRegimeAnalyzer:
     
     def _calculate_momentum_persistence(self, df: pd.DataFrame, lookback: int = 10) -> float:
         """
-        Calculate how long momentum tends to persist (key for scalping exits).
+        Calculate how long momentum tends to persist (key for day trading exits).
         
         Analyzes recent price movements to predict how long the current momentum will last.
-        High persistence = trends continue, good for trend-following scalps
-        Low persistence = choppy reversals, better for mean reversion scalps
+        High persistence = trends continue, good for trend-following trades
+        Low persistence = choppy reversals, better for mean reversion trades
         
         Returns: 0-100 score
         """
@@ -295,10 +295,10 @@ class AdvancedRegimeAnalyzer:
     
     def _calculate_mean_reversion_opportunity(self, df: pd.DataFrame) -> float:
         """
-        Identify when price has stretched too far from mean (scalping gold!).
+        Identify when price has stretched too far from mean (day trading opportunity!).
         
         Uses Bollinger Bands + RSI + price vs SMA deviation to find extremes.
-        High score = excellent mean reversion scalping opportunity
+        High score = excellent mean reversion day trading opportunity
         
         Returns: 0-100 score
         """
@@ -354,13 +354,13 @@ class AdvancedRegimeAnalyzer:
         
         return min(100, score)
     
-    def _calculate_scalping_quality(
+    def _calculate_trading_quality(
         self, regime: str, trend_strength: float, atr_percentage: float,
         momentum_persistence: float, order_flow_imbalance: float,
         volatility_clustering: float, mean_reversion_score: float
-    ) -> float:
+) -> float:
         """
-        REVOLUTIONARY: Calculate overall scalping quality based on microstructure.
+        REVOLUTIONARY: Calculate overall trading quality based on microstructure.
         
         This replaces the binary allow/block with a nuanced 0-100 quality score.
         Different regimes can have high quality if microstructure is favorable!
@@ -378,7 +378,7 @@ class AdvancedRegimeAnalyzer:
                 quality += 10
                 
         elif regime == "RANGE_BOUND":
-            # Range can be EXCELLENT for scalping if microstructure is right!
+            # Range can be EXCELLENT for day trading with proper risk management!
             quality += 15  # Base points for range
             
             # Bonus if mean reversion opportunity is high
@@ -426,14 +426,14 @@ class AdvancedRegimeAnalyzer:
             quality += 8
         
         # === ATR Sweet Spot Bonus (+5 points) ===
-        if 0.1 < atr_percentage < 0.8:  # Optimal volatility for scalping
+        if 0.1 < atr_percentage < 0.8:  # Optimal volatility for day trading
             quality += 5
         
         return max(0, min(100, quality))
     
     def _calculate_dynamic_confluence_threshold(
-        self, scalping_quality: float, volatility_clustering: float
-    ) -> float:
+        self, trading_quality: float, volatility_clustering: float
+) -> float:
         """
         Adaptive confluence threshold based on market conditions.
         
@@ -445,11 +445,11 @@ class AdvancedRegimeAnalyzer:
         base_threshold = 60.0
         
         # Adjust down for high-quality setups (can be more aggressive)
-        if scalping_quality > 80:
+        if trading_quality > 80:
             base_threshold -= 15
-        elif scalping_quality > 70:
+        elif trading_quality > 70:
             base_threshold -= 10
-        elif scalping_quality > 60:
+        elif trading_quality > 60:
             base_threshold -= 5
         
         # Adjust up for unpredictable volatility (need more confirmation)
@@ -460,7 +460,7 @@ class AdvancedRegimeAnalyzer:
         
         return max(40, min(70, base_threshold))
     
-    def _determine_scalping_edge(
+    def _determine_trading_edge(
         self, order_flow: float, mean_reversion: float, momentum: float
     ) -> str:
         """
@@ -490,7 +490,7 @@ class AdvancedRegimeAnalyzer:
         elif momentum_persistence > 50:
             return "10-20"  # Moderate momentum
         else:
-            return "5-15"  # Quick scalps
+            return "5-15"  # Quick trades
     
     # === HELPER METHODS (from original implementation) ===
     
@@ -553,9 +553,9 @@ class AdvancedRegimeAnalyzer:
     
     def _calculate_advanced_confidence(
         self, df: pd.DataFrame, regime: str, trend_strength: float,
-        volatility_percentile: float, scalping_quality: float,
+        volatility_percentile: float, trading_quality: float,
         momentum_persistence: float
-    ) -> float:
+) -> float:
         confidence = 50.0
         
         # Trend strength factor
@@ -572,10 +572,10 @@ class AdvancedRegimeAnalyzer:
         elif volatility_percentile > 90 or volatility_percentile < 10:
             confidence -= 10
         
-        # Scalping quality boost
-        if scalping_quality > 75:
+        # Trading quality boost
+        if trading_quality > 75:
             confidence += 10
-        elif scalping_quality > 60:
+        elif trading_quality > 60:
             confidence += 5
         
         # Momentum persistence factor
@@ -591,7 +591,7 @@ class AdvancedRegimeAnalyzer:
             "volatility_percentile": 50,
             "trend_strength": 0,
             "atr_percentage": 0,
-            "allow_scalping": False,
+            "allow_trading": False,
             "sma_alignment": "NEUTRAL",
             "volume_trend": "STABLE",
             "adx": 0,
@@ -600,8 +600,8 @@ class AdvancedRegimeAnalyzer:
             "order_flow_imbalance": 0,
             "volatility_clustering": 50,
             "mean_reversion_score": 0,
-            "scalping_quality_score": 0,
+            "trading_quality_score": 0,
             "dynamic_confluence_threshold": 60,
-            "scalping_edge": "NEUTRAL",
+            "trading_edge": "NEUTRAL",
             "optimal_hold_time": "10-20"
         }

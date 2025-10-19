@@ -21,13 +21,13 @@ class Settings(BaseSettings):
     jwt_algorithm: str = Field(default="HS256")
     jwt_expiration: int = Field(default=3600)
     
-    # Trading Configuration
-    default_risk_percentage: float = Field(default=1.0)
+    # Trading Configuration - DAY TRADING OPTIMIZED
+    default_risk_percentage: float = Field(default=1.0)  # 1% rule
     default_trading_pair: str = Field(default="BTCUSDT")
-    trading_active_hours_start: str = Field(default="08:00")
-    trading_active_hours_end: str = Field(default="16:00")
+    trading_active_hours_start: str = Field(default="00:00")  # 24/7 crypto market
+    trading_active_hours_end: str = Field(default="23:59")    # Full day coverage
     use_mock_binance: bool = Field(default=False)
-    regime_filter_mode: str = Field(default="balanced")  # strict, balanced, permissive 
+    regime_filter_mode: str = Field(default="balanced")  # strict, balanced, permissive, day_trading 
     
     # CORS - accepts both string and list
     cors_origins: Union[str, List[str]] = Field(

@@ -5,7 +5,7 @@
 
 ## 🎯 System Overview
 
-An automated cryptocurrency scalping bot that uses AI (Google Gemini) to analyze market data and execute trades on Binance. The system follows a conservative 1% risk-per-trade strategy with built-in safety mechanisms.
+An automated cryptocurrency **day trading bot** that uses AI (Google Gemini) to analyze market data and execute trades on Binance. The system follows a conservative **1% risk-per-trade strategy** with adaptive risk-reward based on support/resistance levels and multi-timeframe analysis.
 
 **Tech Stack:** FastAPI + SQLAlchemy + PostgreSQL + Binance API + Google Gemini AI + WebSockets
 
@@ -25,7 +25,7 @@ An automated cryptocurrency scalping bot that uses AI (Google Gemini) to analyze
    └── User now joins the trading loop
 
 3. Main Trading Loop (app/services/trading_bot.py)
-   ├── Method: trading_loop() - Runs every 60 seconds
+   ├── Method: trading_loop() - Runs every 5 minutes (day trading cadence)
    ├── Method: _get_active_trading_configs() - Gets users with is_active=True
    └── For each active user:
        │
@@ -36,22 +36,27 @@ An automated cryptocurrency scalping bot that uses AI (Google Gemini) to analyze
        │
        ├─→ 5. Rate Limiting
        │   ├── Method: _remaining_rate_limit()
-       │   ├── Check: Was user analyzed <30 seconds ago?
+       │   ├── Check: Was user analyzed <5 minutes ago?
        │   └── YES → Skip to next user | NO → Continue
        │
-       ├─→ 6. Market Data Fetch (app/services/binance_service.py)
-       │   ├── Method: get_kline_data()
-       │   └── Fetches 100 1-minute candlesticks from Binance
+       ├─→ 6. Multi-Timeframe Market Data Fetch (app/services/binance_service.py)
+       │   ├── Method: _fetch_market_snapshot()
+       │   ├── Fetches 3 timeframes for comprehensive analysis:
+       │   │   • 15-minute (100 candles) - Primary entry signals
+       │   │   • 1-hour (168 candles) - Trend context
+       │   │   • 5-minute (288 candles) - Entry timing precision
+       │   └── Returns DataFrames for each timeframe
        │
-       ├─→ 7. Historical Context Fetch (NEW - Phase 1)
-       │   ├── File: app/services/ai_analyzer.py
-       │   ├── Method: get_user_trade_history_context()
-       │   └── Queries last 15 closed trades for performance metrics
+       ├─→ 7. Market Regime Analysis (app/services/market_regime_analyzer.py)
+       │   ├── Method: classify_market_regime()
+       │   ├── Analyzes: Trend strength (ADX), Volatility (ATR), Price action
+       │   └── Returns: Regime classification + trading permission
        │
-       ├─→ 8. AI Analysis (app/services/ai_analyzer.py)
-       │   ├── Method: analyze_market_data()
-       │   ├── Method: calculate_technical_indicators() - RSI, MACD, Bollinger Bands
-       │   ├── Method: _generate_prompt() - Includes market data + user history
+       ├─→ 8. Multi-Timeframe AI Analysis (app/services/ai_analyzer.py)
+       │   ├── Method: analyze_market_data_mtf() - Multi-timeframe analysis
+       │   ├── Method: calculate_technical_indicators() - RSI, MACD, ADX, ATR, Bollinger Bands
+       │   ├── Method: _calculate_mtf_confluence() - Scores timeframe alignment (0-100)
+       │   ├── Method: _generate_mtf_prompt() - Includes all timeframes + user history
        │   ├── Sends to Gemini AI (gemini-2.5-flash model)
        │   └── Returns: {"signal": "buy/sell/hold", "confidence": 0-100, "entry_price", "stop_loss", "take_profit"}
        │
@@ -63,24 +68,29 @@ An automated cryptocurrency scalping bot that uses AI (Google Gemini) to analyze
        │   ├── Method: get_account_balance()
        │   └── Gets USDT available balance
        │
-       ├─→ 11. Risk Validation (app/services/risk_manager.py)
+       ├─→ 11. Risk Validation & Adaptive R:R (app/services/risk_manager.py)
        │   ├── Method: validate_trade_signal()
+       │   ├── Method: detect_support_resistance_levels() - Identifies S/R zones
+       │   ├── Method: calculate_adaptive_risk_reward() - Dynamic SL/TP placement
        │   ├── Checks:
        │   │   • User has no open positions (1 trade at a time rule)
-       │   │   • Daily trade limit not exceeded
-       │   │   • AI confidence ≥ 60%
+       │   │   • Daily trade limit not exceeded (max 5/day)
+       │   │   • AI confidence ≥ 75% (day trading quality bar)
        │   │   • Sufficient account balance (≥$10 USDT)
-       │   │   • Position size valid
-       │   │   • Trade value ≥$5 and ≤10% of balance
+       │   │   • Position size follows 1% rule
+       │   │   • Risk-reward ratio ≥ 1:1.5 (minimum acceptable)
+       │   │   • Trade value ≥$10 and ≤3% of balance
        │   └── PASS → Continue | FAIL → Reject + WebSocket notification
        │
        ├─→ 12. Trade Execution (app/services/trading_bot.py)
        │   ├── Method: _execute_trade()
-       │   ├── Step 1: Place order on Binance
+       │   ├── Step 1: Place order on Binance with Adaptive Exits
        │   │   ├── File: app/services/binance_service.py
        │   │   ├── Method: place_order_with_oco()
        │   │   ├── Creates market entry order (BUY/SELL)
-       │   │   ├── Places OCO exit order (Take Profit + Stop Loss)
+       │   │   ├── Places OCO exit order with S/R-based levels:
+       │   │   │   • Take Profit: Nearest resistance + ATR buffer (1:1.5 to 1:3 R:R)
+       │   │   │   • Stop Loss: Nearest support - ATR buffer (0.8-2.5% range)
        │   │   └── OCO executes automatically on Binance servers
        │   ├── Step 2: Create Trade record (app/models/trade.py)
        │   │   └── Fields: symbol, side, amount, price, status='filled', ai_signal_confidence
@@ -90,7 +100,7 @@ An automated cryptocurrency scalping bot that uses AI (Google Gemini) to analyze
        │   │   └── Method: risk_manager.add_open_position()
        │   └── Step 5: Send WebSocket notification to user
        │
-       └─→ 13. Wait 60 seconds → Loop back to Step 3
+       └─→ 13. Wait 5 minutes → Loop back to Step 3
 ```
 
 ---
@@ -106,9 +116,10 @@ Every trade uses OCO orders for automatic risk management:
    - Executes immediately at current price
    - File: `binance_service.py`, Method: `place_order_with_oco()`
    
-2. **Exit Orders** (OCO - placed simultaneously)
-   - **Take Profit**: Limit order at +0.3% from entry
-   - **Stop Loss**: Stop-limit order at -0.5% from entry
+2. **Exit Orders** (OCO - placed simultaneously with adaptive levels)
+   - **Take Profit**: Limit order at nearest resistance + ATR buffer (1.5-5.0% range, 1:1.5-1:3 R:R)
+   - **Stop Loss**: Stop-limit order at nearest support - ATR buffer (0.8-2.5% range)
+   - **Adaptive**: Levels calculated based on actual market structure, not fixed percentages
    - **Automatic**: When one fills, the other cancels (handled by Binance)
 
 **Tracking Lifecycle:**
@@ -135,9 +146,10 @@ closed_at = <timestamp>
 **File:** `app/services/trading_bot.py`
 
 **Method:** `_check_oco_orders()`
-- Runs every 60 seconds
+- Runs every 5 minutes (aligned with trading cycle)
 - Checks status of all open OCO orders via Binance API
 - Method: `binance_service.get_oco_order_status()`
+- Enforces 8-hour maximum hold time (day trading timeout)
 - When OCO status = 'ALL_DONE':
   - Extracts which leg filled (TP or SL)
   - Updates Trade record with exit details
@@ -165,12 +177,12 @@ closed_at = <timestamp>
    - Max: 10% of balance per trade
 
 3. **Daily Trade Limits**
-   - Default: 10 trades per day per user
+   - Default: 5 trades per day per user (quality over quantity)
    - Tracked in-memory: `daily_trade_count[user_id]`
    - Method: `reset_daily_counters()` - Clears at midnight UTC
 
 4. **Confidence Filter**
-   - Minimum 60% AI confidence required
+   - Minimum 75% AI confidence required (higher bar for day trading)
    - Constant: `MIN_SIGNAL_CONFIDENCE` in `service_constants.py`
 
 5. **Balance Requirements**
@@ -186,8 +198,9 @@ closed_at = <timestamp>
 
 **File:** `app/services/trading_bot.py`
 
-**Timeout Threshold:** 30 minutes (1800 seconds)
-- Constant: `POSITION_TIMEOUT_MINUTES = 30`
+**Timeout Threshold:** 8 hours (480 minutes) - Day trading maximum hold
+- Constant: `POSITION_TIMEOUT_MINUTES = 480`
+- Prevents overnight exposure while allowing intraday moves to develop
 
 **What Happens:**
 
@@ -223,57 +236,90 @@ For each open position:
 ## 🕐 Trading Hours & Intervals
 
 ### **Operating Hours**
-- **Active:** 8:00 AM - 4:00 PM GMT
+- **Active:** 24/7 (00:00 - 23:59 GMT) - Crypto markets never close
 - **Configuration:** `app/config.py` → `trading_active_hours_start` / `trading_active_hours_end`
 - **Method:** `trading_bot._is_trading_hours()` - Checks before every cycle
 
-**Outside Trading Hours:**
-- ✅ Bot keeps running (doesn't stop)
-- ❌ No market analysis performed
-- ❌ No new trades executed
-- ✅ Open positions continue to be monitored
-- ✅ OCO orders still active on Binance
+**Day Trading Philosophy:**
+- ✅ Continuous monitoring across all market sessions
+- ✅ Captures opportunities in any timezone
+- ✅ Open positions monitored round-the-clock
+- ✅ 8-hour max hold prevents overnight exposure
+- ✅ OCO orders always active on Binance
 
 ### **Timing Intervals**
 
 | Action | Interval | File/Method |
 |--------|----------|-------------|
-| Main Trading Loop | **60 seconds** | `trading_bot.py` → `trading_loop()` |
-| OCO Order Check | **60 seconds** | `trading_bot.py` → `_check_oco_orders()` |
-| User Rate Limit | **30 seconds** | `trading_bot.py` → `_remaining_rate_limit()` |
-| Position Timeout | **30 minutes** | `trading_bot.py` → `_check_oco_orders()` |
+| Main Trading Loop | **5 minutes** | `trading_bot.py` → `trading_loop()` |
+| OCO Order Check | **5 minutes** | `trading_bot.py` → `_check_oco_orders()` |
+| User Rate Limit | **5 minutes** | `trading_bot.py` → `_remaining_rate_limit()` |
+| Position Timeout | **8 hours** | `trading_bot.py` → `_handle_oco_executing()` |
 | Daily Counter Reset | **Midnight UTC** | `trading_bot.py` → `daily_reset_task()` |
 
 ---
 
-## 🧠 AI Decision Making (Phase 1 Enhanced)
+## 🧠 Multi-Timeframe AI Decision Making
 
 **File:** `app/services/ai_analyzer.py`
 
-### **Historical Context Integration**
+### **Multi-Timeframe Analysis**
 
-**Method:** `get_user_trade_history_context(db, user_id)`
-- Queries last 15 closed trades from `trades` table
-- Calculates:
-  - Win rate (% profitable trades)
-  - Average P&L per trade
-  - Stop-loss hit rate
-  - Take-profit hit rate
-  - Recent trend (winning/losing/mixed based on last 5 trades)
+**Method:** `analyze_market_data_mtf(symbol, mtf_data, user_trade_history, regime_analysis)`
+- Analyzes 3 timeframes simultaneously:
+  - **15-minute:** Primary entry signals and trade setup
+  - **1-hour:** Overall trend direction and momentum
+  - **5-minute:** Precise entry timing
+- Calculates timeframe confluence score (0-100)
+- Higher confluence = stronger, more reliable signals
 
-### **AI Prompt Enhancement**
+### **Support/Resistance Detection**
 
-**Method:** `_generate_prompt(latest, market_summary, user_trade_history)`
+**Method:** `risk_manager.detect_support_resistance_levels(df, current_price)`
+- Identifies key price levels using:
+  - Pivot points (swing highs/lows)
+  - Price clustering analysis
+  - Touch counting (validation of levels)
+- Used for adaptive stop-loss and take-profit placement
+
+### **Adaptive Risk-Reward Calculation**
+
+**Method:** `risk_manager.calculate_adaptive_risk_reward(side, entry_price, sr_levels, atr)`
+- Places stops at support levels (buys) or resistance levels (sells)
+- Adds ATR-based buffer for volatility protection
+- Targets 1:1.5 minimum, 1:2 preferred, up to 1:3 R:R
+- Dynamically adjusts based on actual market structure
+
+### **Day Trading Focus: Current Market Only**
+
+**Historical Data: DISABLED**
+- Day trading requires focus on **current market conditions**, not past performance
+- Historical data can create psychological bias and hesitation
+- Each trade is evaluated purely on technical setup quality
+- Removes emotional baggage from previous wins/losses
+
+**Why This Matters:**
+- Prevents "revenge trading" after losses
+- Prevents overconfidence after wins
+- Ensures objective analysis of each setup
+- AI focuses on market structure, not user psychology
+
+### **Day Trading AI Prompt**
+
+**Method:** `_generate_mtf_prompt(primary_latest, mtf_summary, user_history, regime_analysis)`
 
 **Includes:**
-1. Market data (price, RSI, MACD, Bollinger Bands, volume)
-2. **NEW:** User's historical performance summary
-3. **NEW:** Critical instructions based on performance:
-   - Low win rate (<40%) → Be very conservative, confidence >85% required
-   - Losing streak → Reduce confidence by 15-20 points
-   - High stop-loss rate (>60%) → Extra caution
+1. Multi-timeframe market data (15m/1h/5m)
+2. Technical indicators (RSI, MACD, ADX, ATR, Bollinger Bands, Stochastic, OBV)
+3. Timeframe confluence score
+4. Market regime classification (trending/ranging/volatile)
+5. Day trading specific instructions:
+   - Favor trending markets with ADX > 25
+   - Accept range-bound trades if confluence is high
+   - Respect 1:1.5 minimum risk-reward
+   - Quality over quantity (1-5 trades/day target)
 
-**Result:** Personalized AI decisions that adapt to each user's trading success
+**Result:** Pure technical analysis focused on current market structure and multi-timeframe alignment, free from historical performance bias
 
 ---
 
@@ -409,12 +455,16 @@ FROM portfolio WHERE user_id = 1;
 - **Mock Pattern:** `MockBinanceService` vs `BinanceService` for testing
 - **Async/Await:** All database operations use SQLAlchemy AsyncSession
 
-**Safety Features:**
+**Day Trading Safety Features:**
 - Default testnet mode (`BINANCE_TESTNET=true`)
-- Single-trade-at-a-time constraint (Phase 1 implementation)
-- Position timeout auto-close (30 minutes)
-- Conservative risk management (1% account risk)
-- Historical performance-aware AI (Phase 1 - reduces risk for losing users)
+- Single-trade-at-a-time constraint
+- 8-hour position timeout (prevents overnight exposure)
+- 1% rule position sizing (risk-based, not capital-based)
+- Adaptive stop-loss placement (support/resistance + ATR buffer)
+- Minimum 1:1.5 risk-reward ratio enforcement
+- Multi-timeframe confluence validation
+- Pure technical analysis (no historical performance bias)
+- Quality-focused trade selection (1-5 trades/day, not 10+)
 
 **Real-Time Communication:**
 - WebSocket per user (`/ws/{user_id}`)
@@ -425,9 +475,9 @@ FROM portfolio WHERE user_id = 1;
 
 ## 📚 Further Reading
 
+- `DAY_TRADING_COMPLETE_TRANSFORMATION.md` - **Complete transformation from scalping to day trading**
 - `HISTORICAL_DATA_STRATEGY.md` - Original AI improvement plan
 - `AI_IMPROVEMENT_STRATEGY.md` - Re-evaluated Phase 1 & 2 strategies
-- `PHASE1_IMPLEMENTATION.md` - Detailed Phase 1 implementation notes
 - `IMPLEMENTATION_SUMMARY.md` - Complete system analysis and changes
 - `BUGFIX_GET_LATEST_PRICE.md` - Recent bug fix documentation
 

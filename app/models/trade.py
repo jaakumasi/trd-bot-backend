@@ -27,7 +27,7 @@ class Trade(Base):
     closed_at = Column(DateTime(timezone=True))
     exit_price = Column(DECIMAL(20, 8))
     exit_fee = Column(DECIMAL(20, 8), default=0)
-    exit_reason = Column(String(50))  # 'TAKE_PROFIT', 'STOP_LOSS', 'MANUAL', 'TIMEOUT', 'QUICK_PROFIT', 'BREAKEVEN_TIMEOUT', 'TIME_STOP_LOSS'
+    exit_reason = Column(String(50))  # 'TAKE_PROFIT', 'STOP_LOSS', 'MANUAL', 'TIMEOUT'
     
     # P&L tracking fields
     profit_loss = Column(DECIMAL(20, 8))  # Net P&L after all fees
@@ -42,14 +42,14 @@ class TradingConfig(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    strategy_name = Column(String(50), nullable=False, default='scalping')
-    risk_percentage = Column(DECIMAL(5, 2), default=1.0)
+    strategy_name = Column(String(50), nullable=False, default='day_trading')
+    risk_percentage = Column(DECIMAL(5, 2), default=1.0)  # 1% rule for day trading
     trading_pair = Column(String(20), default='BTCUSDT')
     is_active = Column(Boolean, default=False)
     is_test_mode = Column(Boolean, default=True)
-    max_daily_trades = Column(Integer, default=10)
-    stop_loss_percentage = Column(DECIMAL(5, 2), default=0.5)
-    take_profit_percentage = Column(DECIMAL(5, 2), default=0.3)
+    max_daily_trades = Column(Integer, default=5)  # Quality over quantity
+    stop_loss_percentage = Column(DECIMAL(5, 2), default=1.5)  # Day trading range
+    take_profit_percentage = Column(DECIMAL(5, 2), default=3.0)  # 1:2 R:R baseline
     updated_at = Column(DateTime(timezone=True), server_default=func.now())
     
     # Relationships
