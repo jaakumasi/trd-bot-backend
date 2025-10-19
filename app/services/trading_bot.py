@@ -824,7 +824,7 @@ class TradingBot:
                 f"⚠️  [User {user_id}] Could not determine exit details from OCO status for {position.oco_order_id}"
             )
             # Fallback: try to extract from individual order details
-            exit_reason, exit_price = await self._fallback_extract_exit_details(position, oco_status)
+            exit_reason, exit_price = self._fallback_extract_exit_details(position, oco_status)
             
             if not exit_reason or not exit_price:
                 logger.error(
