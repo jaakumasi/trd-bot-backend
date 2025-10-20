@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     trading_active_hours_start: str = Field(default="00:00")  # 24/7 crypto market
     trading_active_hours_end: str = Field(default="23:59")    # Full day coverage
     use_mock_binance: bool = Field(default=False)
-    regime_filter_mode: str = Field(default="balanced")  # strict, balanced, permissive, day_trading 
+    regime_filter_mode: str = Field(default="day_trading")  # day_trading mode for aggressive intraday 
     
     # CORS - accepts both string and list
     cors_origins: Union[str, List[str]] = Field(

@@ -327,10 +327,10 @@ class TradingBot:
                 primary_data, symbol
             )
 
-            # Check if trading is allowed in current regime
-            if not regime_analysis.get("allow_trading", False):
+            trading_quality = regime_analysis.get("trading_quality_score", 0)
+            if trading_quality < 50:
                 logger.info(
-                    f"🚫 [User {user_id}] Trading blocked - Regime: {regime_analysis.get('regime')} | "
+                    f"🚫 [User {user_id}] Low trading quality: {trading_quality}/100 - Regime: {regime_analysis.get('regime')} | "
                     f"ADX: {regime_analysis.get('trend_strength', 0):.1f} | "
                     f"ATR%: {regime_analysis.get('atr_percentage', 0):.2f}%"
                 )
@@ -1061,6 +1061,162 @@ class TradingBot:
             exit_reason,
             actual_usdt_balance,
         )
+
+    def _extract_oco_exit_details(self, oco_status: Dict) -> tuple:
+        """
+        Extract exit reason and exit price from OCO status response.
+        
+        When an OCO order completes (listOrderStatus = "ALL_DONE"), one order will be FILLED 
+        and the other CANCELED. The FILLED order tells us whether TP or SL was hit.
+        
+        Returns:
+            tuple: (exit_reason, exit_price) or (None, None) if extraction fails
+        """
+        try:
+            orders = oco_status.get("orders", [])
+            if not orders:
+                logger.warning("⚠️  OCO status has no orders array")
+                return None, None
+            
+            filled_order = self._find_filled_order(orders)
+            if not filled_order:
+                return None, None
+            
+            exit_reason = self._determine_exit_reason(filled_order)
+            exit_price = self._extract_exit_price(filled_order)
+            
+            if exit_price and exit_price > 0:
+                logger.info(f"✅ OCO exit extracted: {exit_reason} at ${exit_price:.4f}")
+                return exit_reason, exit_price
+            
+            logger.warning(f"⚠️  Invalid exit price: {exit_price}")
+            return None, None
+            
+        except Exception as e:
+            logger.error(f"❌ Error extracting OCO exit details: {e}")
+            return None, None
+
+    @staticmethod
+    def _find_filled_order(orders: list) -> Optional[Dict]:
+        """Find the FILLED order from OCO orders list"""
+        for order in orders:
+            if order.get("status") == "FILLED":
+                return order
+        logger.warning("⚠️  No FILLED order found in OCO status")
+        return None
+
+    @staticmethod
+    def _determine_exit_reason(filled_order: Dict) -> str:
+        """Determine if exit was TAKE_PROFIT or STOP_LOSS based on order type"""
+        order_type = filled_order.get("type", "")
+        
+        if "LIMIT_MAKER" in order_type or (order_type == "LIMIT" and "STOP" not in order_type):
+            return "TAKE_PROFIT"
+        elif "STOP" in order_type:
+            return "STOP_LOSS"
+        else:
+            logger.warning(f"⚠️  Unknown OCO order type: {order_type}")
+            return "OCO_EXIT"
+
+    @staticmethod
+    def _extract_exit_price(filled_order: Dict) -> Optional[float]:
+        """Extract execution price from filled order, with fallback calculation"""
+        exit_price = float(filled_order.get("price", 0))
+        
+        if exit_price > 0:
+            return exit_price
+        
+        # Fallback: calculate from cummulativeQuoteQty / executedQty
+        executed_qty = float(filled_order.get("executedQty", 0))
+        cumulative_quote = float(filled_order.get("cummulativeQuoteQty", 0))
+        
+        if executed_qty > 0 and cumulative_quote > 0:
+            calculated_price = cumulative_quote / executed_qty
+            logger.debug(f"💡 Calculated exit price from quote/qty: ${calculated_price:.4f}")
+            return calculated_price
+        
+        return None
+
+    def _fallback_extract_exit_details(
+        self, position: OpenPosition, oco_status: Dict
+    ) -> tuple:
+        """
+        Fallback method to extract exit details when primary extraction fails.
+        
+        Attempts two strategies:
+        1. Check individual order details in OCO status for executedQty > 0
+        2. Infer from position's TP/SL prices and current market price
+        
+        Returns:
+            tuple: (exit_reason, exit_price) or (None, None) if all strategies fail
+        """
+        try:
+            logger.info(f"🔍 Attempting fallback exit detail extraction for {position.symbol}")
+            
+            # Strategy 1: Find executed order in OCO status
+            orders = oco_status.get("orders", [])
+            result = self._extract_from_executed_order(orders)
+            if result != (None, None):
+                return result
+            
+            # Strategy 2: Infer from position TP/SL and current market price
+            return self._infer_from_market_price(position)
+            
+        except Exception as e:
+            logger.error(f"❌ Fallback exit detail extraction failed: {e}")
+            return None, None
+
+    @staticmethod
+    def _extract_from_executed_order(orders: list) -> tuple:
+        """Extract exit details from orders with executedQty > 0"""
+        for order in orders:
+            executed_qty = float(order.get("executedQty", 0))
+            if executed_qty <= 0:
+                continue
+            
+            # Found an executed order
+            order_type = order.get("type", "")
+            exit_reason = "STOP_LOSS" if "STOP" in order_type else "TAKE_PROFIT"
+            
+            # Get price from stopPrice or price field
+            exit_price = float(order.get("stopPrice" if "STOP" in order_type else "price", 0))
+            
+            # Calculate average price if available
+            cumulative_quote = float(order.get("cummulativeQuoteQty", 0))
+            if executed_qty > 0 and cumulative_quote > 0:
+                exit_price = cumulative_quote / executed_qty
+            
+            if exit_price > 0:
+                logger.info(f"✅ Fallback Strategy 1: {exit_reason} at ${exit_price:.4f}")
+                return exit_reason, exit_price
+        
+        return None, None
+
+    def _infer_from_market_price(self, position: OpenPosition) -> tuple:
+        """Infer exit reason/price from position TP/SL and current market price"""
+        symbol = position.symbol
+        current_price = self.binance.get_symbol_price(symbol)
+        tp_price = float(position.take_profit_price)
+        sl_price = float(position.stop_loss_price)
+        
+        # Calculate distances from current price
+        tp_distance = abs(current_price - tp_price)
+        sl_distance = abs(current_price - sl_price)
+        
+        # Whichever is closer to current price likely executed
+        if tp_distance < sl_distance:
+            exit_reason = "TAKE_PROFIT"
+            exit_price = tp_price
+        else:
+            exit_reason = "STOP_LOSS"
+            exit_price = sl_price
+        
+        logger.info(
+            f"✅ Fallback Strategy 2: Inferred {exit_reason} at ${exit_price:.4f} "
+            f"(current: ${current_price:.4f})"
+        )
+        
+        return exit_reason, exit_price
 
     async def _handle_oco_executing(
         self, db: AsyncSession, position: OpenPosition

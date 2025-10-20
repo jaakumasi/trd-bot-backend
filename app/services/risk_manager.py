@@ -12,6 +12,7 @@ from .service_constants import (
     MIN_ACCOUNT_BALANCE,
     MIN_SIGNAL_CONFIDENCE,
     MIN_TRADE_VALUE,
+    get_randomized_threshold,
 )
 
 logger = logging.getLogger(__name__)
@@ -169,6 +170,83 @@ class RiskManager:
             )
             return 0.0
 
+    def get_adaptive_confidence_threshold(
+        self, user_trade_history: Optional[Dict] = None
+    ) -> float:
+        """
+        Calculate adaptive confidence threshold to reduce overfitting.
+        
+        Cap maximum threshold to prevent over-conservatism.
+        
+        Adjusts MIN_SIGNAL_CONFIDENCE based on recent win rate:
+        - High win rate (>60%) -> Lower threshold (more aggressive)
+        - Normal win rate (40-60%) -> Standard threshold
+        - Low win rate (<40%) -> Slightly higher threshold
+        
+        Also adds randomization to prevent point-estimate overfitting.
+        
+        Args:
+            user_trade_history: Optional dictionary with 'win_rate' and 'recent_trend'
+        
+        Returns:
+            Adaptive confidence threshold (50-70 range, capped)
+        """
+        base_threshold = MIN_SIGNAL_CONFIDENCE
+        
+        # If no history, use randomized base threshold
+        if not user_trade_history:
+            randomized = get_randomized_threshold(base_threshold, variance_pct=0.10)
+            # Cap at 70% maximum
+            capped = min(randomized, 70.0)
+            logger.info(
+                f"🎲 No trade history - using randomized threshold: {capped:.1f} "
+                f"(base: {base_threshold}, capped at 70%)"
+            )
+            return capped
+        
+        win_rate = user_trade_history.get('win_rate', 50.0)
+        recent_trend = user_trade_history.get('recent_trend', 'neutral')
+        
+        # Adaptive adjustment based on performance (but capped at 70%)
+        if win_rate > 60 and recent_trend == 'winning':
+            # System is hot - be more aggressive
+            adjusted = base_threshold - 10
+            logger.info(
+                f"📈 High performance detected (WR: {win_rate:.1f}%, trend: {recent_trend}) "
+                f"- reducing threshold to {adjusted}"
+            )
+        elif win_rate < 40 or recent_trend == 'losing':
+            # System struggling - require higher confidence (but cap at 70%)
+            adjusted = min(base_threshold + 5, 70.0)
+            logger.info(
+                f"📉 Low performance detected (WR: {win_rate:.1f}%, trend: {recent_trend}) "
+                f"- increasing threshold to {adjusted} (capped at 70%)"
+            )
+        else:
+            # Normal performance - use base with slight randomization
+            adjusted = base_threshold
+            logger.info(
+                f"➡️ Normal performance (WR: {win_rate:.1f}%) - using base threshold {adjusted}"
+            )
+        
+        # Add randomization to prevent overfitting to exact values
+        final_threshold = get_randomized_threshold(adjusted, variance_pct=0.08)
+        
+        # Cap at 70% maximum to prevent killing good trades
+        final_threshold = min(final_threshold, 70.0)
+        
+        # Clamp to reasonable range (50-70%)
+        final_threshold = max(50, min(70, final_threshold))
+        
+        logger.info(f"✅ Final adaptive threshold: {final_threshold:.1f}% (capped at 70%)")
+        
+        logger.info(
+            f"✅ Adaptive confidence threshold: {final_threshold:.1f} "
+            f"(adjusted: {adjusted}, randomized with ±8%)"
+        )
+        
+        return final_threshold
+
     def validate_trade_signal(
         self,
         user_id: int,
@@ -176,6 +254,7 @@ class RiskManager:
         account_balance: float,
         config: Dict,
         market_df=None,
+        user_trade_history: Optional[Dict] = None,
     ) -> Tuple[bool, str, Dict]:
         """
         Validate if a trade signal meets risk management criteria.
@@ -187,6 +266,7 @@ class RiskManager:
             account_balance: Current account balance
             config: Trading configuration
             market_df: Optional DataFrame for S/R detection and adaptive R:R
+            user_trade_history: Optional user trading history for adaptive thresholds
         """
         try:
             self._assert_trading_active(config)
@@ -197,8 +277,11 @@ class RiskManager:
             today_count = self.daily_trade_count.get(user_id, 0)
             self._assert_daily_limit(user_id, today_count, config)
 
+            # Calculate adaptive confidence threshold (anti-overfitting)
+            adaptive_threshold = self.get_adaptive_confidence_threshold(user_trade_history)
+            
             confidence = self._extract_confidence(signal)
-            self._assert_confidence(confidence)
+            self._assert_confidence(confidence, adaptive_threshold)
 
             balance = self._to_float(account_balance)
             self._assert_sufficient_balance(balance)
@@ -639,9 +722,19 @@ class RiskManager:
             raise RiskValidationError("Calculated position size is zero")
 
     @staticmethod
-    def _assert_confidence(confidence: float) -> None:
-        if confidence < MIN_SIGNAL_CONFIDENCE:
-            raise RiskValidationError(f"Signal confidence too low: {confidence}%")
+    def _assert_confidence(confidence: float, adaptive_threshold: Optional[float] = None) -> None:
+        """
+        Validate confidence meets threshold.
+        
+        Args:
+            confidence: Signal confidence value
+            adaptive_threshold: Optional adaptive threshold (if None, uses MIN_SIGNAL_CONFIDENCE)
+        """
+        threshold = adaptive_threshold if adaptive_threshold is not None else MIN_SIGNAL_CONFIDENCE
+        if confidence < threshold:
+            raise RiskValidationError(
+                f"Signal confidence too low: {confidence:.1f}% < {threshold:.1f}%"
+            )
 
     @staticmethod
     def _assert_sufficient_balance(balance: float) -> None:
@@ -867,6 +960,10 @@ class RiskManager:
         - Support/resistance levels
         - Market volatility (ATR)
         - Side of trade (buy/sell)
+        
+        CRITICAL: Enforces minimum distance thresholds to prevent unrealistic tight levels
+        - Minimum SL distance: 0.8% from entry (prevents whipsaw)
+        - Minimum TP distance: 1.2% from entry (realistic profit target)
 
         Returns dict with stop_loss, take_profit, and actual risk_reward_ratio
         """
@@ -876,6 +973,9 @@ class RiskManager:
             MAX_RISK_REWARD_RATIO,
         )
 
+        # ANTI-OVERFITTING: Minimum percentage thresholds for realistic trading
+        MIN_STOP_LOSS_PCT = 0.008  # 0.8% minimum SL distance (prevents tight stops)
+        MIN_TAKE_PROFIT_PCT = 0.012  # 1.2% minimum TP distance (realistic profit)
         try:
             side = side.lower()
 
@@ -905,7 +1005,33 @@ class RiskManager:
 
             if risk == 0:
                 logger.warning("⚠️ Risk is zero, using default levels")
-                return self._default_exit_levels(side, entry_price, atr)
+                return self._default_exit_levels(side, entry_price)
+
+            # CRITICAL: Enforce minimum distances to prevent unrealistic tight levels
+            min_sl_distance = entry_price * MIN_STOP_LOSS_PCT  # 0.8% minimum
+            min_tp_distance = entry_price * MIN_TAKE_PROFIT_PCT  # 1.2% minimum
+            
+            if risk < min_sl_distance:
+                logger.warning(
+                    f"⚠️ Stop loss too tight ({(risk/entry_price*100):.2f}%). "
+                    f"Widening to minimum {MIN_STOP_LOSS_PCT*100:.1f}%"
+                )
+                if side == "buy":
+                    stop_loss = entry_price - min_sl_distance
+                else:
+                    stop_loss = entry_price + min_sl_distance
+                risk = min_sl_distance
+            
+            if reward < min_tp_distance:
+                logger.warning(
+                    f"⚠️ Take profit too tight ({(reward/entry_price*100):.2f}%). "
+                    f"Widening to minimum {MIN_TAKE_PROFIT_PCT*100:.1f}%"
+                )
+                if side == "buy":
+                    take_profit = entry_price + min_tp_distance
+                else:
+                    take_profit = entry_price - min_tp_distance
+                reward = min_tp_distance
 
             risk_reward_ratio = reward / risk
 
@@ -957,23 +1083,34 @@ class RiskManager:
 
         except Exception as e:
             logger.error(f"❌ Error calculating adaptive R:R: {e}")
-            return self._default_exit_levels(side, entry_price, atr)
+            return self._default_exit_levels(side, entry_price)
 
-    def _default_exit_levels(self, side: str, entry_price: float, atr: float) -> Dict:
-        """Default exit levels when adaptive calculation fails."""
+    def _default_exit_levels(self, side: str, entry_price: float) -> Dict:
+        """
+        Default exit levels when adaptive calculation fails.
+        Uses wider, more realistic percentage-based levels.
+        """
+        # Use percentage-based levels for more predictable results
+        # These are realistic for Bitcoin day trading
+        stop_loss_pct = 0.012  # 1.2% stop loss (realistic for BTC volatility)
+        take_profit_pct = 0.024  # 2.4% take profit (1:2 R:R, achievable intraday)
+        
         if side == "buy":
-            stop_loss = entry_price - (atr * 1.5)
-            take_profit = entry_price + (atr * 3.0)
+            stop_loss = entry_price * (1 - stop_loss_pct)
+            take_profit = entry_price * (1 + take_profit_pct)
         else:
-            stop_loss = entry_price + (atr * 1.5)
-            take_profit = entry_price - (atr * 3.0)
+            stop_loss = entry_price * (1 + stop_loss_pct)
+            take_profit = entry_price * (1 - take_profit_pct)
+
+        risk = abs(entry_price - stop_loss)
+        reward = abs(take_profit - entry_price)
 
         return {
             "stop_loss": stop_loss,
             "take_profit": take_profit,
             "risk_reward_ratio": 2.0,
-            "risk_amount": atr * 1.5,
-            "reward_amount": atr * 3.0,
-            "risk_percentage": 1.5,
-            "reward_percentage": 3.0,
+            "risk_amount": risk,
+            "reward_amount": reward,
+            "risk_percentage": stop_loss_pct * 100,
+            "reward_percentage": take_profit_pct * 100,
         }

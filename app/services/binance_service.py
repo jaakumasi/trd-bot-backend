@@ -22,11 +22,13 @@ class BinanceService:
             api_secret=settings.binance_secret_key,
             testnet=settings.binance_testnet,
         )
-        # Increase recvWindow to allow for more clock variance (default is 5000ms, we use 10000ms)
-        self.client.RECV_WINDOW = 10000
+        # Increase recvWindow to allow for more clock variance (default is 5000ms, we use 60000ms)
+        # Larger window helps with timestamp issues on systems with poor time sync
+        self.client.RECV_WINDOW = 60_000
         self.is_connected = False
         self.symbol_info_cache = {}  # Cache for symbol trading rules
         self.timestamp_offset = 0  # Will be set during time synchronization
+        self.last_time_sync = 0  # Track when we last synced time
 
     def get_symbol_info(self, symbol: str) -> Optional[Dict]:
         """Get trading rules and filters for a symbol"""
@@ -216,6 +218,9 @@ class BinanceService:
             # Subtract a small buffer (1000ms) to ensure we're always slightly behind server time
             self.client.timestamp_offset = self.timestamp_offset - 1000
 
+            # Update last sync time
+            self.last_time_sync = time.time()
+
             logger.info(
                 f"⏱️  Time synchronized - Offset: {self.timestamp_offset}ms (applied: {self.client.timestamp_offset}ms)"
             )
@@ -225,6 +230,19 @@ class BinanceService:
             # Set a default conservative offset if sync fails
             self.client.timestamp_offset = -2000  # 2 seconds behind
             logger.info("⏱️  Using default offset: -%s ms", self.client.timestamp_offset)
+
+    def _check_and_resync_time(self) -> None:
+        """
+        Check if time sync is stale and re-synchronize if needed.
+        Called before critical operations to prevent timestamp errors.
+        """
+        current_time = time.time()
+        time_since_last_sync = current_time - self.last_time_sync
+        
+        # Re-sync every 30 minutes (1800 seconds) to prevent clock drift
+        if time_since_last_sync > 1800:
+            logger.info(f"🔄 Time sync is stale ({time_since_last_sync:.0f}s old). Re-synchronizing...")
+            self._synchronize_time()
 
     async def _authenticate_with_retries(self, max_retries: int = 3) -> None:
         for attempt in range(1, max_retries + 1):
@@ -359,6 +377,9 @@ class BinanceService:
         - If SL hits → position closes with loss, TP cancels
         """
         try:
+            # Re-sync time if stale to prevent timestamp errors during order placement
+            self._check_and_resync_time()
+            
             formatted_qty = self.format_quantity(symbol, quantity)
             entry_order = self._place_market_entry(symbol, side, formatted_qty)
 
@@ -470,16 +491,34 @@ class BinanceService:
         - Execution details
         """
         try:
+            # Re-sync time if stale to prevent timestamp errors
+            self._check_and_resync_time()
+            
             result = self.client.v3_get_order_list(orderListId=int(order_list_id))
             return result
 
         except Exception as e:
             logger.error(f"Error getting OCO status for {order_list_id}: {e}")
+            
+            # If timestamp error, force immediate re-sync and retry once
+            if "recvWindow" in str(e) or "Timestamp" in str(e):
+                logger.warning("⚠️  Timestamp error detected. Force re-syncing time and retrying...")
+                self._synchronize_time()
+                try:
+                    result = self.client.v3_get_order_list(orderListId=int(order_list_id))
+                    logger.info("✅ Retry successful after time re-sync")
+                    return result
+                except Exception as retry_error:
+                    logger.error(f"❌ Retry failed: {retry_error}")
+            
             return None
 
     def cancel_oco_order(self, symbol: str, order_list_id: str) -> bool:
         """Cancel an active OCO order on Binance"""
         try:
+            # Re-sync time if stale to prevent timestamp errors
+            self._check_and_resync_time()
+            
             result = self.client._delete(
                 "orderList",
                 True,
@@ -490,4 +529,20 @@ class BinanceService:
 
         except Exception as e:
             logger.error(f"Error cancelling OCO order {order_list_id}: {e}")
+            
+            # If timestamp error, force immediate re-sync and retry once
+            if "recvWindow" in str(e) or "Timestamp" in str(e):
+                logger.warning("⚠️  Timestamp error detected. Force re-syncing time and retrying...")
+                self._synchronize_time()
+                try:
+                    result = self.client._delete(
+                        "orderList",
+                        True,
+                        data={"symbol": symbol, "orderListId": int(order_list_id)},
+                    )
+                    logger.info(f"✅ OCO order cancelled on retry: {order_list_id}")
+                    return True
+                except Exception as retry_error:
+                    logger.error(f"❌ Retry failed: {retry_error}")
+            
             return False

@@ -249,17 +249,20 @@ class AIAnalyzer:
             prev = df_with_indicators.iloc[-2]
             self._latest_data = latest
 
-            # Step 1: Check if we should even analyze (regime filter)
-            if regime_analysis and not regime_analysis.get("allow_trading"):
-                logger.info(
-                    f"🚫 Trading blocked - Market regime: {regime_analysis.get('regime')}"
-                )
-                return self._fallback_analysis(
-                    f"Market regime {regime_analysis.get('regime')} not suitable for day trading. "
-                    f"ADX: {regime_analysis.get('trend_strength', 0):.1f}, "
-                    f"ATR%: {regime_analysis.get('atr_percentage', 0):.2f}%",
-                    float(latest["close"]),
-                )
+            # Step 1: Check trading quality
+            if regime_analysis:
+                trading_quality = regime_analysis.get("trading_quality_score", 0)
+                if trading_quality < 50:
+                    logger.info(
+                        f"🚫 Low trading quality: {trading_quality}/100 - Market regime: {regime_analysis.get('regime')}"
+                    )
+                    return self._fallback_analysis(
+                        f"Trading quality too low ({trading_quality}/100). "
+                        f"Regime: {regime_analysis.get('regime')}, "
+                        f"ADX: {regime_analysis.get('trend_strength', 0):.1f}, "
+                        f"ATR%: {regime_analysis.get('atr_percentage', 0):.2f}%",
+                        float(latest["close"]),
+                    )
 
             # Step 2: Signal Confluence Check (now with dynamic thresholds!)
             confluence_score = self._calculate_signal_confluence(
@@ -363,63 +366,52 @@ class AIAnalyzer:
         self, df: pd.DataFrame, regime_analysis: Optional[Dict]
     ) -> int:
         """
-        Multi-factor signal confluence scoring.
+        Simplified multi-factor signal confluence scoring to reduce overfitting.
 
-        Checks for alignment across multiple indicators:
-        - Trend alignment (price vs SMAs) - 25 points
-        - Momentum confirmation (MACD + RSI) - 25 points
-        - Volume confirmation - 20 points
-        - Volatility regime appropriateness - 30 points
+        Uses only 3 CORE factors:
+        - Trend alignment (price vs SMAs) - 40 points
+        - Momentum confirmation (MACD + RSI) - 30 points  
+        - Regime appropriateness - 30 points
 
+        Volume is integrated into these factors, not scored separately.
+        
         Returns: 0-100 score (>60 required for trade)
         """
         score = 0
         latest = df.iloc[-1]
 
-        # Factor 1: Trend Alignment (25 points)
+        # Factor 1: Trend Alignment (40 points)
         sma_20 = latest.get("sma_20", np.nan)
         sma_50 = latest.get("sma_50", np.nan)
         price = latest.get("close", 0)
 
         if not pd.isna(sma_20) and not pd.isna(sma_50):
             if sma_20 > sma_50 and price > sma_20:  # Bullish alignment
-                score += 25
+                score += 40
             elif sma_20 < sma_50 and price < sma_20:  # Bearish alignment
-                score += 25
+                score += 40
             elif sma_20 > sma_50 and price > sma_50:  # Partial bull
-                score += 15
+                score += 25
             elif sma_20 < sma_50 and price < sma_50:  # Partial bear
-                score += 15
+                score += 25
 
-        # Factor 2: Momentum Confirmation (25 points)
+        # Factor 2: Momentum Confirmation (30 points)
         rsi = latest.get("rsi", 50)
         macd = latest.get("macd", 0)
         macd_signal = latest.get("macd_signal", 0)
 
         if not pd.isna(rsi) and not pd.isna(macd):
-            # RSI in valid range (not extreme)
-            if 30 < rsi < 70:
-                score += 10
-
-            # MACD aligned with trend
-            if macd > macd_signal and rsi > 50:  # Bullish momentum
+            # MACD aligned with trend (primary signal)
+            if macd > macd_signal and rsi > 45:  # Bullish momentum (loosened from RSI>50)
+                score += 30
+            elif macd < macd_signal and rsi < 55:  # Bearish momentum (loosened from RSI<50)
+                score += 30
+            elif macd > macd_signal or rsi > 50:  # Partial bullish
                 score += 15
-            elif macd < macd_signal and rsi < 50:  # Bearish momentum
+            elif macd < macd_signal or rsi < 50:  # Partial bearish
                 score += 15
 
-        # Factor 3: Volume Confirmation (20 points)
-        volume = latest.get("volume", 0)
-        volume_sma = latest.get("volume_sma", 1)
-
-        if not pd.isna(volume_sma) and volume_sma > 0:
-            volume_ratio = volume / volume_sma
-
-            if volume_ratio > 1.2:  # Above-average volume
-                score += 20
-            elif volume_ratio > 1.0:
-                score += 10
-
-        # Factor 4: Regime Appropriateness (30 points + bonuses from advanced metrics)
+        # Factor 3: Regime Appropriateness (30 points)
         if regime_analysis:
             regime = regime_analysis.get("regime")
             trend_strength = regime_analysis.get("trend_strength", 0)
@@ -429,41 +421,24 @@ class AIAnalyzer:
             trading_quality = regime_analysis.get("trading_quality_score")
 
             if trading_quality is not None:
-                # REVOLUTIONARY: Use quality score instead of binary regime check
-                score += int(trading_quality * 0.5)  # 0-50 points based on quality
-
-                # Bonus for high-quality microstructure
-                mean_reversion = regime_analysis.get("mean_reversion_score", 0)
-                if mean_reversion > 70:
-                    score += 15  # Excellent mean reversion setup
+                # Use quality score with adaptive scaling (reduces overfitting)
+                # Quality 0-100 maps to 0-30 points
+                score += int(trading_quality * 0.3)
 
             else:
-                # Legacy scoring (for other modes)
-                if regime in ["BULL_TREND", "BEAR_TREND"] and trend_strength > 25:
+                # Simplified regime scoring (less punitive)
+                if regime in ["BULL_TREND", "BEAR_TREND"]:
                     score += 30
-
-                    # Bonus for optimal volatility range
-                    if 0.1 < atr_percentage < 1.2:
-                        score += 5
-
                 elif regime == "RANGE_BOUND":
-                    # Don't penalize range-bound anymore! Can be great for day trading
-                    score += 10  # Give some credit
-
+                    score += 20  # Range trading can work!
                 elif regime == "HIGH_VOLATILITY":
-                    # Less harsh penalty
-                    if atr_percentage > 2.0:
-                        score -= 15
-                    else:
-                        score -= 5
-
+                    score += 10  # High vol = high opportunity (if managed)
                 elif regime == "LOW_VOLATILITY":
-                    # Less harsh penalty - low vol can work!
-                    score -= 5
+                    score += 15  # Low vol = safer, but slower
 
         final_score = max(0, min(100, score))
 
-        logger.info(f"📊 Signal Confluence Score: {final_score}/100")
+        logger.info(f"📊 Signal Confluence Score: {final_score}/100 (Simplified 3-factor model)")
 
         return final_score
 
@@ -522,6 +497,18 @@ class AIAnalyzer:
             Respect the regime classification. If trading is BLOCKED, only recommend 'hold' unless there's an exceptionally clear setup (confidence >90).
             """
 
+        # Fix #5: Add microstructure signals to regular prompt too
+        microstructure_context = ""
+        if regime_analysis:
+            microstructure_context = f"""
+            ADVANCED MICROSTRUCTURE SIGNALS (Fix #5 Enhancement):
+            - Momentum Persistence: {regime_analysis.get('momentum_persistence', 50):.0f}/100 
+            - Order Flow Imbalance: {regime_analysis.get('order_flow_imbalance', 0):+.0f}/100 
+            - Mean Reversion Score: {regime_analysis.get('mean_reversion_score', 0):.0f}/100 
+            - Trading Quality Score: {regime_analysis.get('trading_quality_score', 0):.0f}/100
+            - Trading Edge: {regime_analysis.get('trading_edge', 'NEUTRAL')}
+            """
+        
         return f"""
             You are an expert cryptocurrency day trading analyst. Analyze this BTC/USDT market data for a 1-minute day trading strategy:
 
@@ -529,6 +516,7 @@ class AIAnalyzer:
             {json.dumps(market_summary, indent=2)}
             
             {regime_context}
+            {microstructure_context}
             Day Trading Strategy Context:
             - Target: 0.3% profit per trade
             - Stop loss: 0.5% maximum loss
@@ -811,15 +799,17 @@ class AIAnalyzer:
 
             self._latest_data = primary_latest
 
-            # Check regime filter
-            if regime_analysis and not regime_analysis.get("allow_trading"):
-                logger.info(
-                    f"🚫 Trading blocked - Market regime: {regime_analysis.get('regime')}"
-                )
-                return self._fallback_analysis(
-                    f"Market regime {regime_analysis.get('regime')} not suitable for trading",
-                    float(primary_latest["close"]),
-                )
+            # Check trading quality (Fix #2 - Quality-based trading for MTF)
+            if regime_analysis:
+                trading_quality = regime_analysis.get("trading_quality_score", 0)
+                if trading_quality < 50:
+                    logger.info(
+                        f"🚫 Low trading quality: {trading_quality}/100 - Market regime: {regime_analysis.get('regime')}"
+                    )
+                    return self._fallback_analysis(
+                        f"Trading quality too low ({trading_quality}/100) for {regime_analysis.get('regime')} regime",
+                        float(primary_latest["close"]),
+                    )
 
             # Multi-timeframe confluence check
             mtf_confluence = self._calculate_mtf_confluence(
@@ -828,9 +818,9 @@ class AIAnalyzer:
 
             # Get dynamic threshold
             dynamic_threshold = (
-                regime_analysis.get("dynamic_confluence_threshold", 75)
+                regime_analysis.get("dynamic_confluence_threshold", 55)
                 if regime_analysis
-                else 75
+                else 55 
             )
 
             if mtf_confluence < dynamic_threshold:
@@ -898,6 +888,9 @@ class AIAnalyzer:
         """
         Calculate multi-timeframe confluence score.
         Checks alignment between 15m, 1h, and 5m timeframes.
+        
+        FIXED: More generous scoring to allow day trading opportunities.
+        Target: 55+ for quality setups (was 75+)
         """
         score = 0
 
@@ -922,11 +915,13 @@ class AIAnalyzer:
                 if primary_trend == context_trend and primary_trend != "neutral":
                     score += 40  # Strong alignment
                 elif primary_trend == context_trend:
-                    score += 20  # Neutral alignment
+                    score += 10  # Neutral alignment (Fix #4 - lowered from 25)
+                elif primary_trend != "neutral" or context_trend != "neutral":
+                    score += 15  # One timeframe has direction 
                 else:
-                    score += 0  # Conflicting trends
+                    score += 10  # Both neutral
             else:
-                score += 20  # No context data, give partial credit
+                score += 25  # No context data, give reasonable credit 
 
             # 2. Momentum confirmation (30 points)
             primary_momentum = self._get_momentum_state(primary_latest)
@@ -934,26 +929,30 @@ class AIAnalyzer:
                 precision_momentum = self._get_momentum_state(precision_latest)
                 if primary_momentum == precision_momentum:
                     score += 30
+                elif primary_momentum != "neutral" or precision_momentum != "neutral":
+                    score += 20  # Partial momentum 
                 else:
-                    score += 15
+                    score += 10  # Both neutral
             else:
-                score += 15
+                score += 20  # No precision data
 
-            # 3. Volume confirmation (30 points)
+            # 3. Volume confirmation (30 points) - More lenient for day trading
             if not pd.isna(primary_latest.get("volume_sma", np.nan)):
                 volume_ratio = primary_latest["volume"] / primary_latest["volume_sma"]
-                if volume_ratio > 1.2:
+                if volume_ratio > 1.1:
                     score += 30  # Strong volume
-                elif volume_ratio > 1.0:
-                    score += 20  # Above-average volume
-                elif volume_ratio > 0.8:
-                    score += 10  # Acceptable volume (day trading doesn't always need high volume)
+                elif volume_ratio > 0.9: 
+                    score += 25  # Above-average volume
+                elif volume_ratio > 0.7:
+                    score += 15  # Acceptable volume
                 else:
-                    score += 5  # Low volume, but not disqualifying
+                    score += 10  # Low volume
             else:
-                score += 10  # No volume data, give minimal credit
+                score += 15  # No volume data
 
-            return min(100, score)
+            final_score = min(100, score)
+            logger.debug(f"📊 MTF Confluence: {final_score}/100 (Target: 55+ for trades)")
+            return final_score
 
         except Exception as e:
             logger.error(f"❌ MTF confluence calculation error: {e}")
@@ -1073,7 +1072,31 @@ TECHNICAL INDICATORS (15m):
 - ATR: {float(primary_latest.get('atr', 0)):.4f}
 
 """
+        # Fix #5: Add microstructure signals to prompt
+        if regime_analysis:
+            prompt += f"""
+ADVANCED MICROSTRUCTURE SIGNALS (Fix #5 Enhancement):
+- Momentum Persistence: {regime_analysis.get('momentum_persistence', 50):.0f}/100 
+  (How long momentum tends to last - high = strong trends)
+- Order Flow Imbalance: {regime_analysis.get('order_flow_imbalance', 0):+.0f}/100 
+  (Buying vs Selling pressure - positive = accumulation, negative = distribution)
+- Mean Reversion Score: {regime_analysis.get('mean_reversion_score', 0):.0f}/100 
+  (Price stretched from mean - high = excellent mean reversion opportunity)
+- Trading Quality Score: {regime_analysis.get('trading_quality_score', 0):.0f}/100
+  (Overall setup quality - must be >50 for trade approval)
+- Trading Edge: {regime_analysis.get('trading_edge', 'NEUTRAL')}
+  (TREND_FOLLOWING, MEAN_REVERSION, BREAKOUT, or NEUTRAL)
+- Optimal Hold Time: {regime_analysis.get('optimal_hold_time', '10-20')} minutes
 
+USE THESE SIGNALS TO REFINE YOUR ANALYSIS:
+- If Order Flow > +40 and Momentum Persistence > 60: Strong trend-following setup
+- If Mean Reversion > 70: Excellent scalping opportunity (price stretched)
+- If Trading Edge = "MEAN_REVERSION": Focus on counter-trend entries
+- If Trading Edge = "TREND_FOLLOWING": Go with the momentum
+- Always respect the Optimal Hold Time for exit planning
+
+"""
+        
         if user_history:
             prompt += f"""
 USER TRADING HISTORY:

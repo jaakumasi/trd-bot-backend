@@ -437,28 +437,31 @@ class AdvancedRegimeAnalyzer:
         """
         Adaptive confluence threshold based on market conditions.
         
+        More aggressive thresholds for day trading (35-60 range instead of 40-70).
         When quality is high, we can accept lower confluence (be more aggressive).
         When volatility is unpredictable, require higher confluence (be cautious).
         
-        Returns: Dynamic threshold (40-70)
+        Returns: Dynamic threshold (35-60)
         """
-        base_threshold = 60.0
+        base_threshold = 50.0
         
         # Adjust down for high-quality setups (can be more aggressive)
         if trading_quality > 80:
-            base_threshold -= 15
+            base_threshold -= 15  # Can go as low as 35
         elif trading_quality > 70:
-            base_threshold -= 10
+            base_threshold -= 10  # Can go as low as 40
         elif trading_quality > 60:
-            base_threshold -= 5
+            base_threshold -= 5   # Can go as low as 45
         
         # Adjust up for unpredictable volatility (need more confirmation)
         if volatility_clustering < 30:
-            base_threshold += 10
+            base_threshold += 10  # Max 60 even in chaotic conditions
         elif volatility_clustering < 50:
-            base_threshold += 5
+            base_threshold += 5   # Max 55
         
-        return max(40, min(70, base_threshold))
+        final_threshold = max(35, min(60, base_threshold))
+        logger.debug(f"🎯 Dynamic confluence threshold: {final_threshold} (quality: {trading_quality:.0f}, vol_cluster: {volatility_clustering:.0f})")
+        return final_threshold
     
     def _determine_trading_edge(
         self, order_flow: float, mean_reversion: float, momentum: float
@@ -601,7 +604,7 @@ class AdvancedRegimeAnalyzer:
             "volatility_clustering": 50,
             "mean_reversion_score": 0,
             "trading_quality_score": 0,
-            "dynamic_confluence_threshold": 60,
+            "dynamic_confluence_threshold": 55,
             "trading_edge": "NEUTRAL",
             "optimal_hold_time": "10-20"
         }

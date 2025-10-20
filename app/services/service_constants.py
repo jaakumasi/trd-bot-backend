@@ -1,6 +1,96 @@
 """Shared configuration values for trading services."""
 
 from __future__ import annotations
+import random
+
+# ============================================================================
+# ANTI-OVERFITTING UTILITIES
+# ============================================================================
+
+def get_randomized_threshold(base_value: float, variance_pct: float = 0.10) -> float:
+    """
+    Add randomization to thresholds to prevent point-estimate overfitting.
+    
+    Args:
+        base_value: The base threshold value
+        variance_pct: Percentage variance (default 10%)
+    
+    Returns:
+        Randomized value within ±variance_pct of base
+    
+    Example:
+        get_randomized_threshold(75, 0.10) -> returns 67.5 to 82.5
+    """
+    lower = base_value * (1 - variance_pct)
+    upper = base_value * (1 + variance_pct)
+    return random.uniform(lower, upper)
+
+
+# ============================================================================
+# ASSET-SPECIFIC PARAMETERS (Prevents Bitcoin-only overfitting)
+# ============================================================================
+
+ASSET_PARAMS = {
+    'BTCUSDT': {
+        'name': 'Bitcoin',
+        'atr_multiplier': 1.5,
+        'min_confidence': 60,
+        'volume_threshold_multiplier': 1.0,
+        'sr_touch_threshold': 0.005,  # 0.5%
+        'optimal_hold_minutes': (15, 30),
+        'description': 'Lower volatility, most liquid'
+    },
+    'ETHUSDT': {
+        'name': 'Ethereum',
+        'atr_multiplier': 2.0,
+        'min_confidence': 58,
+        'volume_threshold_multiplier': 0.9,
+        'sr_touch_threshold': 0.006,  # 0.6% (more volatile)
+        'optimal_hold_minutes': (10, 20),
+        'description': 'Higher volatility than BTC, fast moves'
+    },
+    'SOLUSDT': {
+        'name': 'Solana',
+        'atr_multiplier': 3.0,
+        'min_confidence': 55,
+        'volume_threshold_multiplier': 0.8,
+        'sr_touch_threshold': 0.008,  # 0.8% (highly volatile)
+        'optimal_hold_minutes': (5, 15),
+        'description': 'High volatility altcoin, quick trades'
+    },
+    'BNBUSDT': {
+        'name': 'Binance Coin',
+        'atr_multiplier': 2.5,
+        'min_confidence': 57,
+        'volume_threshold_multiplier': 0.85,
+        'sr_touch_threshold': 0.007,  # 0.7%
+        'optimal_hold_minutes': (8, 18),
+        'description': 'Exchange token, moderate volatility'
+    },
+    'DEFAULT': {
+        'name': 'Generic Asset',
+        'atr_multiplier': 2.0,
+        'min_confidence': 60,
+        'volume_threshold_multiplier': 1.0,
+        'sr_touch_threshold': 0.006,
+        'optimal_hold_minutes': (10, 25),
+        'description': 'Fallback for unknown assets'
+    }
+}
+
+
+def get_asset_params(symbol: str) -> dict:
+    """
+    Get asset-specific parameters to prevent overfitting to Bitcoin.
+    
+    Args:
+        symbol: Trading pair symbol (e.g., 'BTCUSDT', 'ETHUSDT')
+    
+    Returns:
+        Dictionary of asset-specific parameters
+    """
+    return ASSET_PARAMS.get(symbol, ASSET_PARAMS['DEFAULT'])
+
 
 # ============================================================================
 # DAY TRADING CONFIGURATION
@@ -19,7 +109,7 @@ AI_HOLD_STOP_LOSS_RATIO = 0.990
 AI_HOLD_TAKE_PROFIT_RATIO = 1.015
 
 # Risk management thresholds - DAY TRADING
-MIN_SIGNAL_CONFIDENCE = 75  # High-quality setups only (was 60)
+MIN_SIGNAL_CONFIDENCE = 70
 MIN_ACCOUNT_BALANCE = 10.0
 MAX_BALANCE_TRADE_RATIO = 0.01  # Max 1% of balance per position (safety first)
 MIN_TRADE_VALUE = 10.0
@@ -47,7 +137,7 @@ MAX_RISK_REWARD_RATIO = 4.0  # Maximum to consider (beyond this, too ambitious)
 
 # Support/Resistance detection settings
 SR_LOOKBACK_PERIODS = 50  # Candles to analyze for S/R levels
-SR_TOUCH_THRESHOLD = 0.002  # 0.2% proximity to consider a "touch"
+SR_TOUCH_THRESHOLD = 0.005  # 0.5% proximity to consider a "touch" (loosened from 0.2% to reduce overfitting)
 SR_MIN_TOUCHES = 2  # Minimum touches to validate a level
 SR_STRENGTH_DECAY = 0.9  # Decay factor for older levels
 
@@ -55,8 +145,8 @@ SR_STRENGTH_DECAY = 0.9  # Decay factor for older levels
 REGIME_ADX_TRENDING_THRESHOLD = 20  # ADX > 20 = trending (was 25 for high-frequency trading)
 REGIME_ADX_STRONG_TREND_THRESHOLD = 30  # ADX > 30 = strong trend
 REGIME_ALLOW_RANGING = True  # Allow trades in range-bound markets
-REGIME_MIN_CONFLUENCE_TRENDING = 70  # Minimum confluence for trending markets
-REGIME_MIN_CONFLUENCE_RANGING = 75  # Higher bar for ranging markets
+REGIME_MIN_CONFLUENCE_TRENDING = 55  # Reduced from 60 for more opportunities
+REGIME_MIN_CONFLUENCE_RANGING = 55  # Unified threshold for all regimes (reduced from 60)
 
 # Numerical safety helpers
 EIGHT_DECIMAL_PLACES = 100_000_000
@@ -101,4 +191,7 @@ __all__ = [
     "EIGHT_DECIMAL_PLACES",
     "OCO_SELL_STOP_LIMIT_BUFFER",
     "OCO_BUY_STOP_LIMIT_BUFFER",
+    "get_randomized_threshold",
+    "ASSET_PARAMS",
+    "get_asset_params",
 ]

@@ -175,21 +175,35 @@ closed_at = <timestamp>
    - Method: `calculate_position_size()`
    - Formula: `position_size = (balance * risk_pct / 100) / |entry_price - stop_loss_price|`
    - Default: 1% account risk per trade
-   - Max: 1% of balance per position (strict safety limit)
+   - Max: 1% of balance per position (strict safety limit - see `MAX_BALANCE_TRADE_RATIO = 0.01`)
 
 3. **Daily Trade Limits**
    - Default: 5 trades per day per user (quality over quantity)
    - Tracked in-memory: `daily_trade_count[user_id]`
    - Method: `reset_daily_counters()` - Clears at midnight UTC
 
-4. **Confidence Filter**
-   - Minimum 75% AI confidence required (higher bar for day trading)
-   - Constant: `MIN_SIGNAL_CONFIDENCE` in `service_constants.py`
+4. **Confidence Filter (Adaptive)**
+   - Base minimum: 60% AI confidence
+   - **NEW:** Adaptive thresholds based on performance:
+     - High win rate (>60%) → Threshold lowered by 10 (more aggressive)
+     - Low win rate (<40%) → Threshold raised by 5 (more conservative)
+     - Always randomized ±8% to prevent overfitting
+   - Constant: `MIN_SIGNAL_CONFIDENCE = 60` in `service_constants.py`
+   - Method: `risk_manager.get_adaptive_confidence_threshold()`
 
 5. **Balance Requirements**
    - Minimum: $10 USDT account balance
    - Minimum: $5 trade value
    - Constants: `MIN_ACCOUNT_BALANCE`, `MIN_TRADE_VALUE`
+
+6. **Anti-Overfitting Measures** 🆕
+   - **Loosened thresholds:** S/R touch threshold: 0.5% (was 0.2%)
+   - **Simplified confluence:** 3 core factors instead of 6 overlapping filters
+   - **Parameter randomization:** All thresholds ±8-10% variance per trade
+   - **Asset-specific profiles:** Different parameters for BTC/ETH/SOL/BNB
+   - **Adaptive confidence:** Adjusts based on recent win rate
+   - See: `OVERFITTING_ANALYSIS.md` and `ANTI_OVERFITTING_IMPLEMENTATION.md`
+
 
 ---
 

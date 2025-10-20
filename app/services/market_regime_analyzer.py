@@ -249,20 +249,21 @@ class MarketRegimeAnalyzer:
         3. Low Volatility Check
         4. Default to Range-Bound
 
-        Key Fix: High ADX (40+) indicates STRONG TREND, not necessarily high volatility.
-        Only classify as HIGH_VOLATILITY if ATR is genuinely extreme AND no clear trend.
+        High ADX (30+) indicates STRONG TREND, not range-bound or high volatility!
+        ADX measures trend strength, not choppiness.
         """
 
-        # PRIORITY 1: Strong Trend Detection (ADX > 35 = definite trend)
-        # This prevents misclassifying strong trends as "high volatility"
-        if trend_strength > 35:
+        # PRIORITY 1: Very Strong Trend Detection (ADX > 30 = definite trending market)
+        # This is the PRIMARY fix - high ADX means trending, not range-bound!
+        if trend_strength > 30:
+            logger.debug(f"🔥 Strong trend detected (ADX: {trend_strength:.1f}) - classifying direction")
             return self._classify_trend_direction(
                 sma_alignment, price_vs_sma20, volume_trend
             )
 
         # PRIORITY 2: High Volatility Check (genuinely chaotic markets)
         # Only flag HIGH_VOLATILITY if ATR is extreme AND we don't have a clear trend
-        if volatility_percentile > 95 and trend_strength < 25:
+        if volatility_percentile > 95 and trend_strength < 20:
             return "HIGH_VOLATILITY"
 
         # PRIORITY 3: Low Volatility Check
@@ -272,13 +273,13 @@ class MarketRegimeAnalyzer:
         ):
             return "LOW_VOLATILITY"
 
-        # PRIORITY 4: Moderate Trend Detection (ADX 20-35)
+        # PRIORITY 4: Moderate Trend Detection (ADX 20-30)
         if trend_strength > 20:
             return self._classify_trend_direction(
                 sma_alignment, price_vs_sma20, volume_trend
             )
 
-        # Default to range-bound if no clear pattern
+        # Default to range-bound if no clear pattern (ADX < 20)
         return "RANGE_BOUND"
 
     def _classify_trend_direction(
