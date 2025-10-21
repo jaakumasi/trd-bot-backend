@@ -42,6 +42,10 @@ class TradingBot:
         self.is_running = False
         self.active_users = {}
         self.last_analysis_time = {}
+        
+        # Consecutive loss tracking for emergency stop
+        self.consecutive_losses = {}  # user_id -> count
+        self.loss_streak_cooldown = {}  # user_id -> cooldown_until_timestamp
 
     def _create_binance_service(self):
         if settings.use_mock_binance:
@@ -259,6 +263,26 @@ class TradingBot:
             user_id = config.user_id
             symbol = config.trading_pair
 
+            # CRITICAL: Check consecutive loss cooldown FIRST
+            if user_id in self.loss_streak_cooldown:
+                cooldown_until = self.loss_streak_cooldown[user_id]
+                now = datetime.now(timezone.utc)
+                if now < cooldown_until:
+                    remaining = (cooldown_until - now).total_seconds() / 60
+                    logger.warning(
+                        f"🚫 [User {user_id}] LOSS STREAK COOLDOWN ACTIVE: "
+                        f"{remaining:.1f} minutes remaining. "
+                        f"Consecutive losses: {self.consecutive_losses.get(user_id, 0)}"
+                    )
+                    return
+                else:
+                    # Cooldown expired, clear it
+                    logger.info(
+                        f"✅ [User {user_id}] Loss streak cooldown expired. Resuming trading."
+                    )
+                    del self.loss_streak_cooldown[user_id]
+                    self.consecutive_losses[user_id] = 0
+
             # Skip analysis if a position is already open for this pair
             open_positions = self.risk_manager.get_open_positions(user_id)
             if any(p.get("symbol") == symbol for p in open_positions):
@@ -403,7 +427,7 @@ class TradingBot:
 
             self._log_trade_validation_success(user_id, trade_params)
 
-            await self._execute_trade(db, config, ai_signal, trade_params)
+            await self._execute_trade(db, config, ai_signal, trade_params, regime_analysis)
 
         except CircuitBreakerTriggered:
             # Already handled above, don't log as generic error
@@ -802,8 +826,43 @@ class TradingBot:
         self.circuit_breaker.record_trade_result(
             user_id=user_id, pnl=closed_position["net_pnl"], is_winner=is_winner
         )
+        
+        # Track consecutive losses and trigger emergency cooldown
+        if is_winner:
+            # Reset loss streak on winning trade
+            if user_id in self.consecutive_losses:
+                logger.info(f"✅ [User {user_id}] Winning trade! Loss streak reset.")
+                self.consecutive_losses[user_id] = 0
+        else:
+            # Increment loss counter
+            self.consecutive_losses[user_id] = self.consecutive_losses.get(user_id, 0) + 1
+            losses = self.consecutive_losses[user_id]
+            
+            logger.warning(
+                f"❌ [User {user_id}] Consecutive losses: {losses}"
+            )
+            
+            # Trigger cooldown based on loss streak
+            if losses >= 3:
+                # 3+ losses: 4 hour cooldown (very serious)
+                cooldown_hours = 4
+                cooldown_until = datetime.now(timezone.utc) + timedelta(hours=cooldown_hours)
+                self.loss_streak_cooldown[user_id] = cooldown_until
+                logger.error(
+                    f"🚨🚨 [User {user_id}] EMERGENCY STOP: {losses} consecutive losses! "
+                    f"Trading suspended for {cooldown_hours} hours until {cooldown_until.strftime('%H:%M:%S UTC')}"
+                )
+            elif losses >= 2:
+                # 2 losses: 1 hour cooldown
+                cooldown_hours = 1
+                cooldown_until = datetime.now(timezone.utc) + timedelta(hours=cooldown_hours)
+                self.loss_streak_cooldown[user_id] = cooldown_until
+                logger.warning(
+                    f"⚠️ [User {user_id}] COOLDOWN: {losses} consecutive losses. "
+                    f"Trading paused for {cooldown_hours} hour until {cooldown_until.strftime('%H:%M:%S UTC')}"
+                )
 
-        # ✅ FIX: Update original trade record with exit details (consistent with OCO/timeout exits)
+        #  Update original trade record with exit details (consistent with OCO/timeout exits)
         await self._update_trade_record_after_exit(
             db,
             trade_id=position["trade_id"],
@@ -1196,8 +1255,8 @@ class TradingBot:
         """Infer exit reason/price from position TP/SL and current market price"""
         symbol = position.symbol
         current_price = self.binance.get_symbol_price(symbol)
-        tp_price = float(position.take_profit_price)
-        sl_price = float(position.stop_loss_price)
+        tp_price = float(position.take_profit)
+        sl_price = float(position.stop_loss)
         
         # Calculate distances from current price
         tp_distance = abs(current_price - tp_price)
@@ -1585,7 +1644,7 @@ class TradingBot:
         )
 
     async def _execute_trade(
-        self, db: AsyncSession, config: TradingConfig, signal: Dict, params: Dict
+        self, db: AsyncSession, config: TradingConfig, signal: Dict, params: Dict, regime_analysis: Dict = None
     ):
         """Execute a trade based on the signal"""
         trade_start_time = datetime.now(timezone.utc)
@@ -1616,8 +1675,10 @@ class TradingBot:
             )
 
             # Get adaptive exit levels based on ATR and historical performance
+            # Pass regime_analysis for mean reversion detection
             adaptive_exits = await self.risk_manager.get_adaptive_exit_levels(
-                db, user_id, df_with_indicators, side.lower(), current_price
+                db, user_id, df_with_indicators, side.lower(), current_price,
+                regime_analysis=regime_analysis  # NEW: Pass regime info
             )
 
             take_profit_price = adaptive_exits["take_profit_price"]

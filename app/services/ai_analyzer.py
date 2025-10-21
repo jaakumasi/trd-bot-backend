@@ -263,6 +263,29 @@ class AIAnalyzer:
                         f"ATR%: {regime_analysis.get('atr_percentage', 0):.2f}%",
                         float(latest["close"]),
                     )
+                
+                # Step 1.5: Block mean reversion in strong trends (CRITICAL SAFETY)
+                regime = regime_analysis.get("regime", "")
+                trading_edge = regime_analysis.get("trading_edge", "")
+                trend_strength = regime_analysis.get("trend_strength", 0)
+                confidence = regime_analysis.get("confidence", 0)
+                
+                # DO NOT attempt mean reversion counter-trend trades in strong trending markets
+                if trading_edge == "MEAN_REVERSION" and (
+                    (regime in ["BEAR_TREND", "BULL_TREND"] and trend_strength > 40) or
+                    (regime in ["BEAR_TREND", "BULL_TREND"] and confidence > 70)
+                ):
+                    logger.warning(
+                        f"⛔ BLOCKED: Mean reversion in strong trend - "
+                        f"Regime: {regime} ({confidence}% confidence), "
+                        f"ADX: {trend_strength:.1f}, Edge: {trading_edge}. "
+                        f"This is a strong directional move, NOT a bounce opportunity!"
+                    )
+                    return self._fallback_analysis(
+                        f"Mean reversion blocked in strong {regime} (ADX: {trend_strength:.1f}). "
+                        f"Do not catch falling knives or fight strong trends.",
+                        float(latest["close"]),
+                    )
 
             # Step 2: Signal Confluence Check (now with dynamic thresholds!)
             confluence_score = self._calculate_signal_confluence(
@@ -320,6 +343,41 @@ class AIAnalyzer:
             enriched["technical_score"] = technical_score
             enriched["final_confidence"] = min(enriched["confidence"], technical_score)
             enriched["signal_confluence"] = confluence_score
+
+            # CRITICAL: Enforce directional bias in strong trends
+            if regime_analysis:
+                signal = enriched.get("action", "hold").lower()
+                regime = regime_analysis.get("regime", "")
+                trend_strength = regime_analysis.get("trend_strength", 0)
+                confidence = regime_analysis.get("confidence", 0)
+                
+                # In strong bearish trends, BLOCK buy signals (don't catch falling knives)
+                if signal == "buy" and regime == "BEAR_TREND" and (
+                    trend_strength > 50 or confidence > 75
+                ):
+                    logger.warning(
+                        f"⛔ BLOCKED: BUY signal in strong BEAR_TREND - "
+                        f"ADX: {trend_strength:.1f}, Confidence: {confidence}%. "
+                        f"Do NOT buy into strong downtrends!"
+                    )
+                    return self._fallback_analysis(
+                        f"BUY blocked in strong bearish market (ADX: {trend_strength:.1f})",
+                        float(latest["close"]),
+                    )
+                
+                # In strong bullish trends, BLOCK sell signals
+                if signal == "sell" and regime == "BULL_TREND" and (
+                    trend_strength > 50 or confidence > 75
+                ):
+                    logger.warning(
+                        f"⛔ BLOCKED: SELL signal in strong BULL_TREND - "
+                        f"ADX: {trend_strength:.1f}, Confidence: {confidence}%. "
+                        f"Do NOT short into strong uptrends!"
+                    )
+                    return self._fallback_analysis(
+                        f"SELL blocked in strong bullish market (ADX: {trend_strength:.1f})",
+                        float(latest["close"]),
+                    )
 
             logger.info(f"🎯 Final AI Analysis: {enriched}")
             return enriched

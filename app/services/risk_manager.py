@@ -292,9 +292,12 @@ class RiskManager:
             risk_percentage = self._resolve_risk_percentage(config)
 
             # Use adaptive R:R if market data available, otherwise use AI suggestions
+            # CRITICAL: For safety, ALWAYS prefer AI-suggested levels for mean reversion
+            use_ai_levels = True  # Default to safer AI levels
+            
             if market_df is not None and not market_df.empty:
                 logger.info(
-                    f"🎯 [User {user_id}] Using adaptive R:R based on market structure"
+                    f"🎯 [User {user_id}] Testing S/R adaptive R:R based on market structure"
                 )
 
                 # Detect support/resistance levels
@@ -307,21 +310,54 @@ class RiskManager:
                     "atr", entry_price * 0.02
                 )  # Default 2% if missing
 
-                # Calculate adaptive stop loss and take profit
-                adaptive_rr = self.calculate_adaptive_risk_reward(
-                    side, entry_price, sr_levels, atr
+                # SAFETY CHECK: Only use S/R levels if they're reasonable
+                support = sr_levels["nearest_support"]
+                resistance = sr_levels["nearest_resistance"]
+                support_distance = abs(support - entry_price) / entry_price * 100
+                resistance_distance = abs(resistance - entry_price) / entry_price * 100
+                
+                # Reject S/R levels if they're more than 8% away (unrealistic)
+                if support_distance <= 8.0 and resistance_distance <= 8.0:
+                    logger.info(f"✅ S/R levels reasonable: Support={support_distance:.1f}%, Resistance={resistance_distance:.1f}%")
+                    
+                    # Calculate adaptive stop loss and take profit
+                    adaptive_rr = self.calculate_adaptive_risk_reward(
+                        side, entry_price, sr_levels, atr
+                    )
+
+                    stop_loss = adaptive_rr["stop_loss"]
+                    take_profit = adaptive_rr["take_profit"]
+                    risk_reward_ratio = adaptive_rr["risk_reward_ratio"]
+                    use_ai_levels = False  # Use S/R levels
+                    
+                    logger.info(
+                        f"📊 [User {user_id}] S/R Adaptive R:R applied:"
+                        f"\n   Entry: ${entry_price:.2f}"
+                        f"\n   Stop Loss: ${stop_loss:.2f} (S/R: ${sr_levels['nearest_support' if side == 'buy' else 'nearest_resistance']:.2f})"
+                        f"\n   Take Profit: ${take_profit:.2f} (S/R: ${sr_levels['nearest_resistance' if side == 'buy' else 'nearest_support']:.2f})"
+                        f"\n   R:R Ratio: 1:{risk_reward_ratio:.2f}"
+                    )
+                else:
+                    logger.warning(
+                        f"⚠️ S/R levels unrealistic! Support={support_distance:.1f}%, Resistance={resistance_distance:.1f}%. "
+                        f"Falling back to AI levels for safety."
+                    )
+                    
+            if use_ai_levels:
+                # Use AI-suggested levels (safer default)
+                logger.info(f"🤖 [User {user_id}] Using AI-suggested R:R levels (safer)")
+                stop_loss = self._extract_stop_loss(signal)
+                take_profit = self._extract_take_profit(signal)
+                risk_reward_ratio = self._calculate_ai_risk_reward(
+                    entry_price, stop_loss, take_profit
                 )
 
-                stop_loss = adaptive_rr["stop_loss"]
-                take_profit = adaptive_rr["take_profit"]
-                risk_reward_ratio = adaptive_rr["risk_reward_ratio"]
-
                 logger.info(
-                    f"📊 [User {user_id}] Adaptive R:R applied:\n"
-                    f"   Entry: ${entry_price:.2f}\n"
-                    f"   Stop Loss: ${stop_loss:.2f} (S/R: ${sr_levels['nearest_support']:.2f})\n"
-                    f"   Take Profit: ${take_profit:.2f} (S/R: ${sr_levels['nearest_resistance']:.2f})\n"
-                    f"   R:R Ratio: 1:{risk_reward_ratio:.2f}"
+                    f"📊 [User {user_id}] AI R:R applied:"
+                    f"\n   Entry: ${entry_price:.2f}"
+                    f"\n   Stop Loss: ${stop_loss:.2f}"
+                    f"\n   Take Profit: ${take_profit:.2f}"
+                    f"\n   R:R Ratio: 1:{risk_reward_ratio:.2f}"
                 )
             else:
                 # Fallback to AI-suggested levels
@@ -428,17 +464,19 @@ class RiskManager:
         logger.info("Daily trade counters reset")
 
     async def get_adaptive_exit_levels(
-        self, db, user_id: int, df, side: str, entry_price: float
+        self, db, user_id: int, df, side: str, entry_price: float, regime_analysis: Dict = None
     ) -> Dict:
         """
         Calculate optimal SL/TP based on:
         1. Current market volatility (ATR) - inversely scaled
         2. Historical user performance in similar volatility
         3. Safety caps to prevent excessive risk
+        4. **NEW: Mean reversion detection for wider stops**
 
         Philosophy:
         - High volatility → Wider stops (larger ATR multipliers) to avoid premature exits
         - Low volatility → Tighter stops (smaller ATR multipliers) for precision
+        - **Mean reversion setups → Extra wide stops (need breathing room for bounce)**
 
         Returns:
             {
@@ -467,13 +505,35 @@ class RiskManager:
 
             # Store volatility percentile for use by position sizing
             self.current_volatility_percentile = volatility_percentile
+            
+            # Check if this is a mean reversion setup (requires wider stops)
+            is_mean_reversion = False
+            if regime_analysis:
+                trading_edge = regime_analysis.get("trading_edge", "")
+                mean_reversion_score = regime_analysis.get("mean_reversion_score", 0)
+                # NOTE: This check should never be true due to earlier blocking,
+                # but included as failsafe
+                if trading_edge == "MEAN_REVERSION" or mean_reversion_score >= 70:
+                    is_mean_reversion = True
+                    logger.warning(
+                        f"⚠️ Mean reversion setup detected - will apply wider stops if allowed through"
+                    )
 
             # Adaptive Multipliers based on volatility regime
             # High volatility (>75th percentile) → Wider stops (2.5-3x ATR)
             # Medium volatility (25th-75th) → Standard stops (1.8-2.2x ATR)
             # Low volatility (<25th percentile) → Tighter stops (1.2-1.5x ATR)
+            # **MEAN REVERSION → EXTRA WIDE (3.0-4.0x ATR for breathing room)**
 
-            if volatility_percentile > 75:
+            if is_mean_reversion:
+                # Mean reversion needs MUCH wider stops (bounces are volatile)
+                sl_multiplier = 3.5
+                tp_multiplier = 4.5
+                volatility_regime = "MEAN_REVERSION"
+                logger.info(
+                    f"📏 Using WIDE stops for mean reversion: SL={sl_multiplier}x, TP={tp_multiplier}x ATR"
+                )
+            elif volatility_percentile > 75:
                 # HIGH VOLATILITY: Use wider stops to avoid noise
                 sl_multiplier = 2.8
                 tp_multiplier = 3.5
@@ -914,13 +974,21 @@ class RiskManager:
 
     def _find_nearest_above(self, levels: List[float], price: float) -> float:
         """Find nearest level above current price."""
-        above = [l for l in levels if l > price]
-        return min(above) if above else price * 1.05  # Default 5% above
+        # CRITICAL: Filter out insane levels (more than 10% away)
+        MAX_DISTANCE_PCT = 0.10  # 10% maximum distance
+        max_price = price * (1 + MAX_DISTANCE_PCT)
+        
+        above = [l for l in levels if price < l <= max_price]
+        return min(above) if above else price * 1.03  # Default 3% above (conservative)
 
     def _find_nearest_below(self, levels: List[float], price: float) -> float:
         """Find nearest level below current price."""
-        below = [l for l in levels if l < price]
-        return max(below) if below else price * 0.95  # Default 5% below
+        # CRITICAL: Filter out insane levels (more than 10% away)
+        MAX_DISTANCE_PCT = 0.10  # 10% maximum distance
+        min_price = price * (1 - MAX_DISTANCE_PCT)
+        
+        below = [l for l in levels if min_price <= l < price]
+        return max(below) if below else price * 0.97  # Default 3% below (conservative)
 
     def _count_touches(self, df, level: float, threshold: float) -> int:
         """Count how many times price touched a level."""
@@ -976,6 +1044,7 @@ class RiskManager:
         # ANTI-OVERFITTING: Minimum percentage thresholds for realistic trading
         MIN_STOP_LOSS_PCT = 0.008  # 0.8% minimum SL distance (prevents tight stops)
         MIN_TAKE_PROFIT_PCT = 0.012  # 1.2% minimum TP distance (realistic profit)
+        MAX_STOP_LOSS_PCT = 0.05   # 5.0% MAXIMUM SL distance (prevents insane stops)
         try:
             side = side.lower()
 
@@ -1006,6 +1075,19 @@ class RiskManager:
             if risk == 0:
                 logger.warning("⚠️ Risk is zero, using default levels")
                 return self._default_exit_levels(side, entry_price)
+
+            # CRITICAL: Enforce MAXIMUM stop loss distance (5% cap)
+            max_sl_distance = entry_price * MAX_STOP_LOSS_PCT  # 5.0% maximum
+            if risk > max_sl_distance:
+                logger.error(
+                    f"🚨 INSANE STOP LOSS: {(risk/entry_price*100):.2f}% is way too wide! "
+                    f"Capping at maximum {MAX_STOP_LOSS_PCT*100:.1f}% for safety."
+                )
+                if side == "buy":
+                    stop_loss = entry_price - max_sl_distance
+                else:
+                    stop_loss = entry_price + max_sl_distance
+                risk = max_sl_distance
 
             # CRITICAL: Enforce minimum distances to prevent unrealistic tight levels
             min_sl_distance = entry_price * MIN_STOP_LOSS_PCT  # 0.8% minimum
