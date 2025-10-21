@@ -513,6 +513,32 @@ class BinanceService:
             
             return None
 
+    def get_order_status(self, symbol: str, order_id: str) -> Optional[Dict]:
+        """Get the status of an individual order by order ID"""
+        try:
+            # Re-sync time if stale to prevent timestamp errors
+            self._check_and_resync_time()
+            
+            result = self.client.get_order(symbol=symbol, orderId=int(order_id))
+            logger.info(f"✅ Order Status Retrieved: {order_id}")
+            return result
+
+        except Exception as e:
+            logger.error(f"Error getting order status {order_id}: {e}")
+            
+            # If timestamp error, force immediate re-sync and retry once
+            if "recvWindow" in str(e) or "Timestamp" in str(e):
+                logger.warning("⚠️  Timestamp error detected. Force re-syncing time and retrying...")
+                self._synchronize_time()
+                try:
+                    result = self.client.get_order(symbol=symbol, orderId=int(order_id))
+                    logger.info(f"✅ Order Status Retrieved on retry: {order_id}")
+                    return result
+                except Exception as retry_error:
+                    logger.error(f"❌ Order status retrieval failed after retry: {retry_error}")
+                    return None
+            return None
+
     def cancel_oco_order(self, symbol: str, order_list_id: str) -> bool:
         """Cancel an active OCO order on Binance"""
         try:

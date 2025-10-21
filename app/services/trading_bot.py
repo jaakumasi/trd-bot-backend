@@ -1132,9 +1132,17 @@ class TradingBot:
             tuple: (exit_reason, exit_price) or (None, None) if extraction fails
         """
         try:
+            # Debug logging to see what Binance actually returns
+            logger.info(f"🔍 OCO Status Debug: {oco_status}")
+            
             orders = oco_status.get("orders", [])
             if not orders:
                 logger.warning("⚠️  OCO status has no orders array")
+                # Check if we have individual order IDs to query
+                if "orderListId" in oco_status:
+                    logger.info(f"🔍 Attempting to extract order IDs from OCO response...")
+                    # Try to extract order details from other fields
+                    return self._extract_oco_from_alternative_fields(oco_status)
                 return None, None
             
             filled_order = self._find_filled_order(orders)
@@ -1195,6 +1203,101 @@ class TradingBot:
             return calculated_price
         
         return None
+
+    def _extract_oco_from_alternative_fields(self, oco_status: Dict) -> tuple:
+        """
+        Attempt to extract OCO exit details from alternative fields when orders array is empty.
+        This handles cases where Binance Testnet API doesn't populate the orders array properly.
+        """
+        try:
+            logger.info(f"🔍 Available OCO fields: {list(oco_status.keys())}")
+            
+            # Check orderReports field
+            exit_details = self._check_order_reports(oco_status)
+            if exit_details[0] and exit_details[1]:
+                return exit_details
+            
+            # Check all other list fields
+            exit_details = self._check_other_list_fields(oco_status)
+            if exit_details[0] and exit_details[1]:
+                return exit_details
+            
+            logger.warning("⚠️  No alternative OCO exit details found")
+            return None, None
+            
+        except Exception as e:
+            logger.error(f"❌ Error extracting OCO from alternative fields: {e}")
+            return None, None
+
+    def _check_order_reports(self, oco_status: Dict) -> tuple:
+        """Check orderReports field for filled orders"""
+        if "orderReports" not in oco_status:
+            return None, None
+            
+        order_reports = oco_status["orderReports"]
+        logger.info(f"🔍 Found orderReports: {order_reports}")
+        
+        for report in order_reports:
+            if report.get("status") == "FILLED":
+                exit_price = self._extract_order_price(report)
+                exit_reason = self._determine_exit_reason_from_order(report)
+                if exit_price and exit_reason:
+                    return exit_reason, exit_price
+        
+        return None, None
+
+    def _check_other_list_fields(self, oco_status: Dict) -> tuple:
+        """Check other list fields for filled orders"""
+        for key, value in oco_status.items():
+            if key == "orderReports":  # Already checked
+                continue
+                
+            if isinstance(value, list) and value:
+                logger.info(f"🔍 Found list field '{key}': {value}")
+                for item in value:
+                        if isinstance(item, dict) and item.get("status") == "FILLED":
+                            exit_price = self._extract_order_price(item)
+                            exit_reason = self._determine_exit_reason_from_order(item)
+                            if exit_price and exit_reason:
+                                return exit_reason, exit_price
+        
+        return None, None
+
+    def _extract_order_price(self, order: dict) -> float:
+        """Extract price from order, similar to existing _extract_exit_price_from_filled_order"""
+        try:
+            # Try direct price first
+            exit_price = float(order.get("price", 0))
+            
+            if exit_price > 0:
+                return exit_price
+            
+            # Fallback: calculate from cummulativeQuoteQty / executedQty
+            executed_qty = float(order.get("executedQty", 0))
+            cumulative_quote = float(order.get("cummulativeQuoteQty", 0))
+            
+            if executed_qty > 0 and cumulative_quote > 0:
+                calculated_price = cumulative_quote / executed_qty
+                return calculated_price
+                
+            return None
+        except Exception:
+            return None
+
+    def _determine_exit_reason_from_order(self, order: dict) -> str:
+        """Determine if an order was TP or SL based on order type"""
+        try:
+            order_type = order.get("type", "").upper()
+            
+            if "STOP" in order_type:
+                return "STOP_LOSS"
+            elif "LIMIT" in order_type or "MARKET" in order_type:
+                return "TAKE_PROFIT"
+            else:
+                # Fallback - this shouldn't happen in normal OCO
+                return "UNKNOWN"
+        except Exception:
+            return "UNKNOWN"
 
     def _fallback_extract_exit_details(
         self, position: OpenPosition, oco_status: Dict
