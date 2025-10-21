@@ -99,19 +99,19 @@ def get_asset_params(symbol: str) -> dict:
 # Risk management follows the 1% rule with dynamic R:R based on market structure
 # ============================================================================
 
-# AI analyzer ratios - DAY TRADING (adaptive, these are starting points)
-# The system will dynamically adjust based on support/resistance levels
-AI_BUY_STOP_LOSS_RATIO = 0.985   # ~1.5% below entry (day trading range)
-AI_BUY_TAKE_PROFIT_RATIO = 1.030  # ~3.0% above entry (1:2 R:R baseline)
-AI_SELL_STOP_LOSS_RATIO = 1.015   # ~1.5% above entry
-AI_SELL_TAKE_PROFIT_RATIO = 0.970  # ~3.0% below entry
-AI_HOLD_STOP_LOSS_RATIO = 0.990
-AI_HOLD_TAKE_PROFIT_RATIO = 1.015
+# AI analyzer ratios - DAY TRADING with 2:1 minimum R:R (mainnet ready)
+# Updated for sustainable edge after fees and slippage
+AI_BUY_STOP_LOSS_RATIO = 0.993   # ~0.7% below entry
+AI_BUY_TAKE_PROFIT_RATIO = 1.014  # ~1.4% above entry (2:1 R:R baseline)
+AI_SELL_STOP_LOSS_RATIO = 1.007   # ~0.7% above entry
+AI_SELL_TAKE_PROFIT_RATIO = 0.986  # ~1.4% below entry
+AI_HOLD_STOP_LOSS_RATIO = 0.993
+AI_HOLD_TAKE_PROFIT_RATIO = 1.014
 
 # Risk management thresholds - DAY TRADING
 MIN_SIGNAL_CONFIDENCE = 70
 MIN_ACCOUNT_BALANCE = 10.0
-MAX_BALANCE_TRADE_RATIO = 0.01  # Max 1% of balance per position (safety first)
+MAX_BALANCE_TRADE_RATIO = 0.03  # Max 3% of balance per position (conservative mainnet)
 MIN_TRADE_VALUE = 10.0
 DEFAULT_RISK_PERCENTAGE = 1.0  # 1% rule: max risk per trade
 DEFAULT_MAX_DAILY_TRADES = 5  # Quality over quantity (was 10)
@@ -130,9 +130,9 @@ MTF_PRIMARY_CANDLES = 100       # ~25 hours of 15m data
 MTF_CONTEXT_CANDLES = 168       # ~1 week of 1h data
 MTF_PRECISION_CANDLES = 288     # ~24 hours of 5m data
 
-# Adaptive Risk-Reward settings
-MIN_RISK_REWARD_RATIO = 1.5  # Minimum acceptable R:R (1:1.5)
-TARGET_RISK_REWARD_RATIO = 2.0  # Target R:R for optimal setups (1:2)
+# Adaptive Risk-Reward settings (mainnet requirements)
+MIN_RISK_REWARD_RATIO = 2.0  # Minimum 2:1 R:R for profitable trading after fees
+TARGET_RISK_REWARD_RATIO = 2.5  # Target R:R for optimal setups (1:2.5)
 MAX_RISK_REWARD_RATIO = 4.0  # Maximum to consider (beyond this, too ambitious)
 
 # Support/Resistance detection settings

@@ -528,30 +528,30 @@ class RiskManager:
             if is_mean_reversion:
                 # Mean reversion needs MUCH wider stops (bounces are volatile)
                 sl_multiplier = 3.5
-                tp_multiplier = 4.5
+                tp_multiplier = 7.5
                 volatility_regime = "MEAN_REVERSION"
                 logger.info(
                     f"📏 Using WIDE stops for mean reversion: SL={sl_multiplier}x, TP={tp_multiplier}x ATR"
                 )
             elif volatility_percentile > 75:
-                # HIGH VOLATILITY: Use wider stops to avoid noise
+                # HIGH VOLATILITY: Use wider stops to avoid noise (2:1+ R:R)
                 sl_multiplier = 2.8
-                tp_multiplier = 3.5
+                tp_multiplier = 6.0
                 volatility_regime = "HIGH"
             elif volatility_percentile > 50:
-                # MEDIUM-HIGH VOLATILITY
+                # MEDIUM-HIGH VOLATILITY (2:1+ R:R)
                 sl_multiplier = 2.2
-                tp_multiplier = 2.8
+                tp_multiplier = 5.0
                 volatility_regime = "MEDIUM_HIGH"
             elif volatility_percentile > 25:
-                # MEDIUM VOLATILITY
+                # MEDIUM VOLATILITY (2:1+ R:R)
                 sl_multiplier = 1.8
-                tp_multiplier = 2.3
+                tp_multiplier = 4.0
                 volatility_regime = "MEDIUM"
             else:
-                # LOW VOLATILITY: Use tighter stops for precision
+                # LOW VOLATILITY: Use tighter stops for precision (2:1+ R:R)
                 sl_multiplier = 1.3
-                tp_multiplier = 1.7
+                tp_multiplier = 3.0
                 volatility_regime = "LOW"
 
             # Calculate percentage distances
@@ -622,26 +622,26 @@ class RiskManager:
             # Day trading risk management - adaptive to market structure
             # High volatility periods need wider caps BUT with absolute maximum
 
-            # ABSOLUTE MAXIMUM CAPS (regardless of volatility)
+            # ABSOLUTE MAXIMUM CAPS (adjusted for 2:1 R:R requirement)
             ABSOLUTE_MAX_STOP_LOSS = 0.5  # Never risk more than 0.5% per trade
-            ABSOLUTE_MAX_TAKE_PROFIT = 1.5  # Never target more than 1.5% profit
+            ABSOLUTE_MAX_TAKE_PROFIT = 2.0  # Increased from 1.5% to support 2:1 R:R
 
             if volatility_regime == "HIGH":
-                # High volatility: wider stops but capped
-                max_sl = 2.5  # Day trading maximum stop loss (adaptive)
+                # High volatility: wider stops but capped (2:1 R:R friendly)
+                max_sl = 0.5  
                 min_sl = 0.3
-                max_tp = 1.2  # Reduced from 2.5%
-                min_tp = 0.6
+                max_tp = 1.5 
+                min_tp = 0.8
             elif volatility_regime in ["MEDIUM_HIGH", "MEDIUM"]:
-                max_sl = 0.4  # Reduced from 1.0%
+                max_sl = 0.4
                 min_sl = 0.25
-                max_tp = 0.8  # Reduced from 1.8%
-                min_tp = 0.4
+                max_tp = 1.0
+                min_tp = 0.6
             else:  # LOW volatility
-                max_sl = 0.35  # Reduced from 0.7%
+                max_sl = 0.35 
                 min_sl = 0.2
-                max_tp = 0.6  # Reduced from 1.0%
-                min_tp = 0.3
+                max_tp = 0.8
+                min_tp = 0.5
 
             # Apply volatility-specific caps
             dynamic_sl_pct = min(dynamic_sl_pct, max_sl)
@@ -653,12 +653,13 @@ class RiskManager:
             dynamic_sl_pct = min(dynamic_sl_pct, ABSOLUTE_MAX_STOP_LOSS)
             dynamic_tp_pct = min(dynamic_tp_pct, ABSOLUTE_MAX_TAKE_PROFIT)
 
-            # Ensure minimum risk:reward ratio of 1.2:1 for profitability
-            min_risk_reward = 1.2
+            # Ensure minimum risk:reward ratio of 2.0:1 for mainnet profitability
+            # This accounts for fees, slippage, and ensures sustainable edge
+            min_risk_reward = 2.0
             if dynamic_tp_pct / dynamic_sl_pct < min_risk_reward:
                 logger.warning(
                     f"⚠️  Risk:reward ratio too low ({dynamic_tp_pct/dynamic_sl_pct:.2f}:1). "
-                    f"Adjusting TP to maintain {min_risk_reward}:1"
+                    f"Adjusting TP to maintain {min_risk_reward}:1 (mainnet requirement)"
                 )
                 dynamic_tp_pct = max(dynamic_tp_pct, dynamic_sl_pct * min_risk_reward)
 
