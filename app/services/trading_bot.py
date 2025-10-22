@@ -2,7 +2,7 @@ import asyncio
 import logging
 from contextlib import suppress
 from datetime import datetime, time, timedelta, timezone
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from ..database import get_db, get_async_session
@@ -16,6 +16,7 @@ from .risk_manager import RiskManager
 from .websocket_manager import WebSocketManager
 from .market_regime_analyzer import MarketRegimeAnalyzer
 from .circuit_breaker import CircuitBreaker, CircuitBreakerTriggered
+from .position_sync_manager import PositionSyncManager
 from ..logging_config import get_trading_metrics_logger
 from ..config import settings
 from .service_constants import (
@@ -38,6 +39,7 @@ class TradingBot:
             filter_mode=settings.regime_filter_mode
         )
         self.circuit_breaker = CircuitBreaker()
+        self.position_sync_manager = PositionSyncManager(self.binance)
         self.ws_manager = ws_manager
         self.is_running = False
         self.active_users = {}
@@ -105,6 +107,7 @@ class TradingBot:
 
             self._initialize_support_services()
             await self._load_open_positions_from_db()
+            await self._sync_positions_on_startup()
             self._log_initialization_success()
             return True
 
@@ -230,6 +233,9 @@ class TradingBot:
         if total_active_users == 0:
             return 0
 
+        # Synchronize positions with Binance before processing
+        await self._sync_positions_in_cycle(db, active_configs)
+        
         await self._check_oco_orders(db)
 
         processed_users = 0
@@ -2070,6 +2076,148 @@ class TradingBot:
 
         except Exception as e:
             logger.error(f"❌ Error loading open positions from database: {e}")
+
+    async def _sync_positions_on_startup(self):
+        """Synchronize database positions with Binance state on startup"""
+        try:
+            logger.info("🔄 Starting position synchronization with Binance on startup...")
+            
+            async with get_async_session() as db:
+                # Get all users with active trading configurations
+                result = await db.execute(
+                    select(TradingConfig.user_id).where(TradingConfig.is_active == True).distinct()
+                )
+                user_ids = [row[0] for row in result.fetchall()]
+                
+                if not user_ids:
+                    logger.info("📭 No users with active trading configs found - skipping position sync")
+                    return
+                
+                # Perform batch synchronization
+                sync_summary = await self.position_sync_manager.sync_all_users_positions(
+                    db, user_ids
+                )
+                
+                # If positions were closed, reload RiskManager cache
+                if sync_summary['total_positions_closed'] > 0:
+                    logger.info(f"🔄 {sync_summary['total_positions_closed']} positions closed during startup sync - updating RiskManager")
+                    await self._reload_positions_to_risk_manager(db, user_ids)
+                
+                # Log comprehensive summary
+                logger.info("✅ Startup position synchronization completed")
+                logger.info(f"   👥 Users processed: {sync_summary['users_processed']}")
+                logger.info(f"   📊 Positions checked: {sync_summary['total_positions_checked']}")
+                logger.info(f"   🔄 Positions updated: {sync_summary['total_positions_updated']}")
+                logger.info(f"   🔚 Positions closed: {sync_summary['total_positions_closed']}")
+                logger.info(f"   🔧 OCO orders updated: {sync_summary['total_oco_orders_updated']}")
+                logger.info(f"   ⚠️  Conflicts resolved: {sync_summary['total_conflicts_resolved']}")
+                
+                if sync_summary['errors']:
+                    logger.warning(f"   ❌ Sync errors: {len(sync_summary['errors'])}")
+                    for error in sync_summary['errors'][:3]:  # Log first 3 errors
+                        logger.warning(f"      {error}")
+                        
+                # Update metrics
+                metrics_logger.info(
+                    f"STARTUP_POSITION_SYNC | "
+                    f"USERS={sync_summary['users_processed']} | "
+                    f"CHECKED={sync_summary['total_positions_checked']} | "
+                    f"UPDATED={sync_summary['total_positions_updated']} | "
+                    f"CLOSED={sync_summary['total_positions_closed']} | "
+                    f"ERRORS={len(sync_summary['errors'])}"
+                )
+                
+        except Exception as e:
+            logger.error(f"❌ Startup position synchronization failed: {e}")
+            metrics_logger.info(f"STARTUP_POSITION_SYNC_FAILED | ERROR={str(e)}")
+            # Don't fail initialization due to sync issues - continue with warning
+            logger.warning("⚠️  Continuing bot startup despite position sync failure")
+
+    async def _sync_positions_in_cycle(self, db: AsyncSession, active_configs) -> None:
+        """Synchronize positions during trading cycle for active users"""
+        try:
+            # Extract user IDs from active configs
+            user_ids = [config.user_id for config in active_configs]
+            
+            if not user_ids:
+                return
+                
+            logger.debug(f"🔄 Syncing positions for {len(user_ids)} active users in trading cycle")
+            
+            # Perform synchronization for active users only
+            sync_summary = await self.position_sync_manager.sync_all_users_positions(
+                db, user_ids
+            )
+            
+            # If positions were closed, update RiskManager cache
+            if sync_summary['total_positions_closed'] > 0:
+                logger.info(f"🔄 {sync_summary['total_positions_closed']} positions closed - updating RiskManager cache")
+                await self._reload_positions_to_risk_manager(db, user_ids)
+            
+            # Log summary if there were any changes
+            total_changes = (
+                sync_summary['total_positions_updated'] + 
+                sync_summary['total_positions_closed'] + 
+                sync_summary['total_conflicts_resolved']
+            )
+            
+            if total_changes > 0:
+                logger.info(f"🔄 Position sync: {total_changes} changes applied")
+                logger.debug(f"   🔄 Updated: {sync_summary['total_positions_updated']}")
+                logger.debug(f"   🔚 Closed: {sync_summary['total_positions_closed']}")
+                logger.debug(f"   ⚠️  Conflicts: {sync_summary['total_conflicts_resolved']}")
+                
+                metrics_logger.info(
+                    f"CYCLE_POSITION_SYNC | "
+                    f"USERS={sync_summary['users_processed']} | " 
+                    f"CHANGES={total_changes} | "
+                    f"ERRORS={len(sync_summary['errors'])}"
+                )
+            
+            if sync_summary['errors']:
+                logger.warning(f"⚠️  Position sync errors: {len(sync_summary['errors'])}")
+                for error in sync_summary['errors'][:2]:  # Log first 2 errors
+                    logger.warning(f"   {error}")
+                    
+        except Exception as e:
+            logger.error(f"❌ Trading cycle position sync failed: {e}")
+            # Continue trading cycle despite sync failure
+
+    async def _reload_positions_to_risk_manager(self, db: AsyncSession, user_ids: List[int]) -> None:
+        """Reload open positions from database to RiskManager after sync changes"""
+        try:
+            # Get current open positions from database for affected users
+            result = await db.execute(
+                select(OpenPosition).where(OpenPosition.user_id.in_(user_ids))
+            )
+            open_positions = result.scalars().all()
+            
+            # Clear positions for affected users and reload from database
+            for user_id in user_ids:
+                # Clear old cached positions for this user
+                self.risk_manager.open_positions[user_id] = []
+                
+            # Reload positions
+            for position in open_positions:
+                position_data = {
+                    "trade_id": position.trade_id,
+                    "symbol": position.symbol,
+                    "side": position.side,
+                    "amount": float(position.amount),
+                    "entry_price": float(position.entry_price),
+                    "stop_loss": float(position.stop_loss) if position.stop_loss else None,
+                    "take_profit": float(position.take_profit) if position.take_profit else None,
+                    "entry_time": position.opened_at,
+                    "entry_value": float(position.entry_value),
+                    "fees_paid": float(position.fees_paid),
+                    "oco_order_id": position.oco_order_id if position.oco_order_id else None,
+                }
+                self.risk_manager.add_open_position(position.user_id, position_data)
+                
+            logger.debug(f"🔄 Reloaded {len(open_positions)} positions to RiskManager for {len(user_ids)} users")
+            
+        except Exception as e:
+            logger.error(f"❌ Error reloading positions to RiskManager: {e}")
 
     async def daily_reset_task(self):
         """Reset daily counters at midnight"""

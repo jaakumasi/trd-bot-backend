@@ -283,6 +283,130 @@ class BinanceService:
             logger.error(f"Error getting account balance: {e}")
             return {}
 
+    def get_all_open_orders(self) -> List[Dict]:
+        """
+        Get all currently open orders from Binance
+        
+        Returns list of open orders for position synchronization
+        """
+        try:
+            # Re-sync time if stale to prevent timestamp errors
+            self._check_and_resync_time()
+            
+            open_orders = self.client.get_open_orders()
+            logger.debug(f"📊 Retrieved {len(open_orders)} open orders from Binance")
+            return open_orders
+            
+        except Exception as e:
+            logger.error(f"❌ Error getting open orders: {e}")
+            
+            # If timestamp error, force immediate re-sync and retry once
+            if "recvWindow" in str(e) or "Timestamp" in str(e):
+                logger.warning("⚠️  Timestamp error detected. Force re-syncing time and retrying...")
+                self._synchronize_time()
+                try:
+                    open_orders = self.client.get_open_orders()
+                    logger.info(f"✅ Retrieved {len(open_orders)} open orders on retry")
+                    return open_orders
+                except Exception as retry_error:
+                    logger.error(f"❌ Retry failed: {retry_error}")
+                    
+            return []
+
+    def get_account_positions(self) -> List[Dict]:
+        """
+        Get all account positions with non-zero balances
+        
+        Returns list of positions for balance-based position tracking
+        """
+        try:
+            account = self.client.get_account()
+            positions = []
+            
+            for balance in account.get("balances", []):
+                asset = balance["asset"]
+                free = float(balance["free"])
+                locked = float(balance["locked"])
+                total = free + locked
+                
+                # Only include positions with actual holdings
+                if total > 0 and asset != "USDT":  # Exclude USDT as it's base currency
+                    positions.append({
+                        "asset": asset,
+                        "free": free,
+                        "locked": locked,
+                        "total": total
+                    })
+                    
+            logger.debug(f"📊 Retrieved {len(positions)} non-zero positions from Binance")
+            return positions
+            
+        except Exception as e:
+            logger.error(f"❌ Error getting account positions: {e}")
+            return []
+
+    def get_order_history(self, symbol: str = None, limit: int = 500) -> List[Dict]:
+        """
+        Get recent order history from Binance for position reconciliation
+        
+        Args:
+            symbol: Specific symbol to get orders for (optional)
+            limit: Number of recent orders to retrieve
+        """
+        try:
+            # Re-sync time if stale to prevent timestamp errors
+            self._check_and_resync_time()
+            
+            if symbol:
+                orders = self.client.get_all_orders(symbol=symbol, limit=limit)
+                logger.debug(f"📊 Retrieved {len(orders)} orders for {symbol} from Binance")
+            else:
+                # Get all recent orders across all symbols
+                # Note: This might be rate-limited, use carefully
+                orders = []
+                open_orders = self.get_all_open_orders()
+                
+                # Extract symbols from open orders to get recent history
+                symbols = set(order["symbol"] for order in open_orders)
+                
+                for sym in symbols:
+                    try:
+                        sym_orders = self.client.get_all_orders(symbol=sym, limit=100)
+                        orders.extend(sym_orders)
+                    except Exception as sym_error:
+                        logger.warning(f"⚠️  Could not get orders for {sym}: {sym_error}")
+                        
+                logger.debug(f"📊 Retrieved {len(orders)} total orders from Binance")
+                
+            return orders
+            
+        except Exception as e:
+            logger.error(f"❌ Error getting order history: {e}")
+            
+            # If timestamp error, force immediate re-sync and retry once
+            if "recvWindow" in str(e) or "Timestamp" in str(e):
+                logger.warning("⚠️  Timestamp error detected. Force re-syncing time and retrying...")
+                self._synchronize_time()
+                try:
+                    if symbol:
+                        orders = self.client.get_all_orders(symbol=symbol, limit=limit)
+                    else:
+                        orders = []
+                        open_orders = self.get_all_open_orders()
+                        symbols = set(order["symbol"] for order in open_orders)
+                        for sym in symbols:
+                            try:
+                                sym_orders = self.client.get_all_orders(symbol=sym, limit=100)
+                                orders.extend(sym_orders)
+                            except Exception:
+                                continue
+                    logger.info(f"✅ Retrieved {len(orders)} orders on retry")
+                    return orders
+                except Exception as retry_error:
+                    logger.error(f"❌ Order history retry failed: {retry_error}")
+                    
+            return []
+
     def get_symbol_price(self, symbol: str) -> float:
         """Get current price for a trading pair"""
         try:
