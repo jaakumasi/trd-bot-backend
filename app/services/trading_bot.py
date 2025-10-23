@@ -1361,17 +1361,28 @@ class TradingBot:
         return None, None
 
     def _infer_from_market_price(self, position: OpenPosition) -> tuple:
-        """Infer exit reason/price from position TP/SL and current market price"""
+        """
+        Infer exit reason/price from position TP/SL and current market price.
+        
+        For BUY positions:
+        - Exit above entry = TAKE_PROFIT (price moved up)
+        - Exit below entry = STOP_LOSS (price moved down)
+        
+        For SELL positions:
+        - Exit below entry = TAKE_PROFIT (price moved down)
+        - Exit above entry = STOP_LOSS (price moved up)
+        """
         symbol = position.symbol
         current_price = self.binance.get_symbol_price(symbol)
         tp_price = float(position.take_profit)
         sl_price = float(position.stop_loss)
+        entry_price = float(position.entry_price)
         
         # Calculate distances from current price
         tp_distance = abs(current_price - tp_price)
         sl_distance = abs(current_price - sl_price)
         
-        # Whichever is closer to current price likely executed
+        # Determine which level is closer
         if tp_distance < sl_distance:
             exit_reason = "TAKE_PROFIT"
             exit_price = tp_price
@@ -1379,9 +1390,35 @@ class TradingBot:
             exit_reason = "STOP_LOSS"
             exit_price = sl_price
         
+        # Validate inference against position direction
+        if position.side == "BUY":
+            # For LONG: TP should be above entry, SL below
+            if exit_reason == "TAKE_PROFIT" and exit_price < entry_price:
+                logger.warning(
+                    f"⚠️ BUY position: Inferred TP ${exit_price:.4f} is below entry ${entry_price:.4f} - correcting to SL"
+                )
+                exit_reason = "STOP_LOSS"
+            elif exit_reason == "STOP_LOSS" and exit_price > entry_price:
+                logger.warning(
+                    f"⚠️ BUY position: Inferred SL ${exit_price:.4f} is above entry ${entry_price:.4f} - correcting to TP"
+                )
+                exit_reason = "TAKE_PROFIT"
+        else:  # SELL position
+            # For SHORT: TP should be below entry, SL above
+            if exit_reason == "TAKE_PROFIT" and exit_price > entry_price:
+                logger.warning(
+                    f"⚠️ SELL position: Inferred TP ${exit_price:.4f} is above entry ${entry_price:.4f} - correcting to SL"
+                )
+                exit_reason = "STOP_LOSS"
+            elif exit_reason == "STOP_LOSS" and exit_price < entry_price:
+                logger.warning(
+                    f"⚠️ SELL position: Inferred SL ${exit_price:.4f} is below entry ${entry_price:.4f} - correcting to TP"
+                )
+                exit_reason = "TAKE_PROFIT"
+        
         logger.info(
             f"✅ Fallback Strategy 2: Inferred {exit_reason} at ${exit_price:.4f} "
-            f"(current: ${current_price:.4f})"
+            f"for {position.side} position (entry: ${entry_price:.4f}, current: ${current_price:.4f})"
         )
         
         return exit_reason, exit_price

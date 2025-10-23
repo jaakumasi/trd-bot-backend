@@ -1046,13 +1046,47 @@ class RiskManager:
         MIN_STOP_LOSS_PCT = 0.008  # 0.8% minimum SL distance (prevents tight stops)
         MIN_TAKE_PROFIT_PCT = 0.012  # 1.2% minimum TP distance (realistic profit)
         MAX_STOP_LOSS_PCT = 0.05   # 5.0% MAXIMUM SL distance (prevents insane stops)
+        
+        # ADAPTIVE STOP WIDENING: Scale stops with volatility regime
+        # Low volatility = widen stops to avoid noise; High volatility = tighter relative stops
+        atr_percentage = (atr / entry_price) * 100
+        
+        if atr_percentage < 0.50:
+            # Very low volatility - widen stops significantly to avoid whipsaw
+            stop_distance_multiplier = 2.0
+            logger.info(
+                f"📏 LOW VOLATILITY (ATR%: {atr_percentage:.2f}%) - "
+                f"Widening stops by {stop_distance_multiplier}x to avoid noise"
+            )
+        elif atr_percentage < 0.70:
+            # Moderate-low volatility - slightly wider stops
+            stop_distance_multiplier = 1.5
+            logger.info(
+                f"📏 MODERATE-LOW VOLATILITY (ATR%: {atr_percentage:.2f}%) - "
+                f"Widening stops by {stop_distance_multiplier}x"
+            )
+        elif atr_percentage > 1.5:
+            # High volatility - tighter relative stops (but still using ATR buffer)
+            stop_distance_multiplier = 1.2
+            logger.info(
+                f"📏 HIGH VOLATILITY (ATR%: {atr_percentage:.2f}%) - "
+                f"Using tighter relative stops ({stop_distance_multiplier}x)"
+            )
+        else:
+            # Optimal volatility range (0.70-1.50%) - normal stops
+            stop_distance_multiplier = 1.5
+            logger.info(
+                f"📏 OPTIMAL VOLATILITY (ATR%: {atr_percentage:.2f}%) - "
+                f"Using standard stops ({stop_distance_multiplier}x ATR buffer)"
+            )
+        
         try:
             side = side.lower()
 
             if side == "buy":
                 # Stop loss: Just below nearest support
                 support = sr_levels["nearest_support"]
-                buffer = atr * 0.5  # Half ATR below support for breathing room
+                buffer = atr * 0.5 * stop_distance_multiplier  # Apply adaptive multiplier
                 stop_loss = support - buffer
 
                 # Take profit: Just below nearest resistance
@@ -1062,7 +1096,7 @@ class RiskManager:
             else:  # sell
                 # Stop loss: Just above nearest resistance
                 resistance = sr_levels["nearest_resistance"]
-                buffer = atr * 0.5
+                buffer = atr * 0.5 * stop_distance_multiplier  # Apply adaptive multiplier
                 stop_loss = resistance + buffer
 
                 # Take profit: Just above nearest support

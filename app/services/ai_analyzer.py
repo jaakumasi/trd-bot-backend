@@ -13,6 +13,8 @@ from .service_constants import (
     AI_SELL_TAKE_PROFIT_RATIO,
     AI_HOLD_STOP_LOSS_RATIO,
     AI_HOLD_TAKE_PROFIT_RATIO,
+    MIN_ATR_PERCENTAGE_FOR_ENTRY,
+    OPTIMAL_ATR_PERCENTAGE_RANGE,
 )
 import logging
 
@@ -249,6 +251,31 @@ class AIAnalyzer:
             prev = df_with_indicators.iloc[-2]
             self._latest_data = latest
 
+            # Step 0: Check minimum volatility requirement (prevent trading in dead markets)
+            if 'atr' in latest.index and 'close' in latest.index:
+                atr = latest['atr']
+                price = latest['close']
+                atr_percentage = (atr / price) * 100 if price > 0 else 0
+                
+                if atr_percentage < MIN_ATR_PERCENTAGE_FOR_ENTRY:
+                    logger.info(
+                        f"🚫 ATR% too low: {atr_percentage:.2f}% < {MIN_ATR_PERCENTAGE_FOR_ENTRY:.2f}% "
+                        f"(minimum threshold). Insufficient volatility for profitable day trading."
+                    )
+                    return self._fallback_analysis(
+                        f"Market too quiet (ATR%: {atr_percentage:.2f}%). "
+                        f"Need at least {MIN_ATR_PERCENTAGE_FOR_ENTRY:.2f}% for viable entries/exits.",
+                        float(latest["close"]),
+                    )
+                
+                # Log if we're in optimal volatility range
+                optimal_low, optimal_high = OPTIMAL_ATR_PERCENTAGE_RANGE
+                if optimal_low <= atr_percentage <= optimal_high:
+                    logger.info(
+                        f"✅ ATR% in optimal range: {atr_percentage:.2f}% "
+                        f"({optimal_low:.2f}%-{optimal_high:.2f}%) - good trading conditions"
+                    )
+
             # Step 1: Check trading quality
             if regime_analysis:
                 trading_quality = regime_analysis.get("trading_quality_score", 0)
@@ -343,6 +370,54 @@ class AIAnalyzer:
             enriched["technical_score"] = technical_score
             enriched["final_confidence"] = min(enriched["confidence"], technical_score)
             enriched["signal_confluence"] = confluence_score
+            
+            # Require momentum confirmation for counter-trend entries
+            signal = enriched.get("signal", "hold").lower()
+            rsi = float(latest.get("rsi", 50))
+            
+            # For BUY signals, RSI must be turning UP (not just oversold)
+            if signal == "buy" and rsi < 30:
+                # Check if RSI is starting to turn up
+                if len(df) >= 3:
+                    rsi_values = df['rsi'].tail(3).values
+                    rsi_current = rsi_values[-1]
+                    rsi_prev = rsi_values[-2]
+                    
+                    # RSI must be turning UP, not just oversold
+                    if rsi_current <= rsi_prev:
+                        logger.warning(
+                            f"⛔ BLOCKED BUY: RSI={rsi:.1f} still falling (no momentum confirmation). "
+                            f"Wait for RSI to turn back UP above 30 before buying oversold conditions."
+                        )
+                        return self._fallback_analysis(
+                            f"BUY blocked - RSI={rsi:.1f} still declining, no momentum reversal confirmed",
+                            float(latest["close"]),
+                        )
+                    else:
+                        logger.info(
+                            f"✅ BUY momentum confirmed: RSI turning up {rsi_prev:.1f}→{rsi_current:.1f}"
+                        )
+            
+            # For SELL signals, RSI must be turning DOWN (not just overbought)
+            if signal == "sell" and rsi > 70:
+                if len(df) >= 3:
+                    rsi_values = df['rsi'].tail(3).values
+                    rsi_current = rsi_values[-1]
+                    rsi_prev = rsi_values[-2]
+                    
+                    if rsi_current >= rsi_prev:
+                        logger.warning(
+                            f"⛔ BLOCKED SELL: RSI={rsi:.1f} still rising (no momentum confirmation). "
+                            f"Wait for RSI to turn back DOWN below 70 before shorting overbought conditions."
+                        )
+                        return self._fallback_analysis(
+                            f"SELL blocked - RSI={rsi:.1f} still rising, no momentum reversal confirmed",
+                            float(latest["close"]),
+                        )
+                    else:
+                        logger.info(
+                            f"✅ SELL momentum confirmed: RSI turning down {rsi_prev:.1f}→{rsi_current:.1f}"
+                        )
 
             # CRITICAL: Enforce directional bias in strong trends
             if regime_analysis:

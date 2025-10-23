@@ -100,22 +100,26 @@ def get_asset_params(symbol: str) -> dict:
 # ============================================================================
 
 # AI analyzer ratios - DAY TRADING with 2:1 minimum R:R (mainnet ready)
-# Updated for sustainable edge after fees and slippage
-AI_BUY_STOP_LOSS_RATIO = 0.993   # ~0.7% below entry
-AI_BUY_TAKE_PROFIT_RATIO = 1.014  # ~1.4% above entry (2:1 R:R baseline)
-AI_SELL_STOP_LOSS_RATIO = 1.007   # ~0.7% above entry
-AI_SELL_TAKE_PROFIT_RATIO = 0.986  # ~1.4% below entry
-AI_HOLD_STOP_LOSS_RATIO = 0.993
-AI_HOLD_TAKE_PROFIT_RATIO = 1.014
+# Updated for realistic stops based on ATR (1.5% stop, 3.0% target)
+AI_BUY_STOP_LOSS_RATIO = 0.985   # ~1.5% below entry (1.5x ATR for BTC)
+AI_BUY_TAKE_PROFIT_RATIO = 1.030  # ~3.0% above entry (2:1 R:R after fees)
+AI_SELL_STOP_LOSS_RATIO = 1.015   # ~1.5% above entry
+AI_SELL_TAKE_PROFIT_RATIO = 0.970  # ~3.0% below entry
+AI_HOLD_STOP_LOSS_RATIO = 0.985
+AI_HOLD_TAKE_PROFIT_RATIO = 1.030
 
 # Risk management thresholds - DAY TRADING
 MIN_SIGNAL_CONFIDENCE = 70
 MIN_ACCOUNT_BALANCE = 10.0
-MAX_BALANCE_TRADE_RATIO = 0.03  # Max 3% of balance per position (conservative mainnet)
+MAX_BALANCE_TRADE_RATIO = 0.01  # Max 1% of balance per position
 MIN_TRADE_VALUE = 10.0
 DEFAULT_RISK_PERCENTAGE = 1.0  # 1% rule: max risk per trade
-DEFAULT_MAX_DAILY_TRADES = 5  # Quality over quantity (was 10)
+DEFAULT_MAX_DAILY_TRADES = 5  # Quality over quantity
 MAX_OPEN_POSITIONS = 3  # Maximum concurrent open positions per user
+
+# Volatility requirements - DAY TRADING (prevent trading in dead markets)
+MIN_ATR_PERCENTAGE_FOR_ENTRY = 0.40  # Don't trade if ATR% < 0.40% (insufficient movement)
+OPTIMAL_ATR_PERCENTAGE_RANGE = (0.50, 1.20)  # Sweet spot for day trading
 
 # Trading cadence - DAY TRADING
 ANALYSIS_RATE_LIMIT_SECONDS = 300  # 5 minutes between analyses (was 30s)
@@ -143,10 +147,10 @@ SR_STRENGTH_DECAY = 0.9  # Decay factor for older levels
 
 # Regime filter settings - DAY TRADING
 REGIME_ADX_TRENDING_THRESHOLD = 20  # ADX > 20 = trending (was 25 for high-frequency trading)
-REGIME_ADX_STRONG_TREND_THRESHOLD = 30  # ADX > 30 = strong trend
+REGIME_ADX_STRONG_TREND_THRESHOLD = 40  # ADX > 40 = strong trend (block counter-trend trades)
 REGIME_ALLOW_RANGING = True  # Allow trades in range-bound markets
 REGIME_MIN_CONFLUENCE_TRENDING = 55  # Reduced from 60 for more opportunities
-REGIME_MIN_CONFLUENCE_RANGING = 55  # Unified threshold for all regimes (reduced from 60)
+REGIME_MIN_CONFLUENCE_RANGING = 60  # Higher threshold to avoid false ranges
 
 # Numerical safety helpers
 EIGHT_DECIMAL_PLACES = 100_000_000
@@ -167,6 +171,8 @@ __all__ = [
     "DEFAULT_RISK_PERCENTAGE",
     "DEFAULT_MAX_DAILY_TRADES",
     "MAX_OPEN_POSITIONS",
+    "MIN_ATR_PERCENTAGE_FOR_ENTRY",
+    "OPTIMAL_ATR_PERCENTAGE_RANGE",
     "ANALYSIS_RATE_LIMIT_SECONDS",
     "TRADING_CYCLE_DELAY_SECONDS",
     "POSITION_TIMEOUT_MINUTES",

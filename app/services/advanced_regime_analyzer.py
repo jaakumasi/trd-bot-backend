@@ -103,22 +103,46 @@ class AdvancedRegimeAnalyzer:
             # 3. Volatility Clustering Factor (0-100)
             volatility_clustering = self._calculate_volatility_clustering(df)
             
-            # 4. Mean Reversion Opportunity Score (0-100)
-            mean_reversion_score = self._calculate_mean_reversion_opportunity(df)
+            # 4. Mean Reversion Opportunity Score (0-100) - with trend penalty
+            mean_reversion_score = self._calculate_mean_reversion_opportunity(df, adx=adx)
             
-            # 5. Dynamic Trading Quality Score (0-100)
+            # 5. ADX-ATR Coherence Check (detect choppiness)
+            adx_atr_coherence = self._check_adx_atr_coherence(adx, atr_percentage)
+            
+            # 6. Dynamic Trading Quality Score (0-100)
             trading_quality = self._calculate_trading_quality(
                 regime, trend_strength, atr_percentage, momentum_persistence,
                 order_flow_imbalance, volatility_clustering, mean_reversion_score
             )
             
-            # 6. Adaptive Confluence Threshold
+            # Apply coherence penalty to trading quality
+            if adx_atr_coherence < 50:
+                original_quality = trading_quality
+                trading_quality *= (adx_atr_coherence / 100)
+                logger.warning(
+                    f"🚨 Trading quality penalized for ADX-ATR incoherence: "
+                    f"{original_quality:.0f} → {trading_quality:.0f} "
+                    f"(coherence: {adx_atr_coherence:.0f}/100)"
+                )
+            
+            # 7. Adaptive Confluence Threshold
             dynamic_threshold = self._calculate_dynamic_confluence_threshold(
                 trading_quality, volatility_clustering
             )
             
-            # === TRADING PERMISSION (now based on quality score) ===
-            allow_trading = trading_quality >= 50  # Quality-based, not binary regime check
+            # Block counter-trend trades in strong trends ===
+            # If ADX > 40 and regime is RANGE_BOUND, it's actually a FALSE RANGE (trending)
+            # Mean reversion trades in strong trends are statistically losing strategies
+            if regime == "RANGE_BOUND" and adx > 40:
+                logger.warning(
+                    f"🚫 FALSE RANGE DETECTED: ADX={adx:.1f} > 40 indicates actual trending market. "
+                    f"Blocking counter-trend mean reversion trades to prevent catching falling knives."
+                )
+                allow_trading = False
+                trading_quality = min(trading_quality, 35)  # Cap quality for false ranges
+            else:
+                # === TRADING PERMISSION (now based on quality score) ===
+                allow_trading = trading_quality >= 50  # Quality-based, not binary regime check
             
             # Calculate confidence
             confidence = self._calculate_advanced_confidence(
@@ -146,6 +170,7 @@ class AdvancedRegimeAnalyzer:
                 "order_flow_imbalance": order_flow_imbalance,
                 "volatility_clustering": volatility_clustering,
                 "mean_reversion_score": mean_reversion_score,
+                "adx_atr_coherence": adx_atr_coherence,
                 "trading_quality_score": trading_quality,
                 "dynamic_confluence_threshold": dynamic_threshold,
                 
@@ -293,12 +318,14 @@ class AdvancedRegimeAnalyzer:
         
         return clustering_score
     
-    def _calculate_mean_reversion_opportunity(self, df: pd.DataFrame) -> float:
+    def _calculate_mean_reversion_opportunity(self, df: pd.DataFrame, regime: str = None, adx: float = None) -> float:
         """
         Identify when price has stretched too far from mean (day trading opportunity!).
         
         Uses Bollinger Bands + RSI + price vs SMA deviation to find extremes.
         High score = excellent mean reversion day trading opportunity
+        
+        Penalize mean reversion in strong trends (ADX > 40)
         
         Returns: 0-100 score
         """
@@ -351,6 +378,17 @@ class AdvancedRegimeAnalyzer:
                     score += 20
                 elif price_deviation_pct > 0.5:
                     score += 10
+        
+        # CRITICAL FIX: Penalize mean reversion in strong trends
+        # Mean reversion only works in TRUE RANGES, not trending markets
+        if adx is not None and adx > 40:
+            penalty_factor = min(0.3, (adx - 40) / 100)  # Up to 70% penalty
+            original_score = score
+            score *= (1 - penalty_factor)
+            logger.debug(
+                f"⚠️  Mean reversion penalty applied: ADX={adx:.1f} | "
+                f"Original={original_score:.0f} → Penalized={score:.0f}"
+            )
         
         return min(100, score)
     
@@ -494,6 +532,50 @@ class AdvancedRegimeAnalyzer:
             return "10-20"  # Moderate momentum
         else:
             return "5-15"  # Quick trades
+    
+    def _check_adx_atr_coherence(self, adx: float, atr_percentage: float) -> float:
+        """
+        Check if ADX and ATR% are coherent (both agree on market state).
+        
+        PROBLEM: High ADX (60-70) + Low ATR% (0.30-0.50%) = CHOPPY WHIPSAW
+        - High ADX suggests strong trend
+        - Low ATR% suggests no meaningful movement
+        - This paradox = range-bound chop that kills day traders
+        
+        SOLUTION: Penalize when ADX and volatility disagree
+        
+        Returns: 0-100 coherence score (100 = perfect agreement, 0 = total conflict)
+        """
+        # Expected relationship: Strong trend (high ADX) should have decent volatility
+        # Weak trend (low ADX) can have any volatility (consolidation or ranging)
+        
+        if adx < 25:
+            # Low ADX = no strong trend, any volatility is fine
+            return 100.0
+        
+        if adx >= 25 and atr_percentage >= 0.50:
+            # High ADX + decent volatility = coherent trending market
+            return 100.0
+        
+        if adx >= 40 and atr_percentage < 0.40:
+            # Very high ADX + very low volatility = CHOPPY WHIPSAW (worst case)
+            logger.warning(
+                f"⚠️ ADX-ATR INCOHERENCE DETECTED: ADX={adx:.1f} but ATR%={atr_percentage:.2f}% "
+                f"This is choppy range-bound action, NOT a clean trend!"
+            )
+            return 20.0  # Severe penalty
+        
+        if adx >= 25 and atr_percentage < 0.50:
+            # Moderate ADX + low volatility = minor choppiness
+            penalty = ((adx - 25) / 50) * 100  # Scale penalty with ADX strength
+            coherence = max(40, 100 - penalty)
+            logger.info(
+                f"⚡ Moderate ADX-ATR incoherence: ADX={adx:.1f}, ATR%={atr_percentage:.2f}% "
+                f"Coherence={coherence:.0f}/100"
+            )
+            return coherence
+        
+        return 100.0
     
     # === HELPER METHODS (from original implementation) ===
     
