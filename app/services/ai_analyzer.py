@@ -303,10 +303,10 @@ class AIAnalyzer:
                     (regime in ["BEAR_TREND", "BULL_TREND"] and confidence > 70)
                 ):
                     logger.warning(
-                        f"⛔ BLOCKED: Mean reversion in strong trend - "
+                        "⛔ BLOCKED: Mean reversion in strong trend - "
                         f"Regime: {regime} ({confidence}% confidence), "
                         f"ADX: {trend_strength:.1f}, Edge: {trading_edge}. "
-                        f"This is a strong directional move, NOT a bounce opportunity!"
+                        "This is a strong directional move, NOT a bounce opportunity!"
                     )
                     return self._fallback_analysis(
                         f"Mean reversion blocked in strong {regime} (ADX: {trend_strength:.1f}). "
@@ -499,34 +499,33 @@ class AIAnalyzer:
         self, df: pd.DataFrame, regime_analysis: Optional[Dict]
     ) -> int:
         """
-        Simplified multi-factor signal confluence scoring to reduce overfitting.
+        Enhanced multi-factor signal confluence scoring.
 
-        Uses only 3 CORE factors:
-        - Trend alignment (price vs SMAs) - 40 points
-        - Momentum confirmation (MACD + RSI) - 30 points  
-        - Regime appropriateness - 30 points
-
-        Volume is integrated into these factors, not scored separately.
+        Uses these CORE factors:
+        - Trend Alignment (30 points): Is price action aligned with the broader trend?
+        - Momentum Confirmation (30 points): Is momentum supporting the desired direction?
+        - Volume Support (20 points): Is volume confirming the move?
+        - Regime Appropriateness (20 points): Is the current market regime suitable for this trade?
         
         Returns: 0-100 score (>60 required for trade)
         """
         score = 0
         latest = df.iloc[-1]
 
-        # Factor 1: Trend Alignment (40 points)
+        # Factor 1: Trend Alignment (30 points)
         sma_20 = latest.get("sma_20", np.nan)
         sma_50 = latest.get("sma_50", np.nan)
         price = latest.get("close", 0)
 
         if not pd.isna(sma_20) and not pd.isna(sma_50):
-            if sma_20 > sma_50 and price > sma_20:  # Bullish alignment
-                score += 40
-            elif sma_20 < sma_50 and price < sma_20:  # Bearish alignment
-                score += 40
-            elif sma_20 > sma_50 and price > sma_50:  # Partial bull
-                score += 25
-            elif sma_20 < sma_50 and price < sma_50:  # Partial bear
-                score += 25
+            if sma_20 > sma_50 and price > sma_20:  # Strong Bullish
+                score += 30
+            elif sma_20 < sma_50 and price < sma_20:  # Strong Bearish
+                score += 30
+            elif sma_20 > sma_50 and price > sma_50:  # Partial Bullish
+                score += 15
+            elif sma_20 < sma_50 and price < sma_50:  # Partial Bearish
+                score += 15
 
         # Factor 2: Momentum Confirmation (30 points)
         rsi = latest.get("rsi", 50)
@@ -534,44 +533,42 @@ class AIAnalyzer:
         macd_signal = latest.get("macd_signal", 0)
 
         if not pd.isna(rsi) and not pd.isna(macd):
-            # MACD aligned with trend (primary signal)
-            if macd > macd_signal and rsi > 45:  # Bullish momentum (loosened from RSI>50)
+            if macd > macd_signal and rsi > 50:  # Bullish Momentum
                 score += 30
-            elif macd < macd_signal and rsi < 55:  # Bearish momentum (loosened from RSI<50)
+            elif macd < macd_signal and rsi < 50:  # Bearish Momentum
                 score += 30
-            elif macd > macd_signal or rsi > 50:  # Partial bullish
+            elif macd > macd_signal or rsi > 50:  # Partial Bullish
                 score += 15
-            elif macd < macd_signal or rsi < 50:  # Partial bearish
+            elif macd < macd_signal or rsi < 50:  # Partial Bearish
                 score += 15
 
-        # Factor 3: Regime Appropriateness (30 points)
+        # Factor 3: Volume Support (20 points)
+        volume = latest.get("volume", 0)
+        volume_sma = latest.get("volume_sma", 0)
+        if not pd.isna(volume) and not pd.isna(volume_sma) and volume_sma > 0:
+            volume_ratio = volume / volume_sma
+            if volume_ratio > 1.5:  # High volume confirmation
+                score += 20
+            elif volume_ratio > 1.1:  # Moderate volume confirmation
+                score += 10
+
+        # Factor 4: Regime Appropriateness (20 points)
         if regime_analysis:
-            regime = regime_analysis.get("regime")
-            trend_strength = regime_analysis.get("trend_strength", 0)
-            atr_percentage = regime_analysis.get("atr_percentage", 0)
-
-            # Use trading quality score if available (from advanced analyzer)
             trading_quality = regime_analysis.get("trading_quality_score")
-
             if trading_quality is not None:
-                # Use quality score with adaptive scaling (reduces overfitting)
-                # Quality 0-100 maps to 0-30 points
-                score += int(trading_quality * 0.3)
-
+                # Quality 0-100 maps to 0-20 points
+                score += int(trading_quality * 0.2)
             else:
-                # Simplified regime scoring (less punitive)
+                # Fallback for older regime analyzer
+                regime = regime_analysis.get("regime")
                 if regime in ["BULL_TREND", "BEAR_TREND"]:
-                    score += 30
+                    score += 20
                 elif regime == "RANGE_BOUND":
-                    score += 20  # Range trading can work!
-                elif regime == "HIGH_VOLATILITY":
-                    score += 10  # High vol = high opportunity (if managed)
-                elif regime == "LOW_VOLATILITY":
-                    score += 15  # Low vol = safer, but slower
+                    score += 10
 
         final_score = max(0, min(100, score))
 
-        logger.info(f"📊 Signal Confluence Score: {final_score}/100 (Simplified 3-factor model)")
+        logger.info(f"📊 Signal Confluence Score: {final_score}/100 (4-factor model)")
 
         return final_score
 
@@ -1194,6 +1191,7 @@ CURRENT MARKET REGIME:
 {json.dumps(regime_analysis, indent=2) if regime_analysis else 'No regime data available'}
 
 TRADING STYLE: Day Trading
+- Desired R:R Ratio: At least 2:1
 - Holding period: 30 minutes to 8 hours
 - Risk-Reward: Minimum 1:1.5, target 1:2 or better
 - Quality over quantity: Only high-probability setups
@@ -1245,11 +1243,11 @@ Provide your analysis in JSON format:
   "confidence": 0-100,
   "reasoning": "Explain multi-timeframe alignment and why this is a high-quality setup",
   "entry_price": <suggested entry>,
-  "stop_loss": <suggested stop>,
-  "take_profit": <suggested target>,
+  "stop_loss": <suggested stop loss price (e.g., 0.5% from entry)>,
+  "take_profit": <suggested take profit price (e.g., 1.0% from entry, ensuring at least 2:1 R:R)>,
   "timeframe_alignment": "describe how 15m, 1h, and 5m align"
 }
 
-IMPORTANT: Only recommend buy/sell if you see strong multi-timeframe alignment and high probability. Default to "hold" if uncertain.
+IMPORTANT: Only recommend buy/sell if you see strong multi-timeframe alignment and high probability. Default to "hold" if uncertain. Under NO circumstances should you issue a 'buy' signal if the regime is BEAR_TREND with ADX > 30. The same applies to 'sell' signals in a BULL_TREND.
 """
         return prompt

@@ -122,9 +122,9 @@ MIN_ATR_PERCENTAGE_FOR_ENTRY = 0.40  # Don't trade if ATR% < 0.40% (insufficient
 OPTIMAL_ATR_PERCENTAGE_RANGE = (0.50, 1.20)  # Sweet spot for day trading
 
 # Trading cadence - DAY TRADING
-ANALYSIS_RATE_LIMIT_SECONDS = 300  # 5 minutes between analyses (was 30s)
-TRADING_CYCLE_DELAY_SECONDS = 300  # 5-minute cycles (was 60s)
-POSITION_TIMEOUT_MINUTES = 480  # 8 hours max hold (was 60 min)
+ANALYSIS_RATE_LIMIT_SECONDS = 300  # 5 minutes between analyses 
+TRADING_CYCLE_DELAY_SECONDS = 300  # 5-minute cycles
+POSITION_TIMEOUT_MINUTES = 480  # 8 hours max hold 
 
 # Multi-timeframe analysis windows
 MTF_PRIMARY_INTERVAL = "15m"    # Entry signals
@@ -146,8 +146,9 @@ SR_MIN_TOUCHES = 2  # Minimum touches to validate a level
 SR_STRENGTH_DECAY = 0.9  # Decay factor for older levels
 
 # Regime filter settings - DAY TRADING
-REGIME_ADX_TRENDING_THRESHOLD = 20  # ADX > 20 = trending (was 25 for high-frequency trading)
-REGIME_ADX_STRONG_TREND_THRESHOLD = 40  # ADX > 40 = strong trend (block counter-trend trades)
+# ADJUSTED: Raised thresholds to reduce false RANGE_BOUND classifications
+REGIME_ADX_TRENDING_THRESHOLD = 25  # ADX > 25 = trending
+REGIME_ADX_STRONG_TREND_THRESHOLD = 45  # ADX > 45 = strong trend
 REGIME_ALLOW_RANGING = True  # Allow trades in range-bound markets
 REGIME_MIN_CONFLUENCE_TRENDING = 55  # Reduced from 60 for more opportunities
 REGIME_MIN_CONFLUENCE_RANGING = 60  # Higher threshold to avoid false ranges

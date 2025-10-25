@@ -116,7 +116,15 @@ class AdvancedRegimeAnalyzer:
             )
             
             # Apply coherence penalty to trading quality
-            if adx_atr_coherence < 50:
+            if adx_atr_coherence < 40: # Stricter threshold for hard filter
+                logger.error(
+                    f"🚨 HARD FILTER: ADX-ATR incoherence detected! "
+                    f"ADX={adx:.1f}, ATR%={atr_percentage:.2f}%, Coherence={adx_atr_coherence:.0f}/100. "
+                    f"This indicates a choppy, untradable market. Forcing HOLD."
+                )
+                trading_quality = 0 # Force quality to 0 to prevent trading
+                allow_trading = False
+            elif adx_atr_coherence < 50:
                 original_quality = trading_quality
                 trading_quality *= (adx_atr_coherence / 100)
                 logger.warning(
@@ -130,23 +138,24 @@ class AdvancedRegimeAnalyzer:
                 trading_quality, volatility_clustering
             )
             
-            # Block counter-trend trades in strong trends ===
-            # If ADX > 40 and regime is RANGE_BOUND, it's actually a FALSE RANGE (trending)
-            # Mean reversion trades in strong trends are statistically losing strategies
+            # === DETECT FALSE RANGES (Strong ADX but classified as RANGE_BOUND) ===
+            # If ADX > 40 and regime is RANGE_BOUND, it's likely a FALSE RANGE (actually trending)
+            # Apply penalty instead of complete block to allow strong AI signals to override
             if regime == "RANGE_BOUND" and adx > 40:
                 logger.warning(
-                    f"🚫 FALSE RANGE DETECTED: ADX={adx:.1f} > 40 indicates actual trending market. "
-                    f"Blocking counter-trend mean reversion trades to prevent catching falling knives."
+                    f"⚠️  POTENTIAL FALSE RANGE: ADX={adx:.1f} > 40 suggests trending market despite RANGE classification. "
+                    f"Applying 15% quality penalty but allowing strong signals to proceed."
                 )
-                allow_trading = False
-                trading_quality = min(trading_quality, 35)  # Cap quality for false ranges
-            else:
-                # === TRADING PERMISSION (now based on quality score) ===
-                allow_trading = trading_quality >= 50  # Quality-based, not binary regime check
+                # Apply penalty instead of hard block - allows AI override for exceptional signals
+                trading_quality *= 0.85  # 15% penalty for false range risk
+            
+            # === TRADING PERMISSION (quality-based with lower threshold) ===
+            # Lowered from 50 to 40 for day trading to capture more valid opportunities
+            allow_trading = trading_quality >= 40  # More permissive for mainnet deployment
             
             # Calculate confidence
             confidence = self._calculate_advanced_confidence(
-                df, regime, trend_strength, volatility_percentile,
+                regime, trend_strength, volatility_percentile,
                 trading_quality, momentum_persistence
             )
             
@@ -318,7 +327,7 @@ class AdvancedRegimeAnalyzer:
         
         return clustering_score
     
-    def _calculate_mean_reversion_opportunity(self, df: pd.DataFrame, regime: str = None, adx: float = None) -> float:
+    def _calculate_mean_reversion_opportunity(self, df: pd.DataFrame, adx: float = None) -> float:
         """
         Identify when price has stretched too far from mean (day trading opportunity!).
         
@@ -605,8 +614,14 @@ class AdvancedRegimeAnalyzer:
         trend_strength: float, price_vs_sma20: float,
         sma_alignment: str, volume_trend: str
     ) -> str:
-        # Strong trend detection first
-        if trend_strength > 35:
+        """
+        IMPROVED: Adjusted ADX thresholds to reduce false RANGE_BOUND classifications.
+        - Raised trending threshold from 20 to 25 ADX
+        - Raised strong trend threshold from 35 to 40 ADX
+        - Better captures moderate trends (25-40 ADX) that were falling through as RANGE_BOUND
+        """
+        # Strong trend detection first (raised from 35 to 40)
+        if trend_strength > 40:
             return self._classify_trend_direction(sma_alignment, price_vs_sma20, volume_trend)
         
         # High volatility check
@@ -617,8 +632,9 @@ class AdvancedRegimeAnalyzer:
         if atr_percentage < self.volatility_threshold_low and volatility_percentile < 20:
             return "LOW_VOLATILITY"
         
-        # Moderate trend detection
-        if trend_strength > 20:
+        # Moderate trend detection (raised from 20 to 25)
+        # This catches ADX 25-40 which are valid trends
+        if trend_strength > 25:
             return self._classify_trend_direction(sma_alignment, price_vs_sma20, volume_trend)
         
         return "RANGE_BOUND"
@@ -637,23 +653,31 @@ class AdvancedRegimeAnalyzer:
         return "RANGE_BOUND"
     
     def _calculate_advanced_confidence(
-        self, df: pd.DataFrame, regime: str, trend_strength: float,
+        self, regime: str, trend_strength: float,
         volatility_percentile: float, trading_quality: float,
         momentum_persistence: float
 ) -> float:
         confidence = 50.0
+
+        # Regime Factor
+        if regime in ["BULL_TREND", "BEAR_TREND"]:
+            confidence += 15  # Higher confidence in clear trends
+        elif regime == "RANGE_BOUND":
+            confidence -= 5  # Slightly lower confidence in ranges
+        elif regime in ["HIGH_VOLATILITY", "LOW_VOLATILITY"]:
+            confidence -= 10 # Lower confidence in tricky conditions
         
         # Trend strength factor
         if trend_strength > 40:
-            confidence += 25
-        elif trend_strength > 25:
             confidence += 15
+        elif trend_strength > 25:
+            confidence += 10
         elif trend_strength < 15:
             confidence -= 10
         
         # Volatility consistency factor
         if 30 < volatility_percentile < 70:
-            confidence += 15
+            confidence += 10
         elif volatility_percentile > 90 or volatility_percentile < 10:
             confidence -= 10
         

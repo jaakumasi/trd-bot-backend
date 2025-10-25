@@ -358,19 +358,12 @@ class TradingBot:
             )
 
             trading_quality = regime_analysis.get("trading_quality_score", 0)
-            if trading_quality < 50:
-                logger.info(
-                    f"🚫 [User {user_id}] Low trading quality: {trading_quality}/100 - Regime: {regime_analysis.get('regime')} | "
-                    f"ADX: {regime_analysis.get('trend_strength', 0):.1f} | "
-                    f"ATR%: {regime_analysis.get('atr_percentage', 0):.2f}%"
-                )
-                return
-
+            
             # Day trading: Focus on current market conditions, not historical performance
             # Historical data can create bias and hesitation in fast-moving markets
             user_trade_history = None  # Disabled for day trading
 
-            # AI analysis with multi-timeframe context
+            # AI analysis with multi-timeframe context (BEFORE quality check to allow AI override)
             ai_signal = await self._request_ai_signal_mtf(
                 symbol,
                 primary_data,
@@ -389,9 +382,34 @@ class TradingBot:
             self._log_ai_analysis(user_id, symbol, signal_details, current_price)
             await self._emit_ai_analysis(user_id, symbol, signal_details)
 
-            if signal_details["signal"] == "hold":
+            # AI Override Logic: Allow strong AI signals (≥90 confidence) to bypass quality check
+            ai_confidence = signal_details.get("confidence", 0)
+            signal_action = signal_details["signal"]
+            
+            if signal_action == "hold":
                 logger.debug(f"⏸️  [User {user_id}] HOLD signal - no action taken")
                 return
+            
+            # Quality check with AI override for exceptional signals
+            if trading_quality < 50:
+                if ai_confidence >= 90 and signal_action in ["buy", "sell"]:
+                    logger.warning(
+                        f"🚨 [User {user_id}] AI OVERRIDE: High confidence signal ({ai_confidence}%) bypassing quality filter | "
+                        f"Quality: {trading_quality}/100 | Regime: {regime_analysis.get('regime')} | "
+                        f"Signal: {signal_action.upper()}"
+                    )
+                    metrics_logger.info(
+                        f"AI_OVERRIDE | USER={user_id} | QUALITY={trading_quality} | "
+                        f"CONFIDENCE={ai_confidence} | SIGNAL={signal_action.upper()}"
+                    )
+                else:
+                    logger.info(
+                        f"🚫 [User {user_id}] Low trading quality: {trading_quality}/100 - Regime: {regime_analysis.get('regime')} | "
+                        f"ADX: {regime_analysis.get('trend_strength', 0):.1f} | "
+                        f"ATR%: {regime_analysis.get('atr_percentage', 0):.2f}% | "
+                        f"AI Confidence: {ai_confidence}% (needs ≥90% to override)"
+                    )
+                    return
 
             logger.info(
                 f"🎯 [User {user_id}] TRADE SIGNAL DETECTED: {signal_details['signal'].upper()}"
@@ -1311,24 +1329,21 @@ class TradingBot:
         """
         Fallback method to extract exit details when primary extraction fails.
         
-        Attempts two strategies:
-        1. Check individual order details in OCO status for executedQty > 0
-        2. Infer from position's TP/SL prices and current market price
-        
-        Returns:
-            tuple: (exit_reason, exit_price) or (None, None) if all strategies fail
+        Attempts to find an executed order in the OCO status report. If it fails,
+        it returns None, allowing the system to proceed with a manual market close,
+        which correctly determines the exit reason based on P&L.
         """
         try:
             logger.info(f"🔍 Attempting fallback exit detail extraction for {position.symbol}")
             
-            # Strategy 1: Find executed order in OCO status
+            # Strategy: Find executed order in OCO status
             orders = oco_status.get("orders", [])
             result = self._extract_from_executed_order(orders)
             if result != (None, None):
                 return result
             
-            # Strategy 2: Infer from position TP/SL and current market price
-            return self._infer_from_market_price(position)
+            logger.warning(f"⚠️  Fallback extraction failed for OCO {position.oco_order_id}. Manual closure will be required.")
+            return None, None
             
         except Exception as e:
             logger.error(f"❌ Fallback exit detail extraction failed: {e}")
@@ -1360,68 +1375,6 @@ class TradingBot:
         
         return None, None
 
-    def _infer_from_market_price(self, position: OpenPosition) -> tuple:
-        """
-        Infer exit reason/price from position TP/SL and current market price.
-        
-        For BUY positions:
-        - Exit above entry = TAKE_PROFIT (price moved up)
-        - Exit below entry = STOP_LOSS (price moved down)
-        
-        For SELL positions:
-        - Exit below entry = TAKE_PROFIT (price moved down)
-        - Exit above entry = STOP_LOSS (price moved up)
-        """
-        symbol = position.symbol
-        current_price = self.binance.get_symbol_price(symbol)
-        tp_price = float(position.take_profit)
-        sl_price = float(position.stop_loss)
-        entry_price = float(position.entry_price)
-        
-        # Calculate distances from current price
-        tp_distance = abs(current_price - tp_price)
-        sl_distance = abs(current_price - sl_price)
-        
-        # Determine which level is closer
-        if tp_distance < sl_distance:
-            exit_reason = "TAKE_PROFIT"
-            exit_price = tp_price
-        else:
-            exit_reason = "STOP_LOSS"
-            exit_price = sl_price
-        
-        # Validate inference against position direction
-        if position.side == "BUY":
-            # For LONG: TP should be above entry, SL below
-            if exit_reason == "TAKE_PROFIT" and exit_price < entry_price:
-                logger.warning(
-                    f"⚠️ BUY position: Inferred TP ${exit_price:.4f} is below entry ${entry_price:.4f} - correcting to SL"
-                )
-                exit_reason = "STOP_LOSS"
-            elif exit_reason == "STOP_LOSS" and exit_price > entry_price:
-                logger.warning(
-                    f"⚠️ BUY position: Inferred SL ${exit_price:.4f} is above entry ${entry_price:.4f} - correcting to TP"
-                )
-                exit_reason = "TAKE_PROFIT"
-        else:  # SELL position
-            # For SHORT: TP should be below entry, SL above
-            if exit_reason == "TAKE_PROFIT" and exit_price > entry_price:
-                logger.warning(
-                    f"⚠️ SELL position: Inferred TP ${exit_price:.4f} is above entry ${entry_price:.4f} - correcting to SL"
-                )
-                exit_reason = "STOP_LOSS"
-            elif exit_reason == "STOP_LOSS" and exit_price < entry_price:
-                logger.warning(
-                    f"⚠️ SELL position: Inferred SL ${exit_price:.4f} is below entry ${entry_price:.4f} - correcting to TP"
-                )
-                exit_reason = "TAKE_PROFIT"
-        
-        logger.info(
-            f"✅ Fallback Strategy 2: Inferred {exit_reason} at ${exit_price:.4f} "
-            f"for {position.side} position (entry: ${entry_price:.4f}, current: ${current_price:.4f})"
-        )
-        
-        return exit_reason, exit_price
 
     async def _handle_oco_executing(
         self, db: AsyncSession, position: OpenPosition
@@ -1494,7 +1447,7 @@ class TradingBot:
             profit_loss_pct = (profit_loss / float(position.entry_value)) * 100
             duration = (datetime.now(timezone.utc) - position.opened_at).total_seconds()
 
-            # Infer exit reason based on P&L
+            # Determine exit reason definitively from P&L
             exit_reason = "TAKE_PROFIT" if profit_loss > 0 else "STOP_LOSS"
 
             logger.info(f"🔧 [User {user_id}] Manual close details:")
