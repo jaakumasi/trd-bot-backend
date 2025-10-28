@@ -32,6 +32,8 @@ class RiskManager:
         self.daily_trade_count = {}
         self.open_positions = {}  # {user_id: [position_objects]}
         self.current_volatility_percentile = None  # Store latest volatility reading
+        self.last_regime_change_time = datetime.now(timezone.utc)  # Track regime changes for whipsaw protection
+        self.last_regime = None  # Track last known regime
 
     def calculate_position_size(
         self,
@@ -96,14 +98,14 @@ class RiskManager:
                 position_size,
             )
 
-            # SAFETY CAP: Position value should not exceed 3% of balance
+            # SAFETY CAP: Position value should not exceed MAX_BALANCE_TRADE_RATIO of balance
             # This prevents over-concentration in a single trade
             position_value = position_size * entry
-            max_position_value = balance * MAX_BALANCE_TRADE_RATIO  # 3% from constants
+            max_position_value = balance * MAX_BALANCE_TRADE_RATIO
 
             if position_value > max_position_value:
                 logger.warning(
-                    f"⚠️ Position value (${position_value:.2f}) exceeds 3%% cap (${max_position_value:.2f})"
+                    f"⚠️ Position value (${position_value:.2f}) exceeds {MAX_BALANCE_TRADE_RATIO*100:.1f}%% cap (${max_position_value:.2f})"
                 )
                 position_size = max_position_value / entry
                 position_value = position_size * entry
@@ -247,6 +249,352 @@ class RiskManager:
         
         return final_threshold
 
+    def validate_entry_timing(
+        self, signal: Dict, market_df, regime_analysis: Optional[Dict]
+    ) -> Tuple[bool, str]:
+        """
+        PRIORITY 1: Validate entry timing with momentum confirmation.
+        
+        Prevents taking trades at the worst possible moment (extended moves, no confirmation).
+        Professional traders wait for confirmation before entering, not chase moves.
+        
+        Entry Requirements:
+        1. Price not overextended (within 1.5 ATR of SMA20)
+        2. Volume confirmation (>1.5x average on recent candles)
+        3. Momentum confirmation (2-3 candles in trade direction)
+        4. No entries within 30 mins of regime change (avoid whipsaws)
+        
+        Returns:
+            (is_valid, reason) tuple
+        """
+        if market_df is None or market_df.empty or len(market_df) < 20:
+            return True, "Insufficient data for entry timing validation"
+        
+        signal_action = signal.get("signal", "hold").lower()
+        if signal_action == "hold":
+            return True, "Hold signal"
+        
+        try:
+            latest = market_df.iloc[-1]
+            recent = market_df.tail(5)
+            
+            entry_price = latest['close']
+            sma_20 = latest.get('sma_20', entry_price)
+            atr = latest.get('atr', entry_price * 0.01)
+            volume = latest.get('volume', 0)
+            volume_sma = latest.get('volume_sma', volume)
+            
+            # CHECK 1: Price not overextended from SMA20
+            distance_from_sma = abs(entry_price - sma_20)
+            max_distance = atr * 1.5
+            
+            if distance_from_sma > max_distance:
+                extension_pct = (distance_from_sma / entry_price) * 100
+                return False, (
+                    f"🚫 Price overextended {extension_pct:.2f}% from SMA20 "
+                    f"(max allowed: {(max_distance/entry_price)*100:.2f}%). "
+                    f"Chasing extended moves = high probability of reversal. Wait for pullback."
+                )
+            
+            # CHECK 2: Volume confirmation (>1.5x average)
+            if volume > 0 and volume_sma > 0:
+                volume_ratio = volume / volume_sma
+                if volume_ratio < 1.5:
+                    return False, (
+                        f"🚫 Insufficient volume confirmation (ratio: {volume_ratio:.2f}x, need 1.5x+). "
+                        f"Low volume moves are unreliable. Wait for volume expansion."
+                    )
+            
+            # CHECK 3: Momentum confirmation (2-3 recent candles in direction)
+            if len(recent) >= 3:
+                closes = recent['close'].values
+                
+                if signal_action == "buy":
+                    bullish_candles = sum(1 for i in range(1, len(closes)) if closes[i] > closes[i-1])
+                    if bullish_candles < 2:
+                        return False, (
+                            f"🚫 No bullish momentum confirmation ({bullish_candles}/3 up candles). "
+                            f"Wait for 2-3 consecutive up candles before BUY entry."
+                        )
+                elif signal_action == "sell":
+                    bearish_candles = sum(1 for i in range(1, len(closes)) if closes[i] < closes[i-1])
+                    if bearish_candles < 2:
+                        return False, (
+                            f"🚫 No bearish momentum confirmation ({bearish_candles}/3 down candles). "
+                            f"Wait for 2-3 consecutive down candles before SELL entry."
+                        )
+            
+            # CHECK 4: Regime stability check (stored in instance variable)
+            # This prevents entries right after regime changes (whipsaw protection)
+            if regime_analysis and hasattr(self, 'last_regime_change_time'):
+                from datetime import datetime, timezone, timedelta
+                time_since_regime_change = datetime.now(timezone.utc) - self.last_regime_change_time
+                if time_since_regime_change < timedelta(minutes=30):
+                    return False, (
+                        f"🚫 Regime changed {time_since_regime_change.seconds // 60} minutes ago. "
+                        f"Wait 30 minutes after regime change to avoid whipsaws."
+                    )
+            
+            return True, f"✅ Entry timing validated: confirmation requirements met"
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Entry timing validation error: {e}. Allowing trade to proceed.")
+            return True, f"Entry timing check skipped due to error: {e}"
+    
+    def update_regime_tracking(self, current_regime: str) -> None:
+        """
+        Track regime changes to prevent entries during whipsaw periods.
+        """
+        if self.last_regime is not None and self.last_regime != current_regime:
+            self.last_regime_change_time = datetime.now(timezone.utc)
+            logger.info(f"📊 Regime changed: {self.last_regime} → {current_regime} (30-min cooldown started)")
+        self.last_regime = current_regime
+    
+    def validate_confluence(
+        self, signal: Dict, market_df, regime_analysis: Optional[Dict]
+    ) -> Tuple[bool, str]:
+        """
+        PRIORITY 4: Require confluence of multiple factors before allowing trade.
+        
+        Professional traders wait for multiple confirmations, not just one indicator.
+        This prevents low-probability trades where only 1-2 factors align.
+        
+        Confluence Factors (need 3 out of 4):
+        1. MTF Alignment - Multiple timeframes agree on direction
+        2. Volume Confirmation - Volume > 1.5x average
+        3. Momentum Persistence - Momentum strength > 70
+        4. Price Near S/R - Within 1% of support (BUY) or resistance (SELL)
+        
+        Returns:
+            (is_valid, reason) tuple with confluence score
+        """
+        if market_df is None or market_df.empty or len(market_df) < 50:
+            return True, "Insufficient data for confluence validation"
+        
+        signal_action = signal.get("signal", "hold").lower()
+        if signal_action == "hold":
+            return True, "Hold signal"
+        
+        try:
+            latest = market_df.iloc[-1]
+            entry_price = latest['close']
+            
+            confluence_factors = []
+            factor_details = []
+            
+            # FACTOR 1: MTF Alignment (check if trend indicators align)
+            mtf_data = signal.get("raw", {}).get("mtf_analysis", {})
+            if mtf_data:
+                primary_trend = mtf_data.get("primary_trend", "neutral")
+                context_trend = mtf_data.get("context_trend", "neutral")
+                
+                if signal_action == "buy":
+                    mtf_aligned = (primary_trend in ["bullish", "up"] and 
+                                  context_trend in ["bullish", "up"])
+                elif signal_action == "sell":
+                    mtf_aligned = (primary_trend in ["bearish", "down"] and 
+                                  context_trend in ["bearish", "down"])
+                else:
+                    mtf_aligned = False
+                
+                if mtf_aligned:
+                    confluence_factors.append("MTF_ALIGNMENT")
+                    factor_details.append(f"✅ MTF aligned ({primary_trend}/{context_trend})")
+                else:
+                    factor_details.append(f"❌ MTF not aligned ({primary_trend}/{context_trend})")
+            
+            # FACTOR 2: Volume Confirmation (>1.5x average)
+            volume = latest.get('volume', 0)
+            volume_sma = latest.get('volume_sma', volume)
+            
+            if volume > 0 and volume_sma > 0:
+                volume_ratio = volume / volume_sma
+                if volume_ratio >= 1.5:
+                    confluence_factors.append("VOLUME_CONFIRMATION")
+                    factor_details.append(f"✅ Volume confirmed ({volume_ratio:.2f}x)")
+                else:
+                    factor_details.append(f"❌ Volume weak ({volume_ratio:.2f}x)")
+            
+            # FACTOR 3: Momentum Persistence (>70 from regime analysis)
+            if regime_analysis:
+                momentum = regime_analysis.get("momentum_strength", 0)
+                if momentum > 70:
+                    confluence_factors.append("MOMENTUM_PERSISTENCE")
+                    factor_details.append(f"✅ Strong momentum ({momentum:.0f})")
+                else:
+                    factor_details.append(f"❌ Weak momentum ({momentum:.0f})")
+            
+            # FACTOR 4: Price Near S/R (within 1% of key level)
+            sr_levels = self.detect_support_resistance_levels(market_df, entry_price)
+            support = sr_levels.get("nearest_support", 0)
+            resistance = sr_levels.get("nearest_resistance", 0)
+            
+            if signal_action == "buy" and support > 0:
+                distance_pct = abs(entry_price - support) / entry_price * 100
+                if distance_pct <= 1.0:
+                    confluence_factors.append("NEAR_SUPPORT")
+                    factor_details.append(f"✅ Near support ({distance_pct:.2f}% away)")
+                else:
+                    factor_details.append(f"❌ Not near support ({distance_pct:.2f}% away)")
+            elif signal_action == "sell" and resistance > 0:
+                distance_pct = abs(entry_price - resistance) / entry_price * 100
+                if distance_pct <= 1.0:
+                    confluence_factors.append("NEAR_RESISTANCE")
+                    factor_details.append(f"✅ Near resistance ({distance_pct:.2f}% away)")
+                else:
+                    factor_details.append(f"❌ Not near resistance ({distance_pct:.2f}% away)")
+            
+            # CONFLUENCE REQUIREMENT: Need 3 out of 4 factors
+            confluence_score = len(confluence_factors)
+            required_confluence = 3
+            
+            details_str = "\n   ".join(factor_details)
+            
+            if confluence_score >= required_confluence:
+                return True, (
+                    f"✅ Confluence validated ({confluence_score}/4 factors): "
+                    f"{', '.join(confluence_factors)}\n   {details_str}"
+                )
+            else:
+                return False, (
+                    f"🚫 Insufficient confluence ({confluence_score}/4, need {required_confluence}). "
+                    f"Only these factors aligned: {', '.join(confluence_factors) if confluence_factors else 'NONE'}. "
+                    f"\n   {details_str}\n"
+                    f"Wait for stronger setup with more confirmations."
+                )
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Confluence validation error: {e}. Allowing trade to proceed.")
+            return True, f"Confluence check skipped due to error: {e}"
+    
+    def validate_regime_strategy_alignment(
+        self, signal: Dict, regime_analysis: Optional[Dict]
+    ) -> Tuple[bool, str]:
+        """
+        Validate that the trading signal aligns with the current market regime.
+        
+        CRITICAL: Prevents counter-trend trading in strong directional markets.
+        Professional traders don't fight strong trends - they wait or trade with them.
+        
+        Rules:
+        1. BEAR_TREND + ADX > 30: Only SHORT signals allowed
+        2. BULL_TREND + ADX > 30: Only LONG signals allowed
+        3. MEAN_REVERSION edge in strong trend: BLOCKED
+        4. Natural R:R < 2.0: Trade must be rejected at source
+        
+        Returns:
+            (is_valid, reason) tuple
+        """
+        if not regime_analysis:
+            return True, "No regime data - allowing trade"
+        
+        signal_action = signal.get("signal", "hold").lower()
+        if signal_action == "hold":
+            return True, "Hold signal"
+        
+        regime = regime_analysis.get("regime", "")
+        adx = regime_analysis.get("trend_strength", 0)
+        trading_edge = regime_analysis.get("trading_edge", "")
+        confidence = regime_analysis.get("confidence", 0)
+        
+        # PRIORITY 3: Block ALL mean reversion trades (too risky with tight stops)
+        # Don't trade mean reversion with sub-1% stops.
+        # Either trade trends or wait for better setups
+        if trading_edge == "MEAN_REVERSION":
+            return False, (
+                f"🚫 MEAN REVERSION trades BLOCKED (trading edge: {trading_edge}). "
+                f"Mean reversion requires wide stops (2-3%+) and patience. "
+                f"Day trading strategy focuses on momentum/trend trades only. "
+                f"Wait for clear trend or range breakout setup."
+            )
+        
+        # RULE 1: Block counter-trend mean reversion in strong trends (redundant but kept for clarity)
+        if trading_edge == "MEAN_REVERSION":
+            if regime == "BEAR_TREND" and adx > 30:
+                return False, (
+                    f"🚫 MEAN REVERSION blocked in strong BEAR_TREND (ADX={adx:.1f}). "
+                    f"Do not buy falling knives. Wait for trend exhaustion or trade SHORT on bounces."
+                )
+            if regime == "BULL_TREND" and adx > 30:
+                return False, (
+                    f"🚫 MEAN REVERSION blocked in strong BULL_TREND (ADX={adx:.1f}). "
+                    f"Do not short strong rallies. Wait for trend exhaustion or trade LONG on dips."
+                )
+        
+        # RULE 2: Block BUY in strong bear trends
+        if signal_action == "buy" and regime == "BEAR_TREND" and adx > 30:
+            return False, (
+                f"🚫 BUY blocked in strong BEAR_TREND (ADX={adx:.1f}, Confidence={confidence}%). "
+                f"Professional traders don't catch falling knives. "
+                f"Wait for regime change or trade SHORT on rallies."
+            )
+        
+        # RULE 3: Block SELL in strong bull trends
+        if signal_action == "sell" and regime == "BULL_TREND" and adx > 30:
+            return False, (
+                f"🚫 SELL blocked in strong BULL_TREND (ADX={adx:.1f}, Confidence={confidence}%). "
+                f"Don't short strong uptrends. "
+                f"Wait for regime change or trade LONG on dips."
+            )
+        
+        # RULE 4: Warn about counter-trend trades in moderate trends
+        if regime in ["BEAR_TREND", "BULL_TREND"] and 25 < adx <= 30:
+            if (signal_action == "buy" and regime == "BEAR_TREND") or \
+               (signal_action == "sell" and regime == "BULL_TREND"):
+                logger.warning(
+                    f"⚠️ Counter-trend signal in moderate {regime} (ADX={adx:.1f}). "
+                    f"Allowing but with caution - ensure excellent setup quality."
+                )
+        
+        return True, f"✅ Signal aligns with {regime} regime"
+
+    def validate_natural_risk_reward(
+        self, entry_price: float, stop_loss: float, take_profit: float, side: str
+    ) -> Tuple[bool, str, float]:
+        """
+        Validate that the trade has a natural R:R ratio from market structure.
+        
+        CRITICAL: We should NOT force-fit R:R ratios. If the market doesn't
+        naturally provide 2:1 R:R, the trade setup is poor and should be rejected.
+        
+        Professional traders walk away from trades that don't offer good R:R,
+        they don't artificially adjust targets to meet arbitrary ratios.
+        
+        Returns:
+            (is_valid, reason, actual_rrr) tuple
+        """
+        MIN_RRR = 2.0  # Minimum for mainnet profitability with fees
+        
+        # Calculate actual R:R from given levels
+        if side.lower() == "buy":
+            risk = abs(entry_price - stop_loss)
+            reward = abs(take_profit - entry_price)
+        else:  # sell
+            risk = abs(stop_loss - entry_price)
+            reward = abs(entry_price - take_profit)
+        
+        if risk == 0:
+            return False, "🚫 Invalid: Stop loss equals entry price (zero risk)", 0.0
+        
+        actual_rrr = reward / risk
+        
+        # Check if natural R:R meets minimum
+        if actual_rrr < MIN_RRR:
+            risk_pct = (risk / entry_price) * 100
+            reward_pct = (reward / entry_price) * 100
+            return False, (
+                f"🚫 Natural R:R too low: {actual_rrr:.2f}:1 (need {MIN_RRR}:1 minimum). "
+                f"Risk={risk_pct:.2f}%, Reward={reward_pct:.2f}%. "
+                f"Market structure doesn't support this trade - SKIP IT. "
+                f"Professional traders wait for better setups, they don't force bad R:R."
+            ), actual_rrr
+        
+        # Excellent R:R
+        if actual_rrr >= 3.0:
+            logger.info(f"🎯 Excellent natural R:R: {actual_rrr:.2f}:1 - High-quality setup!")
+        
+        return True, f"✅ Natural R:R validated: {actual_rrr:.2f}:1", actual_rrr
+
     def validate_trade_signal(
         self,
         user_id: int,
@@ -290,10 +638,41 @@ class RiskManager:
             entry_price = self._extract_entry_price(signal)
             side = signal.get("signal", "buy").lower()
             risk_percentage = self._resolve_risk_percentage(config)
+            
+            # VALIDATION #1: Check entry timing (PRIORITY 1)
+            # Ensure we have momentum confirmation and aren't chasing extended moves
+            is_timing_valid, timing_reason = self.validate_entry_timing(
+                signal, market_df, signal.get("raw", {}).get("regime_analysis")
+            )
+            if not is_timing_valid:
+                logger.warning(f"[User {user_id}] {timing_reason}")
+                raise RiskValidationError(timing_reason)
+            logger.info(f"[User {user_id}] {timing_reason}")
+            
+            # VALIDATION #2: Check regime-strategy alignment
+            # Block counter-trend trades in strong directional markets
+            regime_analysis = signal.get("raw", {}).get("regime_analysis")
+            if regime_analysis:
+                is_regime_valid, regime_reason = self.validate_regime_strategy_alignment(
+                    signal, regime_analysis
+                )
+                if not is_regime_valid:
+                    logger.warning(f"[User {user_id}] {regime_reason}")
+                    raise RiskValidationError(regime_reason)
+                logger.info(f"[User {user_id}] {regime_reason}")
+            
+            # VALIDATION #3: Check confluence of multiple factors (PRIORITY 4)
+            # Require 3/4 confirmations: MTF alignment, volume, momentum, S/R proximity
+            is_confluence_valid, confluence_reason = self.validate_confluence(
+                signal, market_df, regime_analysis
+            )
+            if not is_confluence_valid:
+                logger.warning(f"[User {user_id}] {confluence_reason}")
+                raise RiskValidationError(confluence_reason)
+            logger.info(f"[User {user_id}] {confluence_reason}")
 
             # Use adaptive R:R if market data available, otherwise use AI suggestions
-            # CRITICAL: For safety, ALWAYS prefer AI-suggested levels for mean reversion
-            use_ai_levels = True  # Default to safer AI levels
+            use_ai_levels = True  # Default to AI levels
             
             if market_df is not None and not market_df.empty:
                 logger.info(
@@ -369,6 +748,18 @@ class RiskManager:
                 risk_reward_ratio = abs(take_profit - entry_price) / abs(
                     entry_price - stop_loss
                 )
+            
+            # VALIDATION #2: Validate natural R:R from market structure
+            # Reject trades where market doesn't naturally provide 2:1 R:R
+            is_rrr_valid, rrr_reason, actual_rrr = self.validate_natural_risk_reward(
+                entry_price, stop_loss, take_profit, side
+            )
+            if not is_rrr_valid:
+                logger.error(f"[User {user_id}] {rrr_reason}")
+                raise RiskValidationError(rrr_reason)
+            
+            logger.info(f"[User {user_id}] {rrr_reason}")
+            risk_reward_ratio = actual_rrr  # Use validated natural R:R
 
             # Calculate position size using 1% rule
             position_size = self.calculate_position_size(
@@ -519,48 +910,48 @@ class RiskManager:
                         f"⚠️ Mean reversion setup detected - will apply wider stops if allowed through"
                     )
 
-            # Adaptive Multipliers based on volatility regime
-            # High volatility (>75th percentile) → Wider stops (2.5-3x ATR)
-            # Medium volatility (25th-75th) → Standard stops (1.8-2.2x ATR)
-            # Low volatility (<25th percentile) → Tighter stops (1.2-1.5x ATR)
-            # **MEAN REVERSION → EXTRA WIDE (3.0-4.0x ATR for breathing room)**
-
+            # PRIORITY 2: Intelligent ATR-Based Stop Widening
+            # Minimum 2x ATR for stops, 5x ATR for targets (ensures 2.5:1 R:R minimum)
+            # Professional stops account for market noise, not arbitrary percentages
+            
             if is_mean_reversion:
-                # Mean reversion needs MUCH wider stops (bounces are volatile)
+                # Mean reversion BLOCKED elsewhere, but failsafe here
                 sl_multiplier = 3.5
-                tp_multiplier = 7.5
+                tp_multiplier = 8.75  # 2.5:1 R:R
                 volatility_regime = "MEAN_REVERSION"
-                logger.info(
-                    f"📏 Using WIDE stops for mean reversion: SL={sl_multiplier}x, TP={tp_multiplier}x ATR"
+                logger.warning(
+                    f"⚠️ Mean reversion setup - using EXTRA WIDE stops (should be blocked earlier)"
                 )
             elif volatility_percentile > 75:
-                # HIGH VOLATILITY: Use wider stops to avoid noise (2:1+ R:R)
-                sl_multiplier = 2.8
-                tp_multiplier = 6.0
+                # HIGH VOLATILITY: Minimum 2.5x ATR stops to avoid noise
+                sl_multiplier = 2.5
+                tp_multiplier = 6.25  # 2.5:1 R:R
                 volatility_regime = "HIGH"
             elif volatility_percentile > 50:
-                # MEDIUM-HIGH VOLATILITY (2:1+ R:R)
+                # MEDIUM-HIGH VOLATILITY: 2.2x ATR stops
                 sl_multiplier = 2.2
-                tp_multiplier = 5.0
+                tp_multiplier = 5.5  # 2.5:1 R:R
                 volatility_regime = "MEDIUM_HIGH"
             elif volatility_percentile > 25:
-                # MEDIUM VOLATILITY (2:1+ R:R)
-                sl_multiplier = 1.8
-                tp_multiplier = 4.0
+                # MEDIUM VOLATILITY: 2.0x ATR stops
+                sl_multiplier = 2.0
+                tp_multiplier = 5.0  # 2.5:1 R:R
                 volatility_regime = "MEDIUM"
             else:
-                # LOW VOLATILITY: Use tighter stops for precision (2:1+ R:R)
-                sl_multiplier = 1.3
-                tp_multiplier = 3.0
+                # LOW VOLATILITY: Still 2x ATR minimum (noise protection)
+                sl_multiplier = 2.0
+                tp_multiplier = 5.0  # 2.5:1 R:R
                 volatility_regime = "LOW"
 
-            # Calculate percentage distances
+            # Calculate percentage distances based on ATR multipliers
             dynamic_sl_pct = atr_percentage * sl_multiplier
             dynamic_tp_pct = atr_percentage * tp_multiplier
-
-            # Calculate percentage distances
-            dynamic_sl_pct = atr_percentage * sl_multiplier
-            dynamic_tp_pct = atr_percentage * tp_multiplier
+            
+            logger.info(
+                f"📏 ATR-based stops: Volatility={volatility_regime} ({volatility_percentile:.0f}th percentile), "
+                f"ATR={atr_percentage:.2f}%, SL={sl_multiplier}x ATR ({dynamic_sl_pct:.2f}%), "
+                f"TP={tp_multiplier}x ATR ({dynamic_tp_pct:.2f}%)"
+            )
 
             # 2. Historical Performance Adjustment (Volatility-Aware)
             try:
@@ -618,48 +1009,38 @@ class RiskManager:
                 )
                 # Continue with ATR-based values
 
-            # 3. Volatility-Adjusted Safety Caps
-            # Day trading risk management - adaptive to market structure
-            # High volatility periods need wider caps BUT with absolute maximum
-
-            # ABSOLUTE MAXIMUM CAPS (adjusted for 2:1 R:R requirement)
-            ABSOLUTE_MAX_STOP_LOSS = 0.5  # Never risk more than 0.5% per trade
-            ABSOLUTE_MAX_TAKE_PROFIT = 2.0  # Increased from 1.5% to support 2:1 R:R
-
-            if volatility_regime == "HIGH":
-                # High volatility: wider stops but capped (2:1 R:R friendly)
-                max_sl = 0.5  
-                min_sl = 0.3
-                max_tp = 1.5 
-                min_tp = 0.8
-            elif volatility_regime in ["MEDIUM_HIGH", "MEDIUM"]:
-                max_sl = 0.4
-                min_sl = 0.25
-                max_tp = 1.0
-                min_tp = 0.6
-            else:  # LOW volatility
-                max_sl = 0.35 
-                min_sl = 0.2
-                max_tp = 0.8
-                min_tp = 0.5
-
-            # Apply volatility-specific caps
-            dynamic_sl_pct = min(dynamic_sl_pct, max_sl)
-            dynamic_sl_pct = max(dynamic_sl_pct, min_sl)
-            dynamic_tp_pct = min(dynamic_tp_pct, max_tp)
-            dynamic_tp_pct = max(dynamic_tp_pct, min_tp)
-
-            # Apply absolute maximum caps (safety override)
+            # 3. Fee-Adjusted Minimum Thresholds
+            # CRITICAL: Stops must be wide enough that fees don't destroy R:R
+            # With 0.2% total fees (0.1% entry + 0.1% exit), need minimum thresholds
+            
+            FEE_PERCENTAGE = 0.2  # 0.1% entry + 0.1% exit
+            
+            # Absolute minimums accounting for fees (for 2.5:1 R:R after fees)
+            # Example: 0.8% SL - 0.2% fees = 0.6% actual risk
+            #          2.0% TP - 0.2% fees = 1.8% actual reward
+            #          Actual R:R = 1.8 / 0.6 = 3:1 → gives 2.5:1 after slippage
+            MIN_SL_FOR_FEES = 0.8  # Minimum to maintain viable R:R after fees
+            MIN_TP_FOR_FEES = 2.0  # Minimum to make profit meaningful after fees
+            
+            # Apply fee-adjusted minimums
+            dynamic_sl_pct = max(dynamic_sl_pct, MIN_SL_FOR_FEES)
+            dynamic_tp_pct = max(dynamic_tp_pct, MIN_TP_FOR_FEES)
+            
+            # Safety maximums (prevent excessive risk)
+            ABSOLUTE_MAX_STOP_LOSS = 2.5  # Increased from 0.5% - day trading can handle wider stops
+            ABSOLUTE_MAX_TAKE_PROFIT = 6.0  # Increased from 2.0% - let winners run
+            
             dynamic_sl_pct = min(dynamic_sl_pct, ABSOLUTE_MAX_STOP_LOSS)
             dynamic_tp_pct = min(dynamic_tp_pct, ABSOLUTE_MAX_TAKE_PROFIT)
 
-            # Ensure minimum risk:reward ratio of 2.0:1 for mainnet profitability
-            # This accounts for fees, slippage, and ensures sustainable edge
-            min_risk_reward = 2.0
+            # Ensure minimum risk:reward ratio of 3.0:1 (PRIORITY 2)
+            # With 40% win rate, need wider R:R for profitability
+            # 3:1 R:R means each win covers 3 losses (sustainable edge)
+            min_risk_reward = 3.0
             if dynamic_tp_pct / dynamic_sl_pct < min_risk_reward:
                 logger.warning(
                     f"⚠️  Risk:reward ratio too low ({dynamic_tp_pct/dynamic_sl_pct:.2f}:1). "
-                    f"Adjusting TP to maintain {min_risk_reward}:1 (mainnet requirement)"
+                    f"Adjusting TP to maintain {min_risk_reward}:1 minimum (accounts for fees + 40% win rate)"
                 )
                 dynamic_tp_pct = max(dynamic_tp_pct, dynamic_sl_pct * min_risk_reward)
 
@@ -807,7 +1188,9 @@ class RiskManager:
         if trade_value < MIN_TRADE_VALUE:
             raise RiskValidationError(f"Trade value too small: ${trade_value:.2f}")
         if trade_value > balance * MAX_BALANCE_TRADE_RATIO:
-            raise RiskValidationError("Trade value exceeds 10% of balance")
+            raise RiskValidationError(
+                f"Trade value exceeds {MAX_BALANCE_TRADE_RATIO*100:.1f}% of balance"
+            )
 
     @staticmethod
     def _assert_trading_active(config: Dict) -> None:
@@ -1152,18 +1535,16 @@ class RiskManager:
 
             risk_reward_ratio = reward / risk
 
-            # Validate minimum R:R (1:1.5)
+            # NO LONGER FORCE-FITTING R:R - Let natural market structure determine it
+            # The trade will be rejected later if R:R < 2.0 (validate_natural_risk_reward)
+            # This ensures we only take trades with NATURALLY good risk/reward profiles
+            
+            # Log warning but DON'T adjust - let validation handle rejection
             if risk_reward_ratio < MIN_RISK_REWARD_RATIO:
                 logger.warning(
-                    f"⚠️ R:R too low ({risk_reward_ratio:.2f}), adjusting to minimum {MIN_RISK_REWARD_RATIO}"
+                    f"⚠️ Natural R:R is {risk_reward_ratio:.2f}:1 (below minimum {MIN_RISK_REWARD_RATIO}:1). "
+                    f"This trade will likely be rejected - market structure doesn't support good R:R."
                 )
-                # Extend take profit to meet minimum R:R
-                if side == "buy":
-                    take_profit = entry_price + (risk * MIN_RISK_REWARD_RATIO)
-                else:
-                    take_profit = entry_price - (risk * MIN_RISK_REWARD_RATIO)
-
-                risk_reward_ratio = MIN_RISK_REWARD_RATIO
 
             # Cap at maximum R:R (1:4) - beyond this is often unrealistic
             if risk_reward_ratio > MAX_RISK_REWARD_RATIO:
@@ -1176,6 +1557,7 @@ class RiskManager:
                     take_profit = entry_price - (risk * MAX_RISK_REWARD_RATIO)
 
                 risk_reward_ratio = MAX_RISK_REWARD_RATIO
+                reward = risk * risk_reward_ratio
 
             risk_pct = (risk / entry_price) * 100
             reward_pct = (reward / entry_price) * 100

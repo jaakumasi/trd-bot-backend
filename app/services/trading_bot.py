@@ -414,24 +414,65 @@ class TradingBot:
             
             # Quality check with AI override for exceptional signals
             if trading_quality < 50:
-                if ai_confidence >= 90 and signal_action in ["buy", "sell"]:
-                    logger.warning(
-                        f"🚨 [User {user_id}] AI OVERRIDE: High confidence signal ({ai_confidence}%) bypassing quality filter | "
-                        f"Quality: {trading_quality}/100 | Regime: {regime_analysis.get('regime')} | "
-                        f"Signal: {signal_action.upper()}"
-                    )
-                    metrics_logger.info(
-                        f"AI_OVERRIDE | USER={user_id} | QUALITY={trading_quality} | "
-                        f"CONFIDENCE={ai_confidence} | SIGNAL={signal_action.upper()}"
-                    )
-                else:
+                # Check if AI override is allowed
+                if not settings.ai_override_enabled:
                     logger.info(
                         f"🚫 [User {user_id}] Low trading quality: {trading_quality}/100 - Regime: {regime_analysis.get('regime')} | "
-                        f"ADX: {regime_analysis.get('trend_strength', 0):.1f} | "
-                        f"ATR%: {regime_analysis.get('atr_percentage', 0):.2f}% | "
-                        f"AI Confidence: {ai_confidence}% (needs ≥90% to override)"
+                        f"AI Override: DISABLED"
                     )
                     return
+                
+                # Mainnet safety: require stricter conditions for override
+                if settings.mainnet_mode and settings.is_mainnet_live():
+                    # For mainnet, require ALL of: high AI confidence, high confluence, high technical score
+                    mtf_confluence = signal_details.get('mtf_confluence', signal_details.get('signal_confluence', 0))
+                    technical_score = signal_details.get('technical_score', 0)
+                    
+                    can_override = (
+                        ai_confidence >= 90 and
+                        mtf_confluence >= 70 and
+                        technical_score >= 70 and
+                        signal_action in ["buy", "sell"]
+                    )
+                    
+                    if can_override:
+                        logger.warning(
+                            f"🚨 [User {user_id}] MAINNET AI OVERRIDE: High confidence + confluence + technical | "
+                            f"Quality: {trading_quality}/100 | Confidence: {ai_confidence}% | "
+                            f"Confluence: {mtf_confluence}/100 | Technical: {technical_score}/100"
+                        )
+                        metrics_logger.info(
+                            f"MAINNET_AI_OVERRIDE | USER={user_id} | QUALITY={trading_quality} | "
+                            f"CONFIDENCE={ai_confidence} | CONFLUENCE={mtf_confluence} | TECHNICAL={technical_score}"
+                        )
+                    else:
+                        logger.info(
+                            f"🚫 [User {user_id}] MAINNET: Low quality blocked | "
+                            f"Quality: {trading_quality}/100 | Confidence: {ai_confidence}% | "
+                            f"Confluence: {mtf_confluence}/100 | Technical: {technical_score}/100 | "
+                            f"Requires: Confidence≥90 AND Confluence≥70 AND Technical≥70"
+                        )
+                        return
+                else:
+                    # Testnet/paper: use lenient override (confidence only)
+                    if ai_confidence >= 90 and signal_action in ["buy", "sell"]:
+                        logger.warning(
+                            f"🚨 [User {user_id}] AI OVERRIDE: High confidence signal ({ai_confidence}%) bypassing quality filter | "
+                            f"Quality: {trading_quality}/100 | Regime: {regime_analysis.get('regime')} | "
+                            f"Signal: {signal_action.upper()}"
+                        )
+                        metrics_logger.info(
+                            f"AI_OVERRIDE | USER={user_id} | QUALITY={trading_quality} | "
+                            f"CONFIDENCE={ai_confidence} | SIGNAL={signal_action.upper()}"
+                        )
+                    else:
+                        logger.info(
+                            f"🚫 [User {user_id}] Low trading quality: {trading_quality}/100 - Regime: {regime_analysis.get('regime')} | "
+                            f"ADX: {regime_analysis.get('trend_strength', 0):.1f} | "
+                            f"ATR%: {regime_analysis.get('atr_percentage', 0):.2f}% | "
+                            f"AI Confidence: {ai_confidence}% (needs ≥90% to override)"
+                        )
+                        return
 
             logger.info(
                 f"🎯 [User {user_id}] TRADE SIGNAL DETECTED: {signal_details['signal'].upper()}"
@@ -1520,7 +1561,12 @@ class TradingBot:
 
     @staticmethod
     def _estimate_exit_fee(amount: float, exit_price: float) -> float:
-        return amount * exit_price * 0.001
+        """
+        Estimate exit trading fee for P&L calculations.
+        Uses configurable fee percentage from settings (default 0.1%).
+        Note: This is an estimate; actual fees may vary based on exchange tier.
+        """
+        return amount * exit_price * settings.fee_estimate_pct
 
     @staticmethod
     def _calculate_profit_loss(
@@ -2644,11 +2690,24 @@ class TradingBot:
             # Check each active user's paper positions
             for config in active_configs:
                 user_id = config.user_id
-                closed_trades = await self.paper_trading.check_position_exits(user_id, current_prices)
+                symbol = config.trading_pair
                 
-                # Process closed trades
-                for trade_summary in closed_trades:
-                    await self._record_paper_trade_exit(db, trade_summary)
+                # Get current price for this symbol
+                current_price = current_prices.get(symbol)
+                if not current_price:
+                    continue
+                
+                # Check exits for this user's positions in this symbol
+                exits = self.paper_trading.check_position_exits(user_id, current_price, symbol)
+                
+                # Process closed positions
+                for exit_info in exits:
+                    position = exit_info['position']
+                    success, msg, trade_summary = self.paper_trading.close_position(
+                        user_id, position.trade_id, exit_info['exit_price'], exit_info['exit_reason']
+                    )
+                    if success and trade_summary:
+                        await self._record_paper_trade_exit(db, trade_summary)
                     
         except Exception as e:
             logger.error(f"📄 [PAPER] Error checking paper trade exits: {e}")

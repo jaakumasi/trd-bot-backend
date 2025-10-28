@@ -34,7 +34,14 @@ class Settings(BaseSettings):
     trading_active_hours_start: str = Field(default="00:00")  # 24/7 crypto market
     trading_active_hours_end: str = Field(default="23:59")    # Full day coverage
     use_mock_binance: bool = Field(default=False)
-    regime_filter_mode: str = Field(default="day_trading")  # day_trading mode for aggressive intraday 
+    regime_filter_mode: str = Field(default="day_trading")  # day_trading mode for aggressive intraday
+    
+    # Mainnet Safety Configuration
+    mainnet_mode: bool = Field(default=False)  # Enable stricter checks for live mainnet trading
+    trading_profile: str = Field(default="normal")  # strict/normal/permissive - affects thresholds
+    ai_override_enabled: bool = Field(default=True)  # Allow AI to override quality filters
+    min_confluence_threshold: int = Field(default=60)  # Minimum confluence score for trades (0-100)
+    fee_estimate_pct: float = Field(default=0.001)  # Fee estimate for P&L calculations (0.1% default) 
     
     # CORS - accepts both string and list
     cors_origins: Union[str, List[str]] = Field(
@@ -76,5 +83,36 @@ class Settings(BaseSettings):
         if self.binance_testnet:
             return (self.testnet_binance_api_key, self.testnet_binance_secret_key)
         return (self.binance_api_key, self.binance_secret_key)
+    
+    def is_mainnet_live(self) -> bool:
+        """
+        Check if we're running on live mainnet (not paper, not mock, not testnet).
+        
+        Returns:
+            bool: True if live mainnet trading is active
+        """
+        return not self.use_paper_trading and not self.use_mock_binance and not self.binance_testnet
+    
+    def get_confluence_threshold(self) -> int:
+        """
+        Get appropriate confluence threshold based on trading profile and environment.
+        Mainnet uses stricter thresholds for safety.
+        
+        Returns:
+            int: Confluence threshold (0-100)
+        """
+        base_threshold = self.min_confluence_threshold
+        
+        # Apply profile adjustments
+        if self.trading_profile == "strict":
+            base_threshold += 10
+        elif self.trading_profile == "permissive":
+            base_threshold -= 5
+        
+        # Mainnet safety: increase threshold
+        if self.mainnet_mode and self.is_mainnet_live():
+            base_threshold = max(base_threshold, 65)
+        
+        return max(50, min(100, base_threshold))
 
 settings = Settings()

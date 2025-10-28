@@ -279,7 +279,7 @@ class AIAnalyzer:
             # Step 1: Check trading quality
             if regime_analysis:
                 trading_quality = regime_analysis.get("trading_quality_score", 0)
-                if trading_quality < 50:
+                if trading_quality < 30:
                     logger.info(
                         f"🚫 Low trading quality: {trading_quality}/100 - Market regime: {regime_analysis.get('regime')}"
                     )
@@ -319,17 +319,18 @@ class AIAnalyzer:
                 df_with_indicators, regime_analysis
             )
 
-            # Get dynamic threshold from advanced regime analysis (if available)
+            # Get dynamic threshold from settings (environment-aware)
+            # Mainnet uses stricter thresholds for safety
             dynamic_threshold = (
-                regime_analysis.get("dynamic_confluence_threshold", 60)
+                regime_analysis.get("dynamic_confluence_threshold", settings.get_confluence_threshold())
                 if regime_analysis
-                else 60
+                else settings.get_confluence_threshold()
             )
 
             if confluence_score < dynamic_threshold:
                 logger.info(
                     f"⚠️ Low signal confluence: {confluence_score}/{dynamic_threshold} "
-                    f"(dynamic threshold) - Recommending HOLD"
+                    f"(threshold mode: {'MAINNET' if settings.mainnet_mode else 'TESTNET'}) - Recommending HOLD"
                 )
                 return self._fallback_analysis(
                     f"Insufficient signal confluence ({confluence_score}/{dynamic_threshold}). "
@@ -370,6 +371,7 @@ class AIAnalyzer:
             enriched["technical_score"] = technical_score
             enriched["final_confidence"] = min(enriched["confidence"], technical_score)
             enriched["signal_confluence"] = confluence_score
+            enriched["regime_analysis"] = regime_analysis  # Include for risk validation
             
             # Require momentum confirmation for counter-trend entries
             signal = enriched.get("signal", "hold").lower()
@@ -932,7 +934,7 @@ class AIAnalyzer:
             # Check trading quality (Fix #2 - Quality-based trading for MTF)
             if regime_analysis:
                 trading_quality = regime_analysis.get("trading_quality_score", 0)
-                if trading_quality < 50:
+                if trading_quality < 30:
                     logger.info(
                         f"🚫 Low trading quality: {trading_quality}/100 - Market regime: {regime_analysis.get('regime')}"
                     )
@@ -946,16 +948,17 @@ class AIAnalyzer:
                 primary_df, context_df, precision_df, regime_analysis
             )
 
-            # Get dynamic threshold
+            # Get dynamic threshold from settings (environment-aware)
             dynamic_threshold = (
-                regime_analysis.get("dynamic_confluence_threshold", 55)
+                regime_analysis.get("dynamic_confluence_threshold", settings.get_confluence_threshold())
                 if regime_analysis
-                else 55 
+                else settings.get_confluence_threshold()
             )
 
             if mtf_confluence < dynamic_threshold:
                 logger.info(
-                    f"⚠️ Low MTF confluence: {mtf_confluence}/{dynamic_threshold} - Recommending HOLD"
+                    f"⚠️ Low MTF confluence: {mtf_confluence}/{dynamic_threshold} "
+                    f"({'MAINNET' if settings.mainnet_mode else 'TESTNET'} mode) - Recommending HOLD"
                 )
                 return self._fallback_analysis(
                     f"Insufficient multi-timeframe confluence ({mtf_confluence}/{dynamic_threshold})",
@@ -1004,6 +1007,7 @@ class AIAnalyzer:
             enriched["final_confidence"] = min(enriched["confidence"], technical_score)
             enriched["mtf_confluence"] = mtf_confluence
             enriched["timeframe_analysis"] = mtf_summary
+            enriched["regime_analysis"] = regime_analysis  # Include for risk validation
 
             logger.info(f"🎯 Final MTF AI Analysis: {enriched}")
             return enriched
@@ -1176,10 +1180,30 @@ class AIAnalyzer:
 
         return summary
 
+    def _sanitize_for_json(self, obj):
+        """Convert numpy types and other non-JSON-serializable types to native Python types."""
+        if isinstance(obj, dict):
+            return {key: self._sanitize_for_json(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [self._sanitize_for_json(item) for item in obj]
+        elif isinstance(obj, (np.integer, np.int64, np.int32)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float64, np.float32)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (bool, np.bool_)):
+            return bool(obj)
+        else:
+            return obj
+
     def _generate_mtf_prompt(
         self, primary_latest, mtf_summary, user_history, regime_analysis
     ) -> str:
         """Generate enhanced prompt with multi-timeframe context."""
+        # Sanitize regime_analysis to ensure JSON serialization works
+        regime_analysis_clean = self._sanitize_for_json(regime_analysis) if regime_analysis else None
+        
         prompt = f"""You are an expert day trading analyst. Analyze this multi-timeframe market data and provide a trading recommendation.
 
 MULTI-TIMEFRAME ANALYSIS:
@@ -1188,7 +1212,7 @@ MULTI-TIMEFRAME ANALYSIS:
 - Precision (5m): {json.dumps(mtf_summary.get('precision', {}), indent=2)}
 
 CURRENT MARKET REGIME:
-{json.dumps(regime_analysis, indent=2) if regime_analysis else 'No regime data available'}
+{json.dumps(regime_analysis_clean, indent=2) if regime_analysis_clean else 'No regime data available'}
 
 TRADING STYLE: Day Trading
 - Desired R:R Ratio: At least 2:1
@@ -1249,5 +1273,23 @@ Provide your analysis in JSON format:
 }
 
 IMPORTANT: Only recommend buy/sell if you see strong multi-timeframe alignment and high probability. Default to "hold" if uncertain. Under NO circumstances should you issue a 'buy' signal if the regime is BEAR_TREND with ADX > 30. The same applies to 'sell' signals in a BULL_TREND.
+
+CRITICAL TRADING RULES:
+1. NEVER trade counter-trend in strong directional markets (ADX > 30)
+   - BEAR_TREND + ADX > 30 → Only SELL signals allowed (or hold)
+   - BULL_TREND + ADX > 30 → Only BUY signals allowed (or hold)
+
+2. NEVER attempt mean reversion (Trading Edge = MEAN_REVERSION) in strong trends
+   - If regime is BEAR_TREND or BULL_TREND with ADX > 30 and Trading Edge = MEAN_REVERSION → Issue HOLD
+   - Mean reversion only works in RANGE_BOUND markets or weak trends (ADX < 25)
+
+3. Natural R:R must be at least 2.0:1 from market structure
+   - Don't suggest tight stop losses or take profits
+   - If market doesn't naturally provide 2:1 R:R, recommend HOLD
+   - Professional traders skip trades with poor natural R:R
+
+4. Quality over quantity - only high-probability setups
+   - When in doubt, recommend HOLD
+   - Better to miss a trade than force a bad setup
 """
         return prompt

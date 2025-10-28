@@ -365,6 +365,35 @@ For each open position:
 - `app/config.py` → Environment variables, API keys, trading parameters
 - `app/services/service_constants.py` → Hardcoded constants (timeouts, ratios, limits)
 
+#### **Per-Asset ATR Thresholds**
+The system now supports **per-asset volatility calibration** for multi-symbol trading:
+
+```python
+# In service_constants.py
+from app.services.service_constants import get_atr_thresholds
+
+# Get thresholds for specific symbol
+btc_thresholds = get_atr_thresholds("BTCUSDT")
+# Returns: {"min": 0.40, "optimal_min": 0.50, "optimal_max": 1.20}
+
+# Fallback to default for unconfigured assets
+xrp_thresholds = get_atr_thresholds("XRPUSDT")
+# Returns: BTCUSDT defaults
+```
+
+**Currently Configured Assets:**
+- `BTCUSDT`: min=0.40%, optimal=0.50-1.20% (BTC volatility)
+- `ETHUSDT`: min=0.50%, optimal=0.60-1.50% (Medium volatility)
+- `BNBUSDT`: min=0.50%, optimal=0.60-1.40%
+- `ADAUSDT`: min=0.60%, optimal=0.80-2.00% (Altcoin volatility)
+- `SOLUSDT`: min=0.80%, optimal=1.00-2.50% (High volatility)
+- `DOTUSDT`: min=0.60%, optimal=0.80-2.00%
+
+**To Add New Assets:**
+1. Edit `PER_ASSET_ATR_THRESHOLDS` dict in `service_constants.py`
+2. Run `validate_constants()` at startup to verify ranges
+3. Monitor logs for: `"Configured assets: BTCUSDT, ETHUSDT, ..."`
+
 ---
 
 ## 🚀 Quick Start for Development

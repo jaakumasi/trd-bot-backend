@@ -9,6 +9,7 @@ from .database import engine, Base
 from .api import trading, portfolio, auth, circuit_breaker
 from .services.trading_bot import TradingBot
 from .services.websocket_manager import WebSocketManager
+from .services.service_constants import validate_constants
 from .logging_config import setup_logging
 # Import all models to ensure they're registered with SQLAlchemy
 from .models.user import User
@@ -48,6 +49,13 @@ trading_bot = None
 
 @app.on_event("startup")
 async def startup_event():
+    # Validate trading constants at startup
+    logger.info("🔍 Validating trading constants...")
+    if not validate_constants():
+        logger.error("❌ Trading constants validation failed! Check configuration.")
+        # Continue anyway but log critical warning
+        logger.warning("⚠️  Bot will start but may behave unexpectedly!")
+    
     # Create database tables
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -68,6 +76,8 @@ async def startup_event():
 
     logger.info("🤖 Trd Bot API Started Successfully!")
     logger.info("📊 Database: Connected to PostgreSQL db")
+    logger.info(f"🌐 Environment: {'MAINNET' if settings.mainnet_mode else 'TESTNET/PAPER'}")
+    logger.info(f"📋 Trading Profile: {settings.trading_profile.upper()}")
     print(f"🔗 CORS Origins: {settings.cors_origins}")
     print(f"🧪 Test Mode: {settings.binance_testnet}")
 

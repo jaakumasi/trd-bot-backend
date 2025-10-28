@@ -5,6 +5,7 @@ import asyncio
 import logging
 from datetime import datetime
 import random
+from ..config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +135,7 @@ class MockBinanceService:
             price = self.get_symbol_price(symbol)
             order_id = int(random.random() * 1000000)
             executed_qty = quantity * random.uniform(0.98, 1.0)  # Slight slippage
-            commission = executed_qty * price * 0.001  # 0.1% fee
+            commission = executed_qty * price * settings.fee_estimate_pct
 
             # Update mock balances
             if side.upper() == "BUY":
@@ -211,7 +212,7 @@ class MockBinanceService:
             price = self.get_symbol_price(symbol)
             entry_order_id = int(random.random() * 1000000)
             executed_qty = quantity * random.uniform(0.98, 1.0)
-            commission = executed_qty * price * 0.001
+            commission = executed_qty * price * settings.fee_estimate_pct
 
             # Update mock balances
             if side.upper() == "BUY":
