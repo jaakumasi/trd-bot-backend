@@ -17,18 +17,27 @@ logger = logging.getLogger(__name__)
 
 class BinanceService:
     def __init__(self):
+        # Get appropriate API keys based on testnet setting
+        api_key, secret_key = settings.get_active_binance_keys()
+        
+        # Determine testnet flag: False if paper trading, otherwise use setting
+        use_testnet = not settings.use_paper_trading and settings.binance_testnet
+        
         self.client = Client(
-            api_key=settings.binance_api_key,
-            api_secret=settings.binance_secret_key,
-            testnet=settings.binance_testnet,
+            api_key=api_key,
+            api_secret=secret_key,
+            testnet=use_testnet,
         )
         # Increase recvWindow to allow for more clock variance (default is 5000ms, we use 60000ms)
-        # Larger window helps with timestamp issues on systems with poor time sync
         self.client.RECV_WINDOW = 60_000
         self.is_connected = False
-        self.symbol_info_cache = {}  # Cache for symbol trading rules
-        self.timestamp_offset = 0  # Will be set during time synchronization
-        self.last_time_sync = 0  # Track when we last synced time
+        self.symbol_info_cache = {}
+        self.timestamp_offset = 0
+        self.last_time_sync = 0
+        
+        # Log which network we're using
+        network = "Mainnet (Paper Trading)" if settings.use_paper_trading else ("Testnet" if use_testnet else "Mainnet (Live)")
+        logger.info(f"🌐 BinanceService initialized for {network}")
 
     def get_symbol_info(self, symbol: str) -> Optional[Dict]:
         """Get trading rules and filters for a symbol"""

@@ -78,9 +78,12 @@ class PositionSyncManager:
             summary["conflicts_resolved"] += 1
 
     async def _get_db_positions(self, db: AsyncSession, user_id: int) -> List[OpenPosition]:
-        """Get all open positions for a user from database"""
+        """Get all open positions for a user from database (excluding paper trades)"""
         result = await db.execute(
-            select(OpenPosition).where(OpenPosition.user_id == user_id)
+            select(OpenPosition).where(
+                OpenPosition.user_id == user_id,
+                OpenPosition.is_paper_trade == False  # Exclude paper trades from sync
+            )
         )
         return result.scalars().all()
 

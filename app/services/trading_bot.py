@@ -11,6 +11,7 @@ from ..models.user import User
 from ..models.portfolio import Portfolio
 from .binance_service import BinanceService
 from .mock_binance_service import MockBinanceService
+from .paper_trading_service import PaperTradingService
 from .ai_analyzer import AIAnalyzer
 from .risk_manager import RiskManager
 from .websocket_manager import WebSocketManager
@@ -40,14 +41,25 @@ class TradingBot:
         )
         self.circuit_breaker = CircuitBreaker()
         self.position_sync_manager = PositionSyncManager(self.binance)
+        self.paper_trading = PaperTradingService() if settings.use_paper_trading else None
         self.ws_manager = ws_manager
         self.is_running = False
         self.active_users = {}
         self.last_analysis_time = {}
         
-        # Consecutive loss tracking for emergency stop
-        self.consecutive_losses = {}  # user_id -> count
-        self.loss_streak_cooldown = {}  # user_id -> cooldown_until_timestamp
+        self.consecutive_losses = {}
+        self.loss_streak_cooldown = {}
+        
+        if settings.use_paper_trading:
+            logger.info("📄 PAPER TRADING MODE ENABLED - Using mainnet data with simulated trades")
+            metrics_logger.info("BOT_MODE=PAPER_TRADING | DATA_SOURCE=MAINNET")
+        elif settings.use_mock_binance:
+            logger.info("🧪 MOCK MODE ENABLED - Simulated trades with mock data")
+        elif settings.binance_testnet:
+            logger.info("🧪 TESTNET MODE - Real testnet trading")
+        else:
+            logger.info("🚀 LIVE MODE - Real mainnet trading")
+
 
     def _create_binance_service(self):
         if settings.use_mock_binance:
@@ -96,6 +108,10 @@ class TradingBot:
 
         self.daily_reset_task_handle = asyncio.create_task(self.daily_reset_task())
         logger.info("⏰ Daily reset task created and started!")
+        
+        if settings.use_paper_trading:
+            self.paper_monitor_task = asyncio.create_task(self.paper_trading_monitor_loop())
+            logger.info("📄 Paper trading monitor task created (30s intervals)")
 
     async def initialize(self):
         """Initialize all services"""
@@ -193,6 +209,10 @@ class TradingBot:
             active_configs = await self._get_active_trading_configs(db)
             self._log_cycle_stats(cycle_count, active_configs)
 
+            # Monitor paper trading positions if enabled
+            if settings.use_paper_trading:
+                await self._check_paper_trade_exits(db, active_configs)
+
             processed_users = await self._process_active_configs(db, active_configs)
 
             cycle_duration = (
@@ -233,10 +253,12 @@ class TradingBot:
         if total_active_users == 0:
             return 0
 
-        # Synchronize positions with Binance before processing
+        # Synchronize positions with Binance before processing (skip in paper mode)
         await self._sync_positions_in_cycle(db, active_configs)
         
-        await self._check_oco_orders(db)
+        # Check OCO order status (skip in paper mode - no real OCO orders)
+        if not settings.use_paper_trading:
+            await self._check_oco_orders(db)
 
         processed_users = 0
         for config in active_configs:
@@ -654,6 +676,11 @@ class TradingBot:
         )
 
     def _fetch_usdt_balance(self, user_id: int) -> float:
+        """Get USDT balance - paper mode doesn't track balances"""
+        if settings.use_paper_trading:
+            logger.info(f"📄 [PAPER] [User {user_id}] Paper mode - balance tracking disabled")
+            return 10000.0  # Return arbitrary balance for validation (not actually used)
+        
         logger.debug(f"💳 [User {user_id}] Checking account balance...")
         balances = self.binance.get_account_balance()
         usdt_balance = balances.get("USDT", {}).get("free", 0.0)
@@ -1745,7 +1772,147 @@ class TradingBot:
     async def _execute_trade(
         self, db: AsyncSession, config: TradingConfig, signal: Dict, params: Dict, regime_analysis: Dict = None
     ):
-        """Execute a trade based on the signal"""
+        """Execute a trade based on the signal - routes to paper trading if enabled"""
+        
+        if settings.use_paper_trading:
+            return await self._execute_paper_trade(db, config, signal, params, regime_analysis)
+        
+        return await self._execute_real_trade(db, config, signal, params, regime_analysis)
+    
+    async def _execute_paper_trade(
+        self, db: AsyncSession, config: TradingConfig, signal: Dict, params: Dict, regime_analysis: Dict = None
+    ):
+        """Execute a paper trade with mainnet data"""
+        trade_start_time = datetime.now(timezone.utc)
+        user_id = config.user_id
+        symbol = config.trading_pair
+        side = signal["signal"].upper()
+
+        try:
+            logger.info(f"📄 [PAPER] [User {user_id}] EXECUTING PAPER TRADE:")
+            logger.info(f"   📊 Symbol: {symbol}")
+            logger.info(f"   📈 Side: {side}")
+            logger.info(f"   💰 Quantity: {params['position_size']:.6f}")
+            logger.info(f"   💵 Trade Value: ${params.get('trade_value', 0):.2f}")
+            logger.info("   🌐 Data Source: Binance Mainnet")
+            logger.info(f"   🎯 AI Confidence: {signal.get('final_confidence', signal.get('confidence', 0)):.1f}%")
+
+            current_price = self.binance.get_symbol_price(symbol)
+            
+            kline_data = self.binance.get_kline_data(symbol, "1m", 100)
+            df_with_indicators = self.ai_analyzer.calculate_technical_indicators(kline_data)
+
+            adaptive_exits = await self.risk_manager.get_adaptive_exit_levels(
+                db, user_id, df_with_indicators, side.lower(), current_price,
+                regime_analysis=regime_analysis
+            )
+
+            take_profit_price = adaptive_exits["take_profit_price"]
+            stop_loss_price = adaptive_exits["stop_loss_price"]
+
+            logger.info(
+                f"📄 [PAPER] [User {user_id}] Exit Levels: "
+                f"Entry=${current_price:.4f}, "
+                f"TP=${take_profit_price:.4f} ({adaptive_exits['take_profit_pct']:.2f}%), "
+                f"SL=${stop_loss_price:.4f} ({adaptive_exits['stop_loss_pct']:.2f}%), "
+                f"R:R={adaptive_exits['risk_reward_ratio']:.2f}:1"
+            )
+
+            trade_id = f"PAPER_{user_id}_{int(trade_start_time.timestamp())}"
+            success, message, position = self.paper_trading.open_position(
+                user_id=user_id,
+                trade_id=trade_id,
+                symbol=symbol,
+                side=side.lower(),
+                amount=params["position_size"],
+                entry_price=current_price,
+                stop_loss=stop_loss_price,
+                take_profit=take_profit_price,
+            )
+
+            if not success:
+                logger.error(f"📄 [PAPER] [User {user_id}] PAPER TRADE FAILED: {message}")
+                metrics_logger.info(
+                    f"PAPER_TRADE_FAILED | USER={user_id} | SYMBOL={symbol} | REASON={message}"
+                )
+                return
+
+            trade = Trade(
+                user_id=user_id,
+                trade_id=trade_id,
+                symbol=symbol,
+                side=side.lower(),
+                amount=params["position_size"],
+                price=current_price,
+                total_value=params["trade_value"],
+                fee=position.fees_paid,
+                status="filled",
+                is_test_trade=False,
+                strategy_used="paper_trading",
+                ai_signal_confidence=signal.get("final_confidence", signal.get("confidence", 0)),
+            )
+            db.add(trade)
+            await db.commit()
+
+            open_position = OpenPosition(
+                user_id=user_id,
+                symbol=symbol,
+                side=side.lower(),
+                amount=params["position_size"],
+                entry_price=current_price,
+                stop_loss=stop_loss_price,
+                take_profit=take_profit_price,
+                trade_id=trade_id,
+                entry_value=params["trade_value"],
+                fees_paid=position.fees_paid,
+                is_test_trade=False,
+                is_paper_trade=True,
+                status="open",
+            )
+            db.add(open_position)
+            await db.commit()
+
+            position_data = {
+                "trade_id": trade_id,
+                "symbol": symbol,
+                "side": side.lower(),
+                "amount": params["position_size"],
+                "entry_price": current_price,
+                "stop_loss": stop_loss_price,
+                "take_profit": take_profit_price,
+                "entry_time": trade_start_time,
+                "entry_value": params["trade_value"],
+                "fees_paid": position.fees_paid,
+            }
+            self.risk_manager.add_open_position(user_id, position_data)
+            self.risk_manager.record_trade(user_id)
+
+            logger.info(f"📄 [PAPER] [User {user_id}] POSITION OPENED:")
+            logger.info(f"   📊 Trade: {side} {params['position_size']:.6f} {symbol}")
+            logger.info(f"   💰 Entry Price: ${current_price:.4f}")
+            logger.info(f"   🎯 Take Profit: ${take_profit_price:.4f}")
+            logger.info(f"   🛑 Stop Loss: ${stop_loss_price:.4f}")
+            logger.info(f"   💵 Position Value: ${params['trade_value']:.2f}")
+            logger.info(f"   💸 Entry Fee: ${position.fees_paid:.4f}")
+
+            metrics_logger.info(
+                f"PAPER_POSITION_OPENED | USER={user_id} | SYMBOL={symbol} | SIDE={side} | "
+                f"QTY={params['position_size']:.6f} | ENTRY=${current_price:.4f} | "
+                f"TP=${take_profit_price:.4f} | SL=${stop_loss_price:.4f} | "
+                f"VALUE=${params['trade_value']:.2f} | FEE=${position.fees_paid:.4f} | "
+                f"CONFIDENCE={signal.get('final_confidence', signal.get('confidence', 0)):.1f}"
+            )
+
+            logger.info(f"📄 [PAPER] [User {user_id}] PAPER POSITION OPENED SUCCESSFULLY!")
+
+        except Exception as e:
+            logger.error(f"📄 [PAPER] [User {user_id}] PAPER TRADE ERROR: {e}")
+            metrics_logger.info(f"PAPER_TRADE_ERROR | USER={user_id} | ERROR={str(e)}")
+    
+    async def _execute_real_trade(
+        self, db: AsyncSession, config: TradingConfig, signal: Dict, params: Dict, regime_analysis: Dict = None
+    ):
+        """Execute a real or testnet trade"""
         trade_start_time = datetime.now(timezone.utc)
         user_id = config.user_id
         symbol = config.trading_pair
@@ -2069,6 +2236,12 @@ class TradingBot:
 
     async def _sync_positions_on_startup(self):
         """Synchronize database positions with Binance state on startup"""
+        
+        # Skip position sync in paper trading mode (no real OCO orders to sync)
+        if settings.use_paper_trading:
+            logger.info("📄 [PAPER] Skipping position sync - paper trading has no real OCO orders")
+            return
+        
         try:
             logger.info("🔄 Starting position synchronization with Binance on startup...")
             
@@ -2125,6 +2298,12 @@ class TradingBot:
 
     async def _sync_positions_in_cycle(self, db: AsyncSession, active_configs) -> None:
         """Synchronize positions during trading cycle for active users"""
+        
+        # Skip position sync in paper trading mode (no real OCO orders to sync)
+        if settings.use_paper_trading:
+            logger.debug("📄 [PAPER] Skipping position sync - paper trading manages positions internally")
+            return
+        
         try:
             # Extract user IDs from active configs
             user_ids = [config.user_id for config in active_configs]
@@ -2255,6 +2434,128 @@ class TradingBot:
             except Exception as e:
                 logger.error(f"❌ Error in daily reset task: {e}")
                 await asyncio.sleep(3600)  # Wait 1 hour before retry
+    
+    async def paper_trading_monitor_loop(self):
+        """Monitor paper trading positions every 30 seconds for TP/SL hits"""
+        logger.info("📄 Paper trading monitor loop started (30s interval)")
+        
+        while self.is_running:
+            try:
+                await asyncio.sleep(30)
+                
+                if not self.paper_trading:
+                    continue
+                
+                # get_async_session() returns an AsyncSession instance (async context manager).
+                # Use `async with` to acquire and close the session correctly instead of `async for`.
+                async with get_async_session() as db:
+                    await self._check_paper_positions(db)
+                        
+            except asyncio.CancelledError:
+                logger.debug("📄 Paper trading monitor task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"📄 [PAPER] Error in monitor loop: {e}")
+    
+    async def _check_paper_positions(self, db: AsyncSession):
+        """Check all paper positions for TP/SL hits"""
+        try:
+            result = await db.execute(
+                select(OpenPosition).where(
+                    OpenPosition.is_paper_trade == True,
+                    OpenPosition.status == "open"
+                )
+            )
+            paper_positions = result.scalars().all()
+            
+            if not paper_positions:
+                return
+            
+            symbols = list(set(p.symbol for p in paper_positions))
+            
+            for symbol in symbols:
+                current_price = self.binance.get_symbol_price(symbol)
+                if not current_price:
+                    continue
+                
+                symbol_positions = [p for p in paper_positions if p.symbol == symbol]
+                
+                for db_position in symbol_positions:
+                    user_id = db_position.user_id
+                    exits = self.paper_trading.check_position_exits(
+                        user_id, current_price, symbol
+                    )
+                    
+                    for exit_info in exits:
+                        await self._close_paper_position(
+                            db,
+                            db_position,
+                            exit_info["exit_price"],
+                            exit_info["exit_reason"]
+                        )
+                        
+        except Exception as e:
+            logger.error(f"📄 [PAPER] Error checking positions: {e}")
+    
+    async def _close_paper_position(
+        self,
+        db: AsyncSession,
+        db_position: OpenPosition,
+        exit_price: float,
+        exit_reason: str
+    ):
+        """Close a paper trading position and update database"""
+        try:
+            user_id = db_position.user_id
+            trade_id = db_position.trade_id
+            
+            success, message, trade_summary = self.paper_trading.close_position(
+                user_id, trade_id, exit_price, exit_reason
+            )
+            
+            if not success:
+                logger.error(f"📄 [PAPER] Failed to close position: {message}")
+                return
+            
+            await self._update_trade_record_after_exit(
+                db,
+                trade_id=trade_id,
+                exit_price=exit_price,
+                exit_fee=trade_summary["total_fees"] - trade_summary["entry_value"] * 0.001,
+                exit_reason=exit_reason,
+                profit_loss=trade_summary["net_pnl"],
+                profit_loss_pct=trade_summary["pnl_percentage"],
+                duration_seconds=trade_summary["duration_seconds"],
+            )
+            
+            await self._remove_open_position_from_db(db, trade_id)
+            
+            self._remove_position_from_risk_manager(user_id, trade_id)
+            
+            if trade_summary["net_pnl"] < 0:
+                self.consecutive_losses[user_id] = self.consecutive_losses.get(user_id, 0) + 1
+            else:
+                self.consecutive_losses[user_id] = 0
+            
+            logger.info(
+                f"📄 [PAPER] Position closed: {db_position.symbol} | "
+                f"Entry: ${db_position.entry_price:.2f} | Exit: ${exit_price:.2f} | "
+                f"P&L: ${trade_summary['net_pnl']:.2f} ({trade_summary['pnl_percentage']:+.2f}%) | "
+                f"Reason: {exit_reason}"
+            )
+            
+            await self.ws_manager.send_to_user(
+                user_id,
+                {
+                    "type": "paper_position_closed",
+                    "position": trade_summary,
+                    "exit_reason": exit_reason,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            
+        except Exception as e:
+            logger.error(f"📄 [PAPER] Error closing position {db_position.trade_id}: {e}")
 
     def _log_cycle_summary(
         self, cycle_count: int, duration: float, processed_users: int
@@ -2318,3 +2619,88 @@ class TradingBot:
             metrics_logger.info(
                 f"CYCLE_{cycle_count}_COMPLETED | DURATION={duration:.2f}s | PROCESSED_USERS={processed_users}"
             )
+    
+    async def _check_paper_trade_exits(self, db: AsyncSession, active_configs: List[TradingConfig]) -> None:
+        """
+        Monitor paper trading positions and close them when TP/SL is hit.
+        Simulates OCO order execution with mainnet price data.
+        """
+        try:
+            # Get current prices for all active symbols
+            symbols = {config.trading_pair for config in active_configs}
+            current_prices = {}
+            
+            for symbol in symbols:
+                try:
+                    price = self.binance.get_symbol_price(symbol)
+                    if price:
+                        current_prices[symbol] = price
+                except Exception as e:
+                    logger.error(f"📄 [PAPER] Error getting price for {symbol}: {e}")
+            
+            if not current_prices:
+                return
+            
+            # Check each active user's paper positions
+            for config in active_configs:
+                user_id = config.user_id
+                closed_trades = await self.paper_trading.check_position_exits(user_id, current_prices)
+                
+                # Process closed trades
+                for trade_summary in closed_trades:
+                    await self._record_paper_trade_exit(db, trade_summary)
+                    
+        except Exception as e:
+            logger.error(f"📄 [PAPER] Error checking paper trade exits: {e}")
+    
+    async def _record_paper_trade_exit(self, db: AsyncSession, trade_summary: Dict) -> None:
+        """Record paper trade exit in database"""
+        try:
+            # Update Trade record
+            trade_query = select(Trade).where(Trade.trade_id == trade_summary["trade_id"])
+            result = await db.execute(trade_query)
+            trade = result.scalar_one_or_none()
+            
+            if trade:
+                trade.status = "closed"
+                trade.closed_at = datetime.fromisoformat(trade_summary["closed_at"])
+                trade.exit_price = trade_summary["exit_price"]
+                trade.exit_fee = trade_summary["total_fees"] - trade.fee
+                trade.exit_reason = trade_summary["exit_reason"]
+                trade.profit_loss = trade_summary["net_pnl"]
+                trade.profit_loss_percentage = trade_summary["pnl_percentage"]
+                trade.duration_seconds = trade_summary["duration_seconds"]
+                await db.commit()
+            
+            # Remove from OpenPosition
+            position_query = select(OpenPosition).where(OpenPosition.trade_id == trade_summary["trade_id"])
+            result = await db.execute(position_query)
+            position = result.scalar_one_or_none()
+            
+            if position:
+                await db.delete(position)
+                await db.commit()
+            
+            # Remove from risk manager
+            self.risk_manager.remove_open_position(trade_summary["user_id"], trade_summary["trade_id"])
+            
+            # Log paper trade closure
+            pnl_emoji = "💰" if trade_summary["net_pnl"] > 0 else "📉"
+            logger.info(
+                f"📄 [PAPER] {pnl_emoji} Trade Closed | User: {trade_summary['user_id']} | "
+                f"Symbol: {trade_summary['symbol']} | Entry: ${trade_summary['entry_price']:.4f} | "
+                f"Exit: ${trade_summary['exit_price']:.4f} | "
+                f"P&L: ${trade_summary['net_pnl']:.2f} ({trade_summary['pnl_percentage']:+.2f}%) | "
+                f"Reason: {trade_summary['exit_reason']}"
+            )
+            
+            metrics_logger.info(
+                f"PAPER_TRADE_CLOSED | USER={trade_summary['user_id']} | "
+                f"SYMBOL={trade_summary['symbol']} | ENTRY={trade_summary['entry_price']:.4f} | "
+                f"EXIT={trade_summary['exit_price']:.4f} | PNL={trade_summary['net_pnl']:.2f} | "
+                f"PNL_PCT={trade_summary['pnl_percentage']:.2f} | REASON={trade_summary['exit_reason']}"
+            )
+            
+        except Exception as e:
+            logger.error(f"📄 [PAPER] Error recording paper trade exit: {e}")
+

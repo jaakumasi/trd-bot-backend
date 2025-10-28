@@ -16,6 +16,7 @@ class Trade(Base):
     fee = Column(DECIMAL(20, 8), default=0)  # Entry fee
     status = Column(String(20), default='pending')  # 'pending', 'filled', 'closed'
     is_test_trade = Column(Boolean, default=True)
+    is_paper_trade = Column(Boolean, default=False)  # Paper trading flag
     strategy_used = Column(String(50))
     ai_signal_confidence = Column(DECIMAL(5, 2))
     executed_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -71,6 +72,8 @@ class OpenPosition(Base):
     entry_value = Column(DECIMAL(20, 8), nullable=False)
     fees_paid = Column(DECIMAL(20, 8), default=0)
     is_test_trade = Column(Boolean, default=True)
+    is_paper_trade = Column(Boolean, default=False)  # Paper trading flag
+    status = Column(String(20), default='open')  # 'open' or 'closed'
     opened_at = Column(DateTime(timezone=True), server_default=func.now())
     
     # OCO (One-Cancels-Other) order tracking
