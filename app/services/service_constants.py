@@ -1,33 +1,9 @@
 """Shared configuration values for trading services."""
 
 from __future__ import annotations
-import random
 import logging
 
 logger = logging.getLogger(__name__)
-
-# ============================================================================
-# ANTI-OVERFITTING UTILITIES
-# ============================================================================
-
-def get_randomized_threshold(base_value: float, variance_pct: float = 0.10) -> float:
-    """
-    Add randomization to thresholds to prevent point-estimate overfitting.
-    
-    Args:
-        base_value: The base threshold value
-        variance_pct: Percentage variance (default 10%)
-    
-    Returns:
-        Randomized value within ±variance_pct of base
-    
-    Example:
-        get_randomized_threshold(75, 0.10) -> returns 67.5 to 82.5
-    """
-    lower = base_value * (1 - variance_pct)
-    upper = base_value * (1 + variance_pct)
-    return random.uniform(lower, upper)
-
 
 # ============================================================================
 # ASSET-SPECIFIC PARAMETERS (Prevents Bitcoin-only overfitting)
@@ -174,6 +150,11 @@ MIN_RISK_REWARD_RATIO = 2.0  # Minimum 2:1 R:R for profitable trading after fees
 TARGET_RISK_REWARD_RATIO = 2.5  # Target R:R for optimal setups (1:2.5)
 MAX_RISK_REWARD_RATIO = 4.0  # Maximum to consider (beyond this, too ambitious)
 
+# Structure-based stop loss settings (Phase 3 enhancement)
+MIN_STOP_DISTANCE_PCT = 0.005  # 0.5% minimum stop distance (prevents too-tight stops)
+MAX_STOP_DISTANCE_PCT = 0.03   # 3.0% maximum stop distance (prevents insane stops)
+STRUCTURE_STOP_ATR_BUFFER = 1.0  # 1.0x ATR buffer beyond S/R level (prevents premature stops on wicks)
+
 # Support/Resistance detection settings
 SR_LOOKBACK_PERIODS = 50  # Candles to analyze for S/R levels
 SR_TOUCH_THRESHOLD = 0.005  # 0.5% proximity to consider a "touch" (loosened from 0.2% to reduce overfitting)
@@ -224,6 +205,9 @@ __all__ = [
     "MIN_RISK_REWARD_RATIO",
     "TARGET_RISK_REWARD_RATIO",
     "MAX_RISK_REWARD_RATIO",
+    "MIN_STOP_DISTANCE_PCT",
+    "MAX_STOP_DISTANCE_PCT",
+    "STRUCTURE_STOP_ATR_BUFFER",
     "SR_LOOKBACK_PERIODS",
     "SR_TOUCH_THRESHOLD",
     "SR_MIN_TOUCHES",
@@ -236,7 +220,6 @@ __all__ = [
     "EIGHT_DECIMAL_PLACES",
     "OCO_SELL_STOP_LIMIT_BUFFER",
     "OCO_BUY_STOP_LIMIT_BUFFER",
-    "get_randomized_threshold",
     "ASSET_PARAMS",
     "get_asset_params",
     "validate_constants",
