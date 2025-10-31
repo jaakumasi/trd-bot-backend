@@ -76,10 +76,10 @@ async def startup_event():
 
     logger.info("🤖 Trd Bot API Started Successfully!")
     logger.info("📊 Database: Connected to PostgreSQL db")
-    logger.info(f"🌐 Environment: {'MAINNET' if settings.mainnet_mode else 'TESTNET/PAPER'}")
+    logger.info(f"🌐 Trading Mode: {settings.get_environment_name()}")
     logger.info(f"📋 Trading Profile: {settings.trading_profile.upper()}")
     print(f"🔗 CORS Origins: {settings.cors_origins}")
-    print(f"🧪 Test Mode: {settings.binance_testnet}")
+    print(f"🎯 Trading Mode: {settings.get_environment_name()}")
 
 
 @app.on_event("shutdown")
@@ -102,7 +102,7 @@ async def health_check():
         "status": "healthy",
         "version": "1.0.0",
         "bot_active": trading_bot.is_running if trading_bot else False,
-        "test_mode": settings.binance_testnet,
+        "trading_mode": settings.get_environment_name(),
     }
 
 
@@ -158,7 +158,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     {
                         "type": "status_update",
                         "bot_running": trading_bot.is_running if trading_bot else False,
-                        "test_mode": settings.binance_testnet,
+                        "trading_mode": settings.get_environment_name(),
                     },
                 )
 

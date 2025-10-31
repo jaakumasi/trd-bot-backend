@@ -12,7 +12,6 @@ from .service_constants import (
     MIN_ACCOUNT_BALANCE,
     MIN_SIGNAL_CONFIDENCE,
     MIN_TRADE_VALUE,
-    get_randomized_threshold,
 )
 
 logger = logging.getLogger(__name__)
@@ -195,13 +194,11 @@ class RiskManager:
         """
         base_threshold = MIN_SIGNAL_CONFIDENCE
         
-        # If no history, use randomized base threshold
+        # If no history, use base threshold
         if not user_trade_history:
-            randomized = get_randomized_threshold(base_threshold, variance_pct=0.10)
-            # Cap at 70% maximum
-            capped = min(randomized, 70.0)
+            capped = min(base_threshold, 70.0)
             logger.info(
-                f"🎲 No trade history - using randomized threshold: {capped:.1f} "
+                f"� No trade history - using base threshold: {capped:.1f} "
                 f"(base: {base_threshold}, capped at 70%)"
             )
             return capped
@@ -211,31 +208,25 @@ class RiskManager:
         
         # Adaptive adjustment based on performance (but capped at 70%)
         if win_rate > 60 and recent_trend == 'winning':
-            # System is hot - be more aggressive
             adjusted = base_threshold - 10
             logger.info(
                 f"📈 High performance detected (WR: {win_rate:.1f}%, trend: {recent_trend}) "
                 f"- reducing threshold to {adjusted}"
             )
         elif win_rate < 40 or recent_trend == 'losing':
-            # System struggling - require higher confidence (but cap at 70%)
             adjusted = min(base_threshold + 5, 70.0)
             logger.info(
                 f"📉 Low performance detected (WR: {win_rate:.1f}%, trend: {recent_trend}) "
                 f"- increasing threshold to {adjusted} (capped at 70%)"
             )
         else:
-            # Normal performance - use base with slight randomization
             adjusted = base_threshold
             logger.info(
                 f"➡️ Normal performance (WR: {win_rate:.1f}%) - using base threshold {adjusted}"
             )
         
-        # Add randomization to prevent overfitting to exact values
-        final_threshold = get_randomized_threshold(adjusted, variance_pct=0.08)
-        
         # Cap at 70% maximum to prevent killing good trades
-        final_threshold = min(final_threshold, 70.0)
+        final_threshold = min(adjusted, 70.0)
         
         # Clamp to reasonable range (50-70%)
         final_threshold = max(50, min(70, final_threshold))
@@ -1401,6 +1392,123 @@ class RiskManager:
             "support_distance_pct": 2.0,
             "resistance_distance_pct": 2.0,
         }
+
+    def calculate_structure_based_stop(
+        self, side: str, entry_price: float, sr_levels: Dict, atr: float
+    ) -> Dict:
+        """
+        Calculate structure-based stop loss at actual invalidation levels.
+        
+        Philosophy: Place stops where the trade setup is INVALIDATED, not at arbitrary percentages.
+        - BUY: Stop goes below support (if support breaks, bullish thesis invalidated)
+        - SELL: Stop goes above resistance (if resistance breaks, bearish thesis invalidated)
+        
+        Buffer: 1.0x ATR beyond the structure level to avoid premature stops on wicks.
+        
+        Returns dict with:
+            - stop_loss: Invalidation price level
+            - stop_distance_pct: Distance from entry as percentage
+            - invalidation_level: The actual S/R level used
+            - buffer_used: ATR buffer applied
+        """
+        from .service_constants import (
+            MIN_STOP_DISTANCE_PCT,
+            MAX_STOP_DISTANCE_PCT,
+            STRUCTURE_STOP_ATR_BUFFER,
+        )
+        
+        try:
+            side = side.lower()
+            
+            if side == "buy":
+                # For BUY: Invalidation = support break
+                # Stop goes below support with ATR buffer
+                invalidation_level = sr_levels["nearest_support"]
+                atr_buffer = atr * STRUCTURE_STOP_ATR_BUFFER
+                stop_loss = invalidation_level - atr_buffer
+                
+                logger.info(
+                    f"🛡️ BUY Structure Stop: Support=${invalidation_level:.2f}, "
+                    f"Buffer={atr_buffer:.2f} ({STRUCTURE_STOP_ATR_BUFFER}x ATR), "
+                    f"Final Stop=${stop_loss:.2f}"
+                )
+                
+            else:  # sell
+                # For SELL: Invalidation = resistance break
+                # Stop goes above resistance with ATR buffer
+                invalidation_level = sr_levels["nearest_resistance"]
+                atr_buffer = atr * STRUCTURE_STOP_ATR_BUFFER
+                stop_loss = invalidation_level + atr_buffer
+                
+                logger.info(
+                    f"🛡️ SELL Structure Stop: Resistance=${invalidation_level:.2f}, "
+                    f"Buffer={atr_buffer:.2f} ({STRUCTURE_STOP_ATR_BUFFER}x ATR), "
+                    f"Final Stop=${stop_loss:.2f}"
+                )
+            
+            # Calculate distance from entry
+            stop_distance = abs(entry_price - stop_loss)
+            stop_distance_pct = (stop_distance / entry_price) * 100
+            
+            # Enforce minimum distance (prevent too-tight stops in low volatility)
+            min_distance = entry_price * MIN_STOP_DISTANCE_PCT
+            if stop_distance < min_distance:
+                logger.warning(
+                    f"⚠️ Structure stop too tight ({stop_distance_pct:.2f}%). "
+                    f"Widening to minimum {MIN_STOP_DISTANCE_PCT*100:.1f}%"
+                )
+                if side == "buy":
+                    stop_loss = entry_price - min_distance
+                else:
+                    stop_loss = entry_price + min_distance
+                stop_distance = min_distance
+                stop_distance_pct = MIN_STOP_DISTANCE_PCT * 100
+            
+            # Enforce maximum distance (prevent insane stops in high volatility)
+            max_distance = entry_price * MAX_STOP_DISTANCE_PCT
+            if stop_distance > max_distance:
+                logger.error(
+                    f"🚨 Structure stop too wide ({stop_distance_pct:.2f}%). "
+                    f"Capping at maximum {MAX_STOP_DISTANCE_PCT*100:.1f}%"
+                )
+                if side == "buy":
+                    stop_loss = entry_price - max_distance
+                else:
+                    stop_loss = entry_price + max_distance
+                stop_distance = max_distance
+                stop_distance_pct = MAX_STOP_DISTANCE_PCT * 100
+            
+            logger.info(
+                "✅ Structure-Based Stop: $%.2f (%.2f%% from entry $%.2f)",
+                stop_loss,
+                stop_distance_pct,
+                entry_price,
+            )
+            
+            return {
+                "stop_loss": stop_loss,
+                "stop_distance_pct": stop_distance_pct,
+                "invalidation_level": invalidation_level,
+                "buffer_used": atr_buffer,
+                "method": "structure_based"
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Error calculating structure-based stop: {e}")
+            # Fallback to safe default (1% stop)
+            default_distance = entry_price * 0.01
+            if side == "buy":
+                stop_loss = entry_price - default_distance
+            else:
+                stop_loss = entry_price + default_distance
+            
+            return {
+                "stop_loss": stop_loss,
+                "stop_distance_pct": 1.0,
+                "invalidation_level": entry_price,
+                "buffer_used": 0.0,
+                "method": "fallback_default"
+            }
 
     def calculate_adaptive_risk_reward(
         self, side: str, entry_price: float, sr_levels: Dict, atr: float

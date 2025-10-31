@@ -18,6 +18,7 @@ from .websocket_manager import WebSocketManager
 from .market_regime_analyzer import MarketRegimeAnalyzer
 from .circuit_breaker import CircuitBreaker, CircuitBreakerTriggered
 from .position_sync_manager import PositionSyncManager
+from .trade_outcome_tracker import TradeOutcomeTracker
 from ..logging_config import get_trading_metrics_logger
 from ..config import settings
 from .service_constants import (
@@ -41,7 +42,8 @@ class TradingBot:
         )
         self.circuit_breaker = CircuitBreaker()
         self.position_sync_manager = PositionSyncManager(self.binance)
-        self.paper_trading = PaperTradingService() if settings.use_paper_trading else None
+        self.paper_trading = PaperTradingService() if settings.use_paper_execution() else None
+        self.trade_tracker = TradeOutcomeTracker()
         self.ws_manager = ws_manager
         self.is_running = False
         self.active_users = {}
@@ -50,19 +52,25 @@ class TradingBot:
         self.consecutive_losses = {}
         self.loss_streak_cooldown = {}
         
-        if settings.use_paper_trading:
-            logger.info("📄 PAPER TRADING MODE ENABLED - Using mainnet data with simulated trades")
-            metrics_logger.info("BOT_MODE=PAPER_TRADING | DATA_SOURCE=MAINNET")
-        elif settings.use_mock_binance:
-            logger.info("🧪 MOCK MODE ENABLED - Simulated trades with mock data")
-        elif settings.binance_testnet:
-            logger.info("🧪 TESTNET MODE - Real testnet trading")
-        else:
-            logger.info("🚀 LIVE MODE - Real mainnet trading")
+        env_name = settings.get_environment_name()
+        logger.info(f"🌐 Trading Mode: {env_name}")
+        
+        if settings.trading_mode == settings.trading_mode.MOCK:
+            logger.info("🧪 MOCK MODE - Simulated trades with mock data")
+            metrics_logger.info("BOT_MODE=MOCK | DATA_SOURCE=MOCK")
+        elif settings.trading_mode == settings.trading_mode.TESTNET:
+            logger.info("🧪 TESTNET MODE - Real testnet trading with fake money")
+            metrics_logger.info("BOT_MODE=TESTNET | DATA_SOURCE=TESTNET_API")
+        elif settings.trading_mode == settings.trading_mode.PAPER_MAINNET:
+            logger.info("📄 PAPER TRADING MODE - Mainnet data with simulated trades")
+            metrics_logger.info("BOT_MODE=PAPER_TRADING | DATA_SOURCE=MAINNET_API")
+        else:  # LIVE_MAINNET
+            logger.info("🚀 LIVE MAINNET MODE - REAL MONEY TRADING")
+            metrics_logger.info("BOT_MODE=LIVE_MAINNET | DATA_SOURCE=MAINNET_API | WARNING=REAL_FUNDS")
 
 
     def _create_binance_service(self):
-        if settings.use_mock_binance:
+        if settings.use_mock_service():
             logger.info("🧪 Using MOCK Binance service - All trades are simulated!")
             return MockBinanceService()
 
@@ -109,7 +117,7 @@ class TradingBot:
         self.daily_reset_task_handle = asyncio.create_task(self.daily_reset_task())
         logger.info("⏰ Daily reset task created and started!")
         
-        if settings.use_paper_trading:
+        if settings.use_paper_execution():
             self.paper_monitor_task = asyncio.create_task(self.paper_trading_monitor_loop())
             logger.info("📄 Paper trading monitor task created (30s intervals)")
 
@@ -210,7 +218,7 @@ class TradingBot:
             self._log_cycle_stats(cycle_count, active_configs)
 
             # Monitor paper trading positions if enabled
-            if settings.use_paper_trading:
+            if settings.use_paper_execution():
                 await self._check_paper_trade_exits(db, active_configs)
 
             processed_users = await self._process_active_configs(db, active_configs)
@@ -257,7 +265,7 @@ class TradingBot:
         await self._sync_positions_in_cycle(db, active_configs)
         
         # Check OCO order status (skip in paper mode - no real OCO orders)
-        if not settings.use_paper_trading:
+        if not settings.use_paper_execution():
             await self._check_oco_orders(db)
 
         processed_users = 0
@@ -329,7 +337,7 @@ class TradingBot:
                 return
 
             logger.info(
-                f"📊 [User {user_id}] ANALYZING {symbol} (Network: {'Testnet' if settings.binance_testnet else 'Mainnet'})"
+                f"📊 [User {user_id}] ANALYZING {symbol} (Mode: {settings.get_environment_name()})"
             )
 
             market_snapshot = self._fetch_market_snapshot(symbol, user_id)
@@ -423,7 +431,7 @@ class TradingBot:
                     return
                 
                 # Mainnet safety: require stricter conditions for override
-                if settings.mainnet_mode and settings.is_mainnet_live():
+                if settings.use_mainnet_thresholds() and settings.is_mainnet_live():
                     # For mainnet, require ALL of: high AI confidence, high confluence, high technical score
                     mtf_confluence = signal_details.get('mtf_confluence', signal_details.get('signal_confluence', 0))
                     technical_score = signal_details.get('technical_score', 0)
@@ -718,7 +726,7 @@ class TradingBot:
 
     def _fetch_usdt_balance(self, user_id: int) -> float:
         """Get USDT balance - paper mode doesn't track balances"""
-        if settings.use_paper_trading:
+        if settings.use_paper_execution():
             logger.info(f"📄 [PAPER] [User {user_id}] Paper mode - balance tracking disabled")
             return 10000.0  # Return arbitrary balance for validation (not actually used)
         
@@ -1820,7 +1828,7 @@ class TradingBot:
     ):
         """Execute a trade based on the signal - routes to paper trading if enabled"""
         
-        if settings.use_paper_trading:
+        if settings.use_paper_execution():
             return await self._execute_paper_trade(db, config, signal, params, regime_analysis)
         
         return await self._execute_real_trade(db, config, signal, params, regime_analysis)
@@ -1899,6 +1907,30 @@ class TradingBot:
             )
             db.add(trade)
             await db.commit()
+            
+            # Phase 7: Log trade entry to outcome tracker for learning
+            try:
+                latest = df_with_indicators.iloc[-1] if not df_with_indicators.empty else {}
+                market_state = {
+                    "rsi": float(latest.get("rsi", 50)) if latest else 50,
+                    "regime": regime_analysis.get("regime", "UNKNOWN") if regime_analysis else "UNKNOWN",
+                    "atr_percentage": regime_analysis.get("atr_percentage", 0) if regime_analysis else 0,
+                    "trend_strength": regime_analysis.get("trend_strength", 0) if regime_analysis else 0,
+                    "volume_ratio": float(latest.get("volume", 1) / latest.get("volume_sma", 1)) if latest and latest.get("volume_sma", 0) > 0 else 1.0,
+                }
+                
+                self.trade_tracker.log_trade_entry(
+                    trade_id=trade_id,
+                    user_id=user_id,
+                    signal=signal,
+                    market_state=market_state,
+                    entry_price=current_price,
+                    stop_loss=stop_loss_price,
+                    take_profit=take_profit_price
+                )
+                logger.debug(f"📊 [TRACKER] Logged trade entry {trade_id} for learning system")
+            except Exception as tracker_error:
+                logger.warning(f"⚠️ [TRACKER] Failed to log trade entry: {tracker_error}")
 
             open_position = OpenPosition(
                 user_id=user_id,
@@ -1971,7 +2003,7 @@ class TradingBot:
             logger.info(f"   💰 Quantity: {params['position_size']:.6f}")
             logger.info(f"   💵 Trade Value: ${params.get('trade_value', 0):.2f}")
             logger.info(
-                f"   🌐 Binance Network: {'Testnet' if settings.binance_testnet else 'Mainnet (REAL MONEY)'}"
+                f"   🌐 Trading Mode: {settings.get_environment_name()}"
             )
             logger.info(
                 f"   🎯 AI Confidence: {signal.get('final_confidence', signal.get('confidence', 0)):.1f}%"
@@ -2067,6 +2099,30 @@ class TradingBot:
             db.add(trade)
             await db.commit()
             logger.debug(f"✅ [User {user_id}] Trade recorded in database")
+            
+            # Phase 7: Log trade entry to outcome tracker for learning
+            try:
+                latest = df_with_indicators.iloc[-1] if not df_with_indicators.empty else {}
+                market_state = {
+                    "rsi": float(latest.get("rsi", 50)) if latest else 50,
+                    "regime": regime_analysis.get("regime", "UNKNOWN") if regime_analysis else "UNKNOWN",
+                    "atr_percentage": regime_analysis.get("atr_percentage", 0) if regime_analysis else 0,
+                    "trend_strength": regime_analysis.get("trend_strength", 0) if regime_analysis else 0,
+                    "volume_ratio": float(latest.get("volume", 1) / latest.get("volume_sma", 1)) if latest and latest.get("volume_sma", 0) > 0 else 1.0,
+                }
+                
+                self.trade_tracker.log_trade_entry(
+                    trade_id=str(order_id),
+                    user_id=user_id,
+                    signal=signal,
+                    market_state=market_state,
+                    entry_price=fill_price,
+                    stop_loss=stop_loss_price,
+                    take_profit=take_profit_price
+                )
+                logger.debug(f"📊 [TRACKER] Logged trade entry {order_id} for learning system")
+            except Exception as tracker_error:
+                logger.warning(f"⚠️ [TRACKER] Failed to log trade entry: {tracker_error}")
 
             # Create open position in database
             open_position = OpenPosition(
@@ -2135,7 +2191,7 @@ class TradingBot:
 
             # Log to metrics file for analysis
             metrics_logger.info(
-                f"POSITION_OPENED | USER={user_id} | SYMBOL={symbol} | SIDE={side} | QTY={executed_qty:.6f} | ENTRY=${fill_price:.4f} | TP=${take_profit_price:.4f} | SL=${stop_loss_price:.4f} | VALUE=${total_cost:.2f} | FEE=${commission:.4f} | CONFIDENCE={signal.get('final_confidence', signal.get('confidence', 0)):.1f} | BALANCE=${current_usdt_balance:.2f} | NETWORK={'TESTNET' if settings.binance_testnet else 'MAINNET'} | IS_TEST_TRADE={config.is_test_mode} | OCO={oco_order_id}"
+                f"POSITION_OPENED | USER={user_id} | SYMBOL={symbol} | SIDE={side} | QTY={executed_qty:.6f} | ENTRY=${fill_price:.4f} | TP=${take_profit_price:.4f} | SL=${stop_loss_price:.4f} | VALUE=${total_cost:.2f} | FEE=${commission:.4f} | CONFIDENCE={signal.get('final_confidence', signal.get('confidence', 0)):.1f} | BALANCE=${current_usdt_balance:.2f} | MODE={settings.get_environment_name()} | IS_TEST_TRADE={config.is_test_mode} | OCO={oco_order_id}"
             )
 
             # Send trade notification
@@ -2152,7 +2208,7 @@ class TradingBot:
                         "confidence": signal.get(
                             "final_confidence", signal.get("confidence", 0)
                         ),
-                        "binance_testnet": settings.binance_testnet,
+                        "trading_mode": settings.get_environment_name(),
                         "is_test_trade": config.is_test_mode,
                         "order_id": order_id,
                         "commission": commission,
@@ -2284,7 +2340,7 @@ class TradingBot:
         """Synchronize database positions with Binance state on startup"""
         
         # Skip position sync in paper trading mode (no real OCO orders to sync)
-        if settings.use_paper_trading:
+        if settings.use_paper_execution():
             logger.info("📄 [PAPER] Skipping position sync - paper trading has no real OCO orders")
             return
         
@@ -2346,7 +2402,7 @@ class TradingBot:
         """Synchronize positions during trading cycle for active users"""
         
         # Skip position sync in paper trading mode (no real OCO orders to sync)
-        if settings.use_paper_trading:
+        if settings.use_paper_execution():
             logger.debug("📄 [PAPER] Skipping position sync - paper trading manages positions internally")
             return
         
@@ -2730,6 +2786,28 @@ class TradingBot:
                 trade.profit_loss_percentage = trade_summary["pnl_percentage"]
                 trade.duration_seconds = trade_summary["duration_seconds"]
                 await db.commit()
+                
+                # Log trade exit for learning system
+                try:
+                    exit_reason = trade_summary["exit_reason"].lower()
+                    if "take profit" in exit_reason or "tp" in exit_reason:
+                        outcome = "TP"
+                    elif "stop loss" in exit_reason or "sl" in exit_reason or "stop" in exit_reason:
+                        outcome = "SL"
+                    else:
+                        outcome = "timeout"
+                    
+                    self.trade_tracker.log_trade_exit(
+                        trade_id=trade_summary["trade_id"],
+                        outcome=outcome,
+                        exit_price=trade_summary["exit_price"],
+                        pnl=trade_summary["net_pnl"],
+                        pnl_percentage=trade_summary["pnl_percentage"],
+                        duration_seconds=trade_summary["duration_seconds"]
+                    )
+                    logger.debug(f"📊 [TRACKER] Logged trade exit {trade_summary['trade_id']} - Outcome: {outcome}, P&L: {trade_summary['pnl_percentage']:+.2f}%")
+                except Exception as tracker_error:
+                    logger.warning(f"⚠️ [TRACKER] Failed to log trade exit: {tracker_error}")
             
             # Remove from OpenPosition
             position_query = select(OpenPosition).where(OpenPosition.trade_id == trade_summary["trade_id"])

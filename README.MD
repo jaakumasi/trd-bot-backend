@@ -404,13 +404,24 @@ xrp_thresholds = get_atr_thresholds("XRPUSDT")
 pip install -r requirements.txt
 
 # Set environment variables in .env
-BINANCE_API_KEY=your_key
-BINANCE_SECRET_KEY=your_secret
-BINANCE_TESTNET=true  # Safe mode
+BINANCE_API_KEY=your_mainnet_key
+BINANCE_SECRET_KEY=your_mainnet_secret
+TESTNET_BINANCE_API_KEY=your_testnet_key
+TESTNET_BINANCE_SECRET_KEY=your_testnet_secret
+
+# Trading Mode Configuration
+# Options: mock, testnet, paper_mainnet, live_mainnet
+TRADING_MODE=paper_mainnet  # Mainnet data, simulated trades, strict thresholds
+
 GEMINI_API_KEY=your_gemini_key
-USE_MOCK_BINANCE=true  # For local testing without Binance
 DATABASE_URL=postgresql+asyncpg://user:pass@localhost/trd_bot
 ```
+
+**Trading Modes:**
+- `mock` - Mock service, no real API, lenient thresholds (local development)
+- `testnet` - Binance testnet API, fake money, lenient thresholds (safe testing)
+- `paper_mainnet` - Mainnet API, simulated trades, strict thresholds (realistic testing)
+- `live_mainnet` - **REAL MONEY** trading on mainnet, strict thresholds (production)
 
 ### **2. Run Backend**
 ```bash
@@ -498,15 +509,17 @@ FROM portfolio WHERE user_id = 1;
 - **Dependency Injection:** Services injected into TradingBot constructor
 - **Mock Pattern:** `MockBinanceService` vs `BinanceService` for testing
 - **Async/Await:** All database operations use SQLAlchemy AsyncSession
+- **Single Enum Configuration:** `TradingMode`
 
 **Day Trading Safety Features:**
-- Default testnet mode (`BINANCE_TESTNET=true`)
+- Default testnet mode (safe for development)
 - Single-trade-at-a-time constraint
 - 8-hour position timeout (prevents overnight exposure)
 - 1% rule position sizing (risk-based, not capital-based)
 - Adaptive stop-loss placement (support/resistance + ATR buffer)
-- Minimum 1:1.5 risk-reward ratio enforcement
+- Minimum 2:1 risk-reward ratio enforcement (mainnet requirement)
 - Multi-timeframe confluence validation
+- Strict mainnet quality thresholds (65+ confluence for live trades)
 - Pure technical analysis (no historical performance bias)
 - Quality-focused trade selection (1-5 trades/day, not 10+)
 

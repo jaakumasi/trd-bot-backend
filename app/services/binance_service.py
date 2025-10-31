@@ -17,11 +17,11 @@ logger = logging.getLogger(__name__)
 
 class BinanceService:
     def __init__(self):
-        # Get appropriate API keys based on testnet setting
+        # Get appropriate API keys based on trading mode
         api_key, secret_key = settings.get_active_binance_keys()
         
-        # Determine testnet flag: False if paper trading, otherwise use setting
-        use_testnet = not settings.use_paper_trading and settings.binance_testnet
+        # Determine testnet flag based on trading mode
+        use_testnet = settings.trading_mode == settings.trading_mode.TESTNET
         
         self.client = Client(
             api_key=api_key,
@@ -36,7 +36,7 @@ class BinanceService:
         self.last_time_sync = 0
         
         # Log which network we're using
-        network = "Mainnet (Paper Trading)" if settings.use_paper_trading else ("Testnet" if use_testnet else "Mainnet (Live)")
+        network = settings.get_environment_name()
         logger.info(f"🌐 BinanceService initialized for {network}")
 
     def get_symbol_info(self, symbol: str) -> Optional[Dict]:
@@ -205,9 +205,7 @@ class BinanceService:
             return False
 
     def _log_network_status(self) -> None:
-        network_label = (
-            "Testnet (Safe)" if settings.binance_testnet else "Mainnet (REAL MONEY)"
-        )
+        network_label = settings.get_environment_name()
         logger.info(f"🌐 Binance Network: {network_label}")
 
     def _synchronize_time(self) -> None:
@@ -468,11 +466,8 @@ class BinanceService:
 
     def place_market_order(self, symbol: str, side: str, quantity: float) -> Dict:
         """
-        Place a market order on Binance (Testnet or Mainnet based on settings)
-
-        The binance_testnet setting determines which API to use:
-        - binance_testnet=True → Uses Binance Testnet (safe for testing)
-        - binance_testnet=False → Uses Binance Mainnet (real money)
+        Place a market order on Binance.
+        Trading mode determines which API endpoint is used.
         """
         try:
             # Format quantity to meet Binance LOT_SIZE requirements
@@ -495,11 +490,8 @@ class BinanceService:
         stop_loss_price: float,
     ) -> Dict:
         """
-        Place market entry order with OCO (One-Cancels-Other) exit on Binance
-
-        The binance_testnet setting determines which API to use:
-        - binance_testnet=True → Uses Binance Testnet (safe for testing)
-        - binance_testnet=False → Uses Binance Mainnet (real money)
+        Place market entry order with OCO (One-Cancels-Other) exit on Binance.
+        Trading mode determines which API endpoint is used.
 
         This creates:
         1. Market order for entry (BUY/SELL)

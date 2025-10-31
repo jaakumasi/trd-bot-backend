@@ -2,7 +2,17 @@ import os
 from typing import List, Union
 from pydantic_settings import BaseSettings
 from pydantic import Field, field_validator
+from enum import Enum
 import json
+
+class TradingMode(str, Enum):
+    """
+    Trading mode configuration - single source of truth for environment settings.
+    """
+    MOCK = "mock"                    # Mock service, no real API calls, lenient thresholds
+    TESTNET = "testnet"              # Binance testnet API, fake money, lenient thresholds
+    PAPER_MAINNET = "paper_mainnet"  # Mainnet API, simulated trades, strict thresholds
+    LIVE_MAINNET = "live_mainnet"    # Live mainnet trading with REAL MONEY, strict thresholds
 
 class Settings(BaseSettings):
     # Database
@@ -17,8 +27,7 @@ class Settings(BaseSettings):
     testnet_binance_secret_key: str = Field(default="")
     
     # Trading Mode Configuration
-    binance_testnet: bool = Field(default=True)
-    use_paper_trading: bool = Field(default=False)
+    trading_mode: TradingMode = Field(default=TradingMode.TESTNET)
     
     # Gemini AI
     gemini_api_key: str = Field(default="")
@@ -33,15 +42,13 @@ class Settings(BaseSettings):
     default_trading_pair: str = Field(default="BTCUSDT")
     trading_active_hours_start: str = Field(default="00:00")  # 24/7 crypto market
     trading_active_hours_end: str = Field(default="23:59")    # Full day coverage
-    use_mock_binance: bool = Field(default=False)
     regime_filter_mode: str = Field(default="day_trading")  # day_trading mode for aggressive intraday
     
-    # Mainnet Safety Configuration
-    mainnet_mode: bool = Field(default=False)  # Enable stricter checks for live mainnet trading
+    # Trading Profile Configuration
     trading_profile: str = Field(default="normal")  # strict/normal/permissive - affects thresholds
     ai_override_enabled: bool = Field(default=True)  # Allow AI to override quality filters
     min_confluence_threshold: int = Field(default=60)  # Minimum confluence score for trades (0-100)
-    fee_estimate_pct: float = Field(default=0.001)  # Fee estimate for P&L calculations (0.1% default) 
+    fee_estimate_pct: float = Field(default=0.001)  # Fee estimate for P&L calculations
     
     # CORS - accepts both string and list
     cors_origins: Union[str, List[str]] = Field(
@@ -75,23 +82,46 @@ class Settings(BaseSettings):
     
     def get_active_binance_keys(self) -> tuple[str, str]:
         """
-        Returns the appropriate Binance API key pair based on BINANCE_TESTNET setting.
+        Returns the appropriate Binance API key pair based on trading mode.
         
         Returns:
             tuple[str, str]: (api_key, secret_key)
         """
-        if self.binance_testnet:
+        if self.trading_mode in (TradingMode.MOCK, TradingMode.TESTNET):
             return (self.testnet_binance_api_key, self.testnet_binance_secret_key)
-        return (self.binance_api_key, self.binance_secret_key)
+        else:  # PAPER_MAINNET or LIVE_MAINNET
+            return (self.binance_api_key, self.binance_secret_key)
+    
+    def use_mock_service(self) -> bool:
+        """Check if we should use mock Binance service instead of real API."""
+        return self.trading_mode == TradingMode.MOCK
+    
+    def use_paper_execution(self) -> bool:
+        """Check if trades should be simulated (not executed on exchange)."""
+        return self.trading_mode in (TradingMode.MOCK, TradingMode.TESTNET, TradingMode.PAPER_MAINNET)
+    
+    def use_mainnet_thresholds(self) -> bool:
+        """Check if we should use strict mainnet quality thresholds."""
+        return self.trading_mode in (TradingMode.PAPER_MAINNET, TradingMode.LIVE_MAINNET)
     
     def is_mainnet_live(self) -> bool:
         """
-        Check if we're running on live mainnet (not paper, not mock, not testnet).
+        Check if we're running on live mainnet.
         
         Returns:
             bool: True if live mainnet trading is active
         """
-        return not self.use_paper_trading and not self.use_mock_binance and not self.binance_testnet
+        return self.trading_mode == TradingMode.LIVE_MAINNET
+    
+    def get_environment_name(self) -> str:
+        """Get human-readable environment name for logging."""
+        env_map = {
+            TradingMode.MOCK: "MOCK",
+            TradingMode.TESTNET: "TESTNET",
+            TradingMode.PAPER_MAINNET: "PAPER_MAINNET",
+            TradingMode.LIVE_MAINNET: "LIVE_MAINNET"
+        }
+        return env_map.get(self.trading_mode, "UNKNOWN")
     
     def get_confluence_threshold(self) -> int:
         """
@@ -110,7 +140,7 @@ class Settings(BaseSettings):
             base_threshold -= 5
         
         # Mainnet safety: increase threshold
-        if self.mainnet_mode and self.is_mainnet_live():
+        if self.use_mainnet_thresholds() and self.is_mainnet_live():
             base_threshold = max(base_threshold, 65)
         
         return max(50, min(100, base_threshold))
