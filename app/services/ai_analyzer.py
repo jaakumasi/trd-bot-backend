@@ -13,7 +13,10 @@ from .service_constants import (
     AI_SELL_TAKE_PROFIT_RATIO,
     AI_HOLD_STOP_LOSS_RATIO,
     AI_HOLD_TAKE_PROFIT_RATIO,
+    MIN_ATR_PERCENTAGE_FOR_ENTRY,
+    OPTIMAL_ATR_PERCENTAGE_RANGE,
 )
+from .trade_outcome_tracker import TradeOutcomeTracker
 import logging
 
 logger = logging.getLogger(__name__)
@@ -25,15 +28,22 @@ class AIAnalyzer:
             genai.configure(api_key=settings.gemini_api_key)
             # Updated to use the latest available Gemini model
             self.model = genai.GenerativeModel("models/gemini-2.5-flash")
-            logger.info("✅ AI Analyzer initialized with Gemini 2.5 Flash model")
+            # Initialize trade outcome tracker for historical learning
+            self.trade_tracker = TradeOutcomeTracker()
+            logger.info("✅ AI Analyzer initialized with Gemini 2.5 Flash model + TradeOutcomeTracker")
         except Exception as e:
             logger.error(f"❌ Failed to initialize AI Analyzer: {e}")
             self.model = None
+            self.trade_tracker = None
 
     def calculate_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """Calculate technical indicators for analysis"""
         if df.empty or len(df) < 20:
+            logger.warning(f"⚠️ DataFrame too small for indicators: {len(df)} rows")
             return df
+
+        # Work on a copy to avoid modifying original
+        df = df.copy()
 
         # RSI calculation
         delta = df["close"].diff()
@@ -89,40 +99,42 @@ class AIAnalyzer:
         Calculate Average Directional Index (ADX) for trend strength.
         ADX > 25 indicates strong trend, < 20 indicates weak/ranging market.
         """
-        high = df['high']
-        low = df['low']
-        close = df['close']
-        
+        high = df["high"]
+        low = df["low"]
+        close = df["close"]
+
         # True Range
         tr1 = high - low
         tr2 = abs(high - close.shift())
         tr3 = abs(low - close.shift())
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         atr = tr.rolling(window=period).mean()
-        
+
         # Directional Movement
         up_move = high - high.shift()
         down_move = low.shift() - low
-        
+
         plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
         minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
-        
+
         plus_dm_smooth = pd.Series(plus_dm).rolling(window=period).mean()
         minus_dm_smooth = pd.Series(minus_dm).rolling(window=period).mean()
-        
+
         # Directional Indicators
-        df['plus_di'] = 100 * (plus_dm_smooth / atr)
-        df['minus_di'] = 100 * (minus_dm_smooth / atr)
-        
+        df["plus_di"] = 100 * (plus_dm_smooth / atr)
+        df["minus_di"] = 100 * (minus_dm_smooth / atr)
+
         # ADX Calculation
-        dx = 100 * abs(df['plus_di'] - df['minus_di']) / (df['plus_di'] + df['minus_di'])
-        df['adx'] = dx.rolling(window=period).mean()
-        
+        dx = (
+            100 * abs(df["plus_di"] - df["minus_di"]) / (df["plus_di"] + df["minus_di"])
+        )
+        df["adx"] = dx.rolling(window=period).mean()
+
         # Fill NaN values with 0
-        df['adx'] = df['adx'].fillna(0)
-        df['plus_di'] = df['plus_di'].fillna(0)
-        df['minus_di'] = df['minus_di'].fillna(0)
-        
+        df["adx"] = df["adx"].fillna(0)
+        df["plus_di"] = df["plus_di"].fillna(0)
+        df["minus_di"] = df["minus_di"].fillna(0)
+
         return df
 
     async def get_user_trade_history_context(
@@ -189,6 +201,7 @@ class AIAnalyzer:
 
             context = {
                 "has_history": True,
+                "user_id": user_id,  # Include user_id for pattern matching
                 "total_trades": total_trades,
                 "winning_trades": winning_trades,
                 "losing_trades": losing_trades,
@@ -218,11 +231,11 @@ class AIAnalyzer:
             return None
 
     async def analyze_market_data(
-        self, 
-        symbol: str, 
-        df: pd.DataFrame, 
+        self,
+        symbol: str,
+        df: pd.DataFrame,
         user_trade_history: Optional[Dict] = None,
-        regime_analysis: Optional[Dict] = None
+        regime_analysis: Optional[Dict] = None,
     ) -> Dict:
         """Use Gemini AI to analyze market data and provide trading signals."""
         try:
@@ -243,37 +256,105 @@ class AIAnalyzer:
             prev = df_with_indicators.iloc[-2]
             self._latest_data = latest
 
-            # Step 1: Check if we should even analyze (regime filter)
-            if regime_analysis and not regime_analysis.get("allow_scalping"):
-                logger.info(f"🚫 Scalping blocked - Market regime: {regime_analysis.get('regime')}")
-                return self._fallback_analysis(
-                    f"Market regime {regime_analysis.get('regime')} not suitable for scalping. "
-                    f"ADX: {regime_analysis.get('trend_strength', 0):.1f}, "
-                    f"ATR%: {regime_analysis.get('atr_percentage', 0):.2f}%",
-                    float(latest["close"])
-                )
-            
+            # Step 0: Check minimum volatility requirement (prevent trading in dead markets)
+            if 'atr' in latest.index and 'close' in latest.index:
+                atr = latest['atr']
+                price = latest['close']
+                atr_percentage = (atr / price) * 100 if price > 0 else 0
+                
+                if atr_percentage < MIN_ATR_PERCENTAGE_FOR_ENTRY:
+                    logger.info(
+                        f"🚫 ATR% too low: {atr_percentage:.2f}% < {MIN_ATR_PERCENTAGE_FOR_ENTRY:.2f}% "
+                        f"(minimum threshold). Insufficient volatility for profitable day trading."
+                    )
+                    return self._fallback_analysis(
+                        f"Market too quiet (ATR%: {atr_percentage:.2f}%). "
+                        f"Need at least {MIN_ATR_PERCENTAGE_FOR_ENTRY:.2f}% for viable entries/exits.",
+                        float(latest["close"]),
+                    )
+                
+                # Log if we're in optimal volatility range
+                optimal_low, optimal_high = OPTIMAL_ATR_PERCENTAGE_RANGE
+                if optimal_low <= atr_percentage <= optimal_high:
+                    logger.info(
+                        f"✅ ATR% in optimal range: {atr_percentage:.2f}% "
+                        f"({optimal_low:.2f}%-{optimal_high:.2f}%) - good trading conditions"
+                    )
+
+            # Step 1: Check trading quality
+            if regime_analysis:
+                trading_quality = regime_analysis.get("trading_quality_score", 0)
+                if trading_quality < 30:
+                    logger.info(
+                        f"🚫 Low trading quality: {trading_quality}/100 - Market regime: {regime_analysis.get('regime')}"
+                    )
+                    return self._fallback_analysis(
+                        f"Trading quality too low ({trading_quality}/100). "
+                        f"Regime: {regime_analysis.get('regime')}, "
+                        f"ADX: {regime_analysis.get('trend_strength', 0):.1f}, "
+                        f"ATR%: {regime_analysis.get('atr_percentage', 0):.2f}%",
+                        float(latest["close"]),
+                    )
+                
+                # Step 1.5: Block mean reversion in strong trends (CRITICAL SAFETY)
+                regime = regime_analysis.get("regime", "")
+                trading_edge = regime_analysis.get("trading_edge", "")
+                trend_strength = regime_analysis.get("trend_strength", 0)
+                confidence = regime_analysis.get("confidence", 0)
+                
+                # DO NOT attempt mean reversion counter-trend trades in strong trending markets
+                if trading_edge == "MEAN_REVERSION" and (
+                    (regime in ["BEAR_TREND", "BULL_TREND"] and trend_strength > 40) or
+                    (regime in ["BEAR_TREND", "BULL_TREND"] and confidence > 70)
+                ):
+                    logger.warning(
+                        "⛔ BLOCKED: Mean reversion in strong trend - "
+                        f"Regime: {regime} ({confidence}% confidence), "
+                        f"ADX: {trend_strength:.1f}, Edge: {trading_edge}. "
+                        "This is a strong directional move, NOT a bounce opportunity!"
+                    )
+                    return self._fallback_analysis(
+                        f"Mean reversion blocked in strong {regime} (ADX: {trend_strength:.1f}). "
+                        f"Do not catch falling knives or fight strong trends.",
+                        float(latest["close"]),
+                    )
+
             # Step 2: Signal Confluence Check (now with dynamic thresholds!)
-            confluence_score = self._calculate_signal_confluence(df_with_indicators, regime_analysis)
-            
-            # Get dynamic threshold from advanced regime analysis (if available)
-            dynamic_threshold = regime_analysis.get('dynamic_confluence_threshold', 60) if regime_analysis else 60
-            
+            confluence_score = self._calculate_signal_confluence(
+                df_with_indicators, regime_analysis
+            )
+
+            # Get dynamic threshold from settings (environment-aware)
+            # Mainnet uses stricter thresholds for safety
+            dynamic_threshold = (
+                regime_analysis.get("dynamic_confluence_threshold", settings.get_confluence_threshold())
+                if regime_analysis
+                else settings.get_confluence_threshold()
+            )
+
             if confluence_score < dynamic_threshold:
                 logger.info(
                     f"⚠️ Low signal confluence: {confluence_score}/{dynamic_threshold} "
-                    f"(dynamic threshold) - Recommending HOLD"
+                    f"(Mode: {settings.get_environment_name()}) - Recommending HOLD"
                 )
                 return self._fallback_analysis(
                     f"Insufficient signal confluence ({confluence_score}/{dynamic_threshold}). "
                     f"Trend alignment, momentum, volume, or regime not aligned.",
-                    float(latest["close"])
+                    float(latest["close"]),
                 )
 
             market_summary = self._build_market_summary(
                 symbol, df_with_indicators, latest, prev
             )
-            prompt = self._generate_prompt(latest, market_summary, user_trade_history, regime_analysis)
+            
+            # Build enhanced AI context with price action, volatility, and volume analysis
+            enhanced_context = self._build_enhanced_ai_context(
+                df_with_indicators, sr_levels=None, regime_analysis=regime_analysis
+            )
+            
+            prompt = self._generate_prompt(
+                latest, market_summary, user_trade_history, regime_analysis, enhanced_context
+            )
 
             try:
                 response = await self.model.generate_content_async(prompt)
@@ -301,6 +382,90 @@ class AIAnalyzer:
             enriched["technical_score"] = technical_score
             enriched["final_confidence"] = min(enriched["confidence"], technical_score)
             enriched["signal_confluence"] = confluence_score
+            enriched["regime_analysis"] = regime_analysis  # Include for risk validation
+            
+            # Require momentum confirmation for counter-trend entries
+            signal = enriched.get("signal", "hold").lower()
+            rsi = float(latest.get("rsi", 50))
+            
+            # For BUY signals, RSI must be turning UP (not just oversold)
+            if signal == "buy" and rsi < 30:
+                # Check if RSI is starting to turn up
+                if len(df) >= 3:
+                    rsi_values = df['rsi'].tail(3).values
+                    rsi_current = rsi_values[-1]
+                    rsi_prev = rsi_values[-2]
+                    
+                    # RSI must be turning UP, not just oversold
+                    if rsi_current <= rsi_prev:
+                        logger.warning(
+                            f"⛔ BLOCKED BUY: RSI={rsi:.1f} still falling (no momentum confirmation). "
+                            f"Wait for RSI to turn back UP above 30 before buying oversold conditions."
+                        )
+                        return self._fallback_analysis(
+                            f"BUY blocked - RSI={rsi:.1f} still declining, no momentum reversal confirmed",
+                            float(latest["close"]),
+                        )
+                    else:
+                        logger.info(
+                            f"✅ BUY momentum confirmed: RSI turning up {rsi_prev:.1f}→{rsi_current:.1f}"
+                        )
+            
+            # For SELL signals, RSI must be turning DOWN (not just overbought)
+            if signal == "sell" and rsi > 70:
+                if len(df) >= 3:
+                    rsi_values = df['rsi'].tail(3).values
+                    rsi_current = rsi_values[-1]
+                    rsi_prev = rsi_values[-2]
+                    
+                    if rsi_current >= rsi_prev:
+                        logger.warning(
+                            f"⛔ BLOCKED SELL: RSI={rsi:.1f} still rising (no momentum confirmation). "
+                            f"Wait for RSI to turn back DOWN below 70 before shorting overbought conditions."
+                        )
+                        return self._fallback_analysis(
+                            f"SELL blocked - RSI={rsi:.1f} still rising, no momentum reversal confirmed",
+                            float(latest["close"]),
+                        )
+                    else:
+                        logger.info(
+                            f"✅ SELL momentum confirmed: RSI turning down {rsi_prev:.1f}→{rsi_current:.1f}"
+                        )
+
+            # CRITICAL: Enforce directional bias in strong trends
+            if regime_analysis:
+                signal = enriched.get("action", "hold").lower()
+                regime = regime_analysis.get("regime", "")
+                trend_strength = regime_analysis.get("trend_strength", 0)
+                confidence = regime_analysis.get("confidence", 0)
+                
+                # In strong bearish trends, BLOCK buy signals (don't catch falling knives)
+                if signal == "buy" and regime == "BEAR_TREND" and (
+                    trend_strength > 50 or confidence > 75
+                ):
+                    logger.warning(
+                        f"⛔ BLOCKED: BUY signal in strong BEAR_TREND - "
+                        f"ADX: {trend_strength:.1f}, Confidence: {confidence}%. "
+                        f"Do NOT buy into strong downtrends!"
+                    )
+                    return self._fallback_analysis(
+                        f"BUY blocked in strong bearish market (ADX: {trend_strength:.1f})",
+                        float(latest["close"]),
+                    )
+                
+                # In strong bullish trends, BLOCK sell signals
+                if signal == "sell" and regime == "BULL_TREND" and (
+                    trend_strength > 50 or confidence > 75
+                ):
+                    logger.warning(
+                        f"⛔ BLOCKED: SELL signal in strong BULL_TREND - "
+                        f"ADX: {trend_strength:.1f}, Confidence: {confidence}%. "
+                        f"Do NOT short into strong uptrends!"
+                    )
+                    return self._fallback_analysis(
+                        f"SELL blocked in strong bullish market (ADX: {trend_strength:.1f})",
+                        float(latest["close"]),
+                    )
 
             logger.info(f"🎯 Final AI Analysis: {enriched}")
             return enriched
@@ -308,6 +473,249 @@ class AIAnalyzer:
         except Exception as error:
             logger.error(f"AI analysis error: {error}")
             return self._fallback_analysis(f"Analysis error: {str(error)[:50]}")
+
+    def _describe_last_5_candles(self, df: pd.DataFrame) -> str:
+        """
+        Analyze last 5 candles for price action quality.
+        Returns natural language description for AI prompt.
+        """
+        if len(df) < 5:
+            return "Insufficient data for candle analysis"
+        
+        last_5 = df.tail(5)
+        descriptions = []
+        
+        for idx, candle in last_5.iterrows():
+            body_size = abs(candle['close'] - candle['open'])
+            total_range = candle['high'] - candle['low']
+            body_pct = (body_size / total_range * 100) if total_range > 0 else 0
+            
+            direction = "bullish" if candle['close'] > candle['open'] else "bearish"
+            
+            # Detect wicks
+            if candle['close'] > candle['open']:  # Bull candle
+                upper_wick = candle['high'] - candle['close']
+                lower_wick = candle['open'] - candle['low']
+            else:  # Bear candle
+                upper_wick = candle['high'] - candle['open']
+                lower_wick = candle['close'] - candle['low']
+            
+            upper_wick_pct = (upper_wick / total_range * 100) if total_range > 0 else 0
+            lower_wick_pct = (lower_wick / total_range * 100) if total_range > 0 else 0
+            
+            # Classify candle
+            if body_pct > 70:
+                strength = "strong"
+            elif body_pct > 40:
+                strength = "moderate"
+            elif body_pct > 20:
+                strength = "weak"
+            else:
+                strength = "doji-like"
+            
+            # Check for rejection
+            rejection = ""
+            if upper_wick_pct > 40:
+                rejection = " with upper rejection"
+            elif lower_wick_pct > 40:
+                rejection = " with lower rejection"
+            
+            descriptions.append(f"{strength} {direction}{rejection}")
+        
+        return " | ".join(descriptions)
+
+    def _score_candle_quality(self, df: pd.DataFrame) -> Dict:
+        """
+        Score overall candle quality for trend strength assessment.
+        """
+        if len(df) < 5:
+            return {"quality_score": 50, "description": "insufficient_data"}
+        
+        last_5 = df.tail(5)
+        total_quality = 0
+        bullish_count = 0
+        bearish_count = 0
+        
+        for idx, candle in last_5.iterrows():
+            body_size = abs(candle['close'] - candle['open'])
+            total_range = candle['high'] - candle['low']
+            body_pct = (body_size / total_range * 100) if total_range > 0 else 0
+            
+            # Strong body = higher quality
+            if body_pct > 70:
+                total_quality += 20
+            elif body_pct > 50:
+                total_quality += 15
+            elif body_pct > 30:
+                total_quality += 10
+            else:
+                total_quality += 5
+            
+            if candle['close'] > candle['open']:
+                bullish_count += 1
+            else:
+                bearish_count += 1
+        
+        # Directional consistency bonus
+        consistency = max(bullish_count, bearish_count)
+        if consistency >= 4:
+            total_quality += 10  # Very consistent
+        elif consistency == 3:
+            total_quality += 5  # Somewhat consistent
+        
+        direction = "bullish" if bullish_count > bearish_count else "bearish" if bearish_count > bullish_count else "mixed"
+        
+        return {
+            "quality_score": min(100, total_quality),
+            "direction": direction,
+            "consistency": f"{consistency}/5"
+        }
+
+    def _detect_atr_trend(self, df: pd.DataFrame) -> str:
+        """
+        Detect if ATR is expanding (volatility increasing) or contracting.
+        """
+        if len(df) < 20 or 'atr' not in df.columns:
+            return "unknown"
+        
+        atr_values = df['atr'].tail(20)
+        recent_atr = atr_values.tail(5).mean()
+        earlier_atr = atr_values.iloc[:10].mean()
+        
+        if pd.isna(recent_atr) or pd.isna(earlier_atr) or earlier_atr == 0:
+            return "stable"
+        
+        change_pct = (recent_atr - earlier_atr) / earlier_atr * 100
+        
+        if change_pct > 15:
+            return "expanding_rapidly"
+        elif change_pct > 5:
+            return "expanding"
+        elif change_pct < -15:
+            return "contracting_rapidly"
+        elif change_pct < -5:
+            return "contracting"
+        else:
+            return "stable"
+
+    def _analyze_volume_profile(self, df: pd.DataFrame) -> Dict:
+        """
+        Analyze volume profile for buying vs selling pressure.
+        """
+        if len(df) < 10 or 'volume' not in df.columns:
+            return {"pressure": "unknown", "ratio": 1.0}
+        
+        last_10 = df.tail(10)
+        
+        buying_volume = 0
+        selling_volume = 0
+        
+        for idx, candle in last_10.iterrows():
+            if candle['close'] > candle['open']:  # Bull candle = buying
+                buying_volume += candle['volume']
+            else:  # Bear candle = selling
+                selling_volume += candle['volume']
+        
+        total_volume = buying_volume + selling_volume
+        if total_volume == 0:
+            return {"pressure": "neutral", "ratio": 1.0}
+        
+        buy_ratio = buying_volume / total_volume
+        
+        if buy_ratio > 0.65:
+            pressure = "strong_buying"
+        elif buy_ratio > 0.55:
+            pressure = "moderate_buying"
+        elif buy_ratio < 0.35:
+            pressure = "strong_selling"
+        elif buy_ratio < 0.45:
+            pressure = "moderate_selling"
+        else:
+            pressure = "neutral"
+        
+        return {
+            "pressure": pressure,
+            "buy_ratio": buy_ratio,
+            "sell_ratio": 1 - buy_ratio
+        }
+
+    def _build_enhanced_ai_context(
+        self,
+        df: pd.DataFrame,
+        sr_levels: Optional[Dict] = None,
+        regime_analysis: Optional[Dict] = None
+    ) -> str:
+        """
+        Build comprehensive market structure context for AI prompt.
+        Includes: price action, S/R proximity, ATR trend, volume profile, candle quality, regime state.
+        """
+        context_parts = []
+        
+        # Price Action Analysis
+        candle_desc = self._describe_last_5_candles(df)
+        context_parts.append(f"Recent Price Action (Last 5 Candles): {candle_desc}")
+        
+        # Candle Quality
+        quality = self._score_candle_quality(df)
+        context_parts.append(
+            f"Candle Quality: {quality['quality_score']}/100 "
+            f"(Direction: {quality['direction']}, Consistency: {quality['consistency']})"
+        )
+        
+        # ATR Trend
+        atr_trend = self._detect_atr_trend(df)
+        context_parts.append(f"Volatility Trend (ATR): {atr_trend.replace('_', ' ').title()}")
+        
+        # Volume Profile
+        volume = self._analyze_volume_profile(df)
+        if volume['pressure'] != "unknown":
+            context_parts.append(
+                f"Volume Profile: {volume['pressure'].replace('_', ' ').title()} "
+                f"(Buy: {volume['buy_ratio']*100:.0f}%, Sell: {volume['sell_ratio']*100:.0f}%)"
+            )
+        
+        # Market Regime Context (using regime_analysis parameter)
+        if regime_analysis:
+            regime = regime_analysis.get('regime', 'UNKNOWN')
+            trend_strength = regime_analysis.get('trend_strength', 0)
+            trading_edge = regime_analysis.get('trading_edge', 'NEUTRAL')
+            trading_quality = regime_analysis.get('trading_quality_score', 0)
+            
+            context_parts.append(
+                f"Market Regime: {regime} (ADX: {trend_strength:.1f}, "
+                f"Edge: {trading_edge}, Quality: {trading_quality}/100)"
+            )
+            
+            # Add regime-specific guidance
+            if regime in ['BULL_TREND', 'BEAR_TREND'] and trend_strength > 25:
+                context_parts.append(
+                    f"⚠️ Strong {regime.split('_')[0].lower()} trend detected - "
+                    f"favor {('long' if regime == 'BULL_TREND' else 'short')} positions"
+                )
+            elif regime == 'RANGE_BOUND':
+                context_parts.append(
+                    "⚠️ Range-bound market - consider mean reversion strategies at S/R levels"
+                )
+            elif regime in ['HIGH_VOL', 'LOW_VOL']:
+                context_parts.append(
+                    f"⚠️ {regime.replace('_', ' ')} environment - adjust position sizing accordingly"
+                )
+        
+        # Support/Resistance Proximity
+        if sr_levels and 'support' in sr_levels and 'resistance' in sr_levels:
+            current_price = float(df.iloc[-1]['close'])
+            support = sr_levels['support']
+            resistance = sr_levels['resistance']
+            
+            dist_to_support = (current_price - support) / current_price * 100
+            dist_to_resistance = (resistance - current_price) / current_price * 100
+            
+            context_parts.append(
+                f"S/R Proximity: Support {dist_to_support:.2f}% below, "
+                f"Resistance {dist_to_resistance:.2f}% above"
+            )
+        
+        return "\n".join(context_parts)
 
     def _build_market_summary(
         self,
@@ -343,143 +751,290 @@ class AIAnalyzer:
         }
         return summary
 
-    def _calculate_signal_confluence(self, df: pd.DataFrame, regime_analysis: Optional[Dict]) -> int:
+    def _calculate_signal_confluence(
+        self, df: pd.DataFrame, regime_analysis: Optional[Dict]
+    ) -> int:
         """
-        Multi-factor signal confluence scoring.
-        
-        Checks for alignment across multiple indicators:
-        - Trend alignment (price vs SMAs) - 25 points
-        - Momentum confirmation (MACD + RSI) - 25 points
-        - Volume confirmation - 20 points
-        - Volatility regime appropriateness - 30 points
+        Enhanced multi-factor signal confluence scoring with pullback quality reward.
+
+        Uses these CORE factors:
+        - Trend Alignment (25 points): Is price action aligned with the broader trend?
+        - Pullback Quality (15 points): Rewards optimal entries at value zones
+        - Momentum Confirmation (25 points): Is momentum supporting the desired direction?
+        - Volume Support (15 points): Is volume confirming the move?
+        - Regime Appropriateness (20 points): Is the current market regime suitable for this trade?
         
         Returns: 0-100 score (>60 required for trade)
         """
         score = 0
         latest = df.iloc[-1]
-        
+
         # Factor 1: Trend Alignment (25 points)
-        sma_20 = latest.get('sma_20', np.nan)
-        sma_50 = latest.get('sma_50', np.nan)
-        price = latest.get('close', 0)
-        
+        sma_20 = latest.get("sma_20", np.nan)
+        sma_50 = latest.get("sma_50", np.nan)
+        price = latest.get("close", 0)
+
         if not pd.isna(sma_20) and not pd.isna(sma_50):
-            if sma_20 > sma_50 and price > sma_20:  # Bullish alignment
+            # Identify trend direction
+            bullish_trend = sma_20 > sma_50
+            bearish_trend = sma_20 < sma_50
+            
+            if bullish_trend and price > sma_50:  # Bullish structure (price above both MAs or in pullback zone)
                 score += 25
-            elif sma_20 < sma_50 and price < sma_20:  # Bearish alignment
+            elif bearish_trend and price < sma_50:  # Bearish structure
                 score += 25
-            elif sma_20 > sma_50 and price > sma_50:  # Partial bull
+            elif bullish_trend and price > sma_20:  # Weaker bullish (only above 20 SMA)
                 score += 15
-            elif sma_20 < sma_50 and price < sma_50:  # Partial bear
+            elif bearish_trend and price < sma_20:  # Weaker bearish
                 score += 15
-        
-        # Factor 2: Momentum Confirmation (25 points)
-        rsi = latest.get('rsi', 50)
-        macd = latest.get('macd', 0)
-        macd_signal = latest.get('macd_signal', 0)
-        
-        if not pd.isna(rsi) and not pd.isna(macd):
-            # RSI in valid range (not extreme)
-            if 30 < rsi < 70:
-                score += 10
+
+        # Factor 2: Pullback Quality (15 points)
+        # Reward optimal entries when price pulls back to value in a trend
+        if not pd.isna(sma_20) and not pd.isna(sma_50):
+            bullish_trend = sma_20 > sma_50
+            bearish_trend = sma_20 < sma_50
             
-            # MACD aligned with trend
-            if macd > macd_signal and rsi > 50:  # Bullish momentum
-                score += 15
-            elif macd < macd_signal and rsi < 50:  # Bearish momentum
-                score += 15
-        
-        # Factor 3: Volume Confirmation (20 points)
-        volume = latest.get('volume', 0)
-        volume_sma = latest.get('volume_sma', 1)
-        
-        if not pd.isna(volume_sma) and volume_sma > 0:
-            volume_ratio = volume / volume_sma
+            # Calculate distance from price to MAs
+            distance_to_20 = abs(price - sma_20) / price if price > 0 else 1
             
-            if volume_ratio > 1.2:  # Above-average volume
-                score += 20
-            elif volume_ratio > 1.0:
-                score += 10
-        
-        # Factor 4: Regime Appropriateness (30 points + bonuses from advanced metrics)
-        if regime_analysis:
-            regime = regime_analysis.get('regime')
-            trend_strength = regime_analysis.get('trend_strength', 0)
-            atr_percentage = regime_analysis.get('atr_percentage', 0)
+            # BULLISH PULLBACK: Price between 20 and 50 SMA in uptrend (optimal buy zone)
+            if bullish_trend and sma_50 <= price <= sma_20:
+                pullback_quality = 15  # Maximum points for perfect pullback
+                score += pullback_quality
+                logger.debug(
+                    f"✅ BULLISH PULLBACK DETECTED: Price ${price:.2f} in value zone "
+                    f"(${sma_50:.2f} to ${sma_20:.2f}) - BONUS +{pullback_quality} points"
+                )
+            # BULLISH NEAR PULLBACK: Price slightly below 20 SMA (still good entry)
+            elif bullish_trend and price < sma_20 and distance_to_20 < 0.01:  # Within 1% of 20 SMA
+                pullback_quality = 10
+                score += pullback_quality
+                logger.debug(f"✅ Near 20 SMA in uptrend - BONUS +{pullback_quality} points")
             
-            # Use scalping quality score if available (from advanced analyzer)
-            scalping_quality = regime_analysis.get('scalping_quality_score')
+            # BEARISH PULLBACK: Price between 50 and 20 SMA in downtrend (optimal short zone)
+            elif bearish_trend and sma_20 <= price <= sma_50:
+                pullback_quality = 15
+                score += pullback_quality
+                logger.debug(
+                    f"✅ BEARISH PULLBACK DETECTED: Price ${price:.2f} in value zone "
+                    f"(${sma_20:.2f} to ${sma_50:.2f}) - BONUS +{pullback_quality} points"
+                )
+            # BEARISH NEAR PULLBACK: Price slightly above 20 SMA
+            elif bearish_trend and price > sma_20 and distance_to_20 < 0.01:
+                pullback_quality = 10
+                score += pullback_quality
+                logger.debug(f"✅ Near 20 SMA in downtrend - BONUS +{pullback_quality} points")
             
-            if scalping_quality is not None:
-                # REVOLUTIONARY: Use quality score instead of binary regime check
-                score += int(scalping_quality * 0.5)  # 0-50 points based on quality
-                
-                # Bonus for high-quality microstructure
-                mean_reversion = regime_analysis.get('mean_reversion_score', 0)
-                if mean_reversion > 70:
-                    score += 15  # Excellent mean reversion setup
-                
-            else:
-                # Legacy scoring (for non-scalping modes)
-                if regime in ['BULL_TREND', 'BEAR_TREND'] and trend_strength > 25:
-                    score += 30
-                    
-                    # Bonus for optimal volatility range
-                    if 0.1 < atr_percentage < 1.2:
-                        score += 5
-                        
-                elif regime == 'RANGE_BOUND':
-                    # Don't penalize range-bound anymore! Can be great for scalping
-                    score += 10  # Give some credit
-                    
-                elif regime == 'HIGH_VOLATILITY':
-                    # Less harsh penalty
-                    if atr_percentage > 2.0:
-                        score -= 15
-                    else:
-                        score -= 5
-                        
-                elif regime == 'LOW_VOLATILITY':
-                    # Less harsh penalty - low vol can work!
+            # PENALTY: Price too extended from trend (chase entry)
+            elif bullish_trend and price > sma_20:
+                extension = (price - sma_20) / sma_20
+                if extension > 0.02:  # More than 2% extended above 20 SMA
+                    score -= 5  # Small penalty for chasing
+                    logger.debug(
+                        "⚠️ Price extended %.1f%% above 20 SMA - chase entry",
+                        extension * 100
+                    )
+            elif bearish_trend and price < sma_20:
+                extension = (sma_20 - price) / sma_20
+                if extension > 0.02:
                     score -= 5
-        
+                    logger.debug(
+                        "⚠️ Price extended %.1f%% below 20 SMA - chase entry",
+                        extension * 100
+                    )
+
+        # Factor 3: Momentum Confirmation (25 points)
+        rsi = latest.get("rsi", 50)
+        macd = latest.get("macd", 0)
+        macd_signal = latest.get("macd_signal", 0)
+
+        if not pd.isna(rsi) and not pd.isna(macd):
+            if macd > macd_signal and rsi > 50:  # Bullish Momentum
+                score += 25
+            elif macd < macd_signal and rsi < 50:  # Bearish Momentum
+                score += 25
+            elif macd > macd_signal or rsi > 50:  # Partial Bullish
+                score += 12
+            elif macd < macd_signal or rsi < 50:  # Partial Bearish
+                score += 12
+
+        # Factor 4: Volume Support (15 points)
+        volume = latest.get("volume", 0)
+        volume_sma = latest.get("volume_sma", 0)
+        if not pd.isna(volume) and not pd.isna(volume_sma) and volume_sma > 0:
+            volume_ratio = volume / volume_sma
+            if volume_ratio > 1.5:  # High volume confirmation
+                score += 15
+            elif volume_ratio > 1.1:  # Moderate volume confirmation
+                score += 8
+
+        # Factor 5: Regime Appropriateness (20 points)
+        if regime_analysis:
+            trading_quality = regime_analysis.get("trading_quality_score")
+            if trading_quality is not None:
+                # Quality 0-100 maps to 0-20 points
+                score += int(trading_quality * 0.2)
+            else:
+                # Fallback for older regime analyzer
+                regime = regime_analysis.get("regime")
+                if regime in ["BULL_TREND", "BEAR_TREND"]:
+                    score += 20
+                elif regime == "RANGE_BOUND":
+                    score += 10
+
         final_score = max(0, min(100, score))
-        
-        logger.info(f"📊 Signal Confluence Score: {final_score}/100")
-        
+
+        logger.info(f"📊 Signal Confluence Score: {final_score}/100 (5-factor model with pullback quality)")
+
         return final_score
+
+    def _build_pattern_aware_history_context(
+        self,
+        user_id: int,
+        current_setup: Dict,
+        user_trade_history: Optional[Dict] = None
+    ) -> str:
+        """
+        Build pattern-aware historical context using TradeOutcomeTracker.
+        This replaces basic win/loss stats with actionable pattern insights.
+        
+        Args:
+            user_id: User ID for filtering trades to this user only
+            current_setup: Current market setup dictionary
+            user_trade_history: Optional basic trade history dict
+        
+        Returns natural language context for AI prompt with:
+        - Calibration data (AI confidence vs actual win rate)
+        - Failing pattern warnings
+        - Regime-specific performance
+        - Historical context from tracker
+        """
+        if not self.trade_tracker:
+            logger.warning("⚠️ TradeOutcomeTracker not available, using basic history")
+            return self._build_basic_history_context(user_trade_history)
+        
+        context_parts = []
+        
+        # Get calibration curve for this user
+        calibration = self.trade_tracker.get_calibration_curve(user_id=user_id)
+        if calibration:
+            context_parts.append("AI CONFIDENCE CALIBRATION:")
+            context_parts.append(
+                "The AI's confidence scores are calibrated against actual outcomes:"
+            )
+            for conf_bucket, actual_wr in sorted(calibration.items()):
+                context_parts.append(f"  - {conf_bucket}% confidence → {actual_wr:.1f}% actual win rate")
+            
+            # Warning if AI is overconfident
+            high_conf_buckets = [k for k in calibration.keys() if k >= 80]
+            if high_conf_buckets:
+                avg_high_conf_wr = sum(calibration[k] for k in high_conf_buckets) / len(high_conf_buckets)
+                if avg_high_conf_wr < 70:
+                    context_parts.append(
+                        f"⚠️ WARNING: High confidence predictions (80%+) only win {avg_high_conf_wr:.1f}% of the time. "
+                        "Be more conservative with confidence scores."
+                    )
+        
+        # Get failing patterns for this user
+        failing_patterns = self.trade_tracker.identify_failing_patterns(user_id=user_id, min_occurrences=3)
+        if failing_patterns:
+            context_parts.append("\nRECURRING FAILURE PATTERNS (AVOID THESE):")
+            for pattern in failing_patterns[:3]:  # Top 3 patterns
+                context_parts.append(
+                    f"  - {pattern['pattern_type']}: {pattern['occurrences']} trades, "
+                    f"{pattern['win_rate']:.1f}% win rate, "
+                    f"avg loss ${pattern['avg_pnl']:+.2f}"
+                )
+                context_parts.append(f"    Description: {pattern['description']}")
+        
+        # Get regime-specific performance for this user
+        regime_perf = self.trade_tracker.get_regime_performance(user_id=user_id)
+        if regime_perf:
+            context_parts.append("\nPERFORMANCE BY MARKET REGIME:")
+            for regime, stats in regime_perf.items():
+                if stats['trade_count'] >= 5:  # Only show regimes with sufficient data
+                    context_parts.append(
+                        f"  - {regime}: {stats['win_rate']:.1f}% win rate "
+                        f"({stats['trade_count']} trades, avg P&L ${stats['avg_pnl']:+.2f})"
+                    )
+        
+        # Get historical context specific to current setup for this user
+        tracker_context = self.trade_tracker.get_historical_context_for_ai(current_setup, user_id=user_id)
+        if tracker_context:
+            context_parts.append("\nSIMILAR PAST SETUPS:")
+            context_parts.append(tracker_context)
+        
+        # Add basic stats if available
+        if user_trade_history and user_trade_history.get("has_history"):
+            h = user_trade_history
+            context_parts.append("\nOVERALL STATISTICS:")
+            context_parts.append(
+                f"  - Last {h['total_trades']} trades: {h['win_rate']:.1f}% win rate, "
+                f"${h['total_pnl']:+.2f} total P&L"
+            )
+            context_parts.append(
+                f"  - Recent trend: {h['recent_trend'].upper()} "
+                f"({h['recent_wins']}/{h['recent_total']} wins in last 5 trades)"
+            )
+        
+        if not context_parts:
+            return ""
+        
+        full_context = "\n".join(context_parts)
+        
+        instructions = """
+        
+        INSTRUCTIONS FOR USING HISTORICAL CONTEXT:
+        - If calibration shows overconfidence (predicted > actual by 10%+): Reduce your confidence by 10-15 points
+        - If current setup matches a failing pattern: Consider HOLD or reduce confidence by 20+ points
+        - If regime performance is poor (<40% win rate): Be extra cautious in this regime
+        - Use similar past setups to validate or challenge your technical analysis
+        - Focus on avoiding repeated mistakes, not on over-penalizing recent losses
+        """
+        
+        return full_context + instructions
+    
+    def _build_basic_history_context(self, user_trade_history: Optional[Dict]) -> str:
+        """Fallback basic history context when tracker unavailable."""
+        if not user_trade_history or not user_trade_history.get("has_history"):
+            return ""
+        
+        h = user_trade_history
+        return f"""
+        User's Recent Trading Performance (Last {h['total_trades']} Trades):
+        - Win Rate: {h['win_rate']:.1f}% ({h['winning_trades']} wins, {h['losing_trades']} losses)
+        - Average P&L per Trade: ${h['avg_pnl_per_trade']:+.2f}
+        - Stop Loss Hit Rate: {h['stop_loss_rate']:.1f}%
+        - Recent Trend: {h['recent_trend'].upper()} ({h['recent_wins']} wins in last {h['recent_total']} trades)
+        """
 
     def _generate_prompt(
         self,
         latest: pd.Series,
         market_summary: Dict,
         user_trade_history: Optional[Dict] = None,
-        regime_analysis: Optional[Dict] = None
+        regime_analysis: Optional[Dict] = None,
+        enhanced_context: Optional[str] = None,
     ) -> str:
-        # Build historical context section if available
         history_context = ""
+        
         if user_trade_history and user_trade_history.get("has_history"):
-            h = user_trade_history
-            history_context = f"""
-            User's Recent Trading Performance (Last {h['total_trades']} Trades):
-            - Win Rate: {h['win_rate']:.1f}% ({h['winning_trades']} wins, {h['losing_trades']} losses)
-            - Average P&L per Trade: ${h['avg_pnl_per_trade']:+.2f}
-            - Total P&L: ${h['total_pnl']:+.2f}
-            - Average Trade Duration: {h['avg_duration_minutes']:.1f} minutes
-            - Stop Loss Hit Rate: {h['stop_loss_rate']:.1f}%
-            - Take Profit Hit Rate: {h['take_profit_rate']:.1f}%
-            - Recent Trend: {h['recent_trend'].upper()} ({h['recent_wins']} wins in last {h['recent_total']} trades)
-
-            INSTRUCTIONS BASED ON USER HISTORY (USE WITH MODERATION):
-            - If win_rate < 30% OR (win_rate < 40% AND recent_trend is "losing"): Be more conservative. Reduce confidence by 10-15 points if considering a trade.
-            - If stop_loss_rate > 70%: User frequently hits stop losses. Focus on higher-quality setups with stronger confluence.
-            - If recent_trend is "losing" (only 0-1 wins in last 5 trades): Reduce confidence by 5-10 points to encourage caution.
-            - If win_rate > 55% AND recent_trend is "winning": You can maintain normal confidence levels.
+            # Build current setup for pattern matching
+            current_setup = {
+                "rsi": float(latest.get("rsi", 50)),
+                "regime": regime_analysis.get("regime") if regime_analysis else "UNKNOWN",
+                "confidence": market_summary.get("confidence", 50),
+                "atr_percentage": regime_analysis.get("atr_percentage", 0) if regime_analysis else 0,
+                "trend_strength": regime_analysis.get("trend_strength", 0) if regime_analysis else 0,
+            }
             
-            IMPORTANT: Historical performance should influence confidence scores moderately, NOT cause complete avoidance of trading.
-            For scalping strategies, some losses are normal. Do not over-penalize recent losses - focus on technical setup quality.
-            Your primary job is to analyze current market conditions, with history as a secondary factor.
-            """
+            # Extract user_id for per-user tracking
+            user_id = user_trade_history.get("user_id", 0)
+            
+            # Use pattern-aware context (replaces basic stats)
+            history_context = self._build_pattern_aware_history_context(
+                user_id, current_setup, user_trade_history
+            )
         
         # Build regime context section if available
         regime_context = ""
@@ -493,25 +1048,54 @@ class AIAnalyzer:
             - ATR Percentage: {r.get('atr_percentage', 0):.2f}% (current volatility level)
             - SMA Alignment: {r.get('sma_alignment', 'NEUTRAL')}
             - Volume Trend: {r.get('volume_trend', 'STABLE')}
-            - Scalping Status: {'ALLOWED' if r.get('allow_scalping') else 'BLOCKED'}
+            - Trading Status: {'ALLOWED' if r.get('allow_trading') else 'BLOCKED'}
 
             REGIME-BASED TRADING RULES:
-            - BULL_TREND/BEAR_TREND with ADX>25: Favorable for scalping - trade in direction of trend
-            - RANGE_BOUND: Not suitable for scalping - recommend 'hold' unless exceptionally strong signal
-            - HIGH_VOLATILITY: Too risky for scalping - recommend 'hold' to avoid whipsaw
+            - BULL_TREND/BEAR_TREND with ADX>25: Favorable for day trading - trade in direction of trend
+            - RANGE_BOUND: Not suitable for day trading - recommend 'hold' unless exceptionally strong signal
+            - HIGH_VOLATILITY: Too risky for day trading - recommend 'hold' to avoid whipsaw
             - LOW_VOLATILITY: Insufficient movement - recommend 'hold' to wait for better opportunity
             
-            Respect the regime classification. If scalping is BLOCKED, only recommend 'hold' unless there's an exceptionally clear setup (confidence >90).
+            Respect the regime classification. If trading is BLOCKED, only recommend 'hold' unless there's an exceptionally clear setup (confidence >90).
             """
 
+        # Fix #5: Add microstructure signals to regular prompt too
+        microstructure_context = ""
+        if regime_analysis:
+            microstructure_context = f"""
+            ADVANCED MICROSTRUCTURE SIGNALS (Fix #5 Enhancement):
+            - Momentum Persistence: {regime_analysis.get('momentum_persistence', 50):.0f}/100 
+            - Order Flow Imbalance: {regime_analysis.get('order_flow_imbalance', 0):+.0f}/100 
+            - Mean Reversion Score: {regime_analysis.get('mean_reversion_score', 0):.0f}/100 
+            - Trading Quality Score: {regime_analysis.get('trading_quality_score', 0):.0f}/100
+            - Trading Edge: {regime_analysis.get('trading_edge', 'NEUTRAL')}
+            """
+        
+        enhanced_market_context = ""
+        if enhanced_context:
+            enhanced_market_context = f"""
+            ENHANCED MARKET STRUCTURE ANALYSIS:
+            {enhanced_context}
+            
+            INSTRUCTIONS FOR USING ENHANCED CONTEXT:
+            - Price Action: Look for rejection wicks, strong bodies, and directional consistency
+            - Candle Quality: Higher scores (>70) indicate conviction; low scores (<40) suggest indecision
+            - Volatility Trend: Expanding ATR = momentum building; Contracting = consolidation/reversal
+            - Volume Profile: Strong buying/selling pressure confirms directional moves
+            - Use this context to validate or challenge basic indicator signals (RSI, MACD)
+            """
+        
         return f"""
-            You are an expert cryptocurrency scalping analyst. Analyze this BTC/USDT market data for a 1-minute scalping strategy:
+            You are an expert cryptocurrency day trading analyst. Analyze this BTC/USDT market data for a 1-minute day trading strategy:
 
             Market Data:
             {json.dumps(market_summary, indent=2)}
             
+            {history_context}
             {regime_context}
-            Scalping Strategy Context:
+            {microstructure_context}
+            {enhanced_market_context}
+            Day Trading Strategy Context:
             - Target: 0.3% profit per trade
             - Stop loss: 0.5% maximum loss
             - Risk tolerance: Very conservative (1% account risk)
@@ -748,3 +1332,410 @@ class AIAnalyzer:
         except Exception as e:
             logger.error(f"Technical score calculation error: {e}")
             return 50
+
+    async def analyze_market_data_mtf(
+        self,
+        symbol: str,
+        mtf_data: Dict[str, pd.DataFrame],
+        user_trade_history: Optional[Dict] = None,
+        regime_analysis: Optional[Dict] = None,
+    ) -> Dict:
+        """
+        Multi-timeframe market analysis for day trading.
+
+        Analyzes three timeframes:
+        - Primary (15m): Main trading signals and entry points
+        - Context (1h): Overall trend direction and market structure
+        - Precision (5m): Fine-tuned entry timing
+
+        Returns enhanced signal with multi-timeframe confirmation.
+        """
+        try:
+            if self.model is None:
+                logger.warning("🤖 AI model not available, using fallback analysis")
+                return self._fallback_analysis("AI model unavailable")
+
+            primary_df = mtf_data.get("primary")
+            context_df = mtf_data.get("context")
+            precision_df = mtf_data.get("precision")
+
+            if primary_df is None or primary_df.empty or len(primary_df) < 20:
+                return self._fallback_analysis("Insufficient primary timeframe data")
+
+            # Extract latest data from all timeframes
+            primary_latest = primary_df.iloc[-1]
+            context_latest = (
+                context_df.iloc[-1]
+                if context_df is not None and not context_df.empty
+                else primary_latest
+            )
+            precision_latest = (
+                precision_df.iloc[-1]
+                if precision_df is not None and not precision_df.empty
+                else primary_latest
+            )
+
+            self._latest_data = primary_latest
+
+            # Check trading quality (Fix #2 - Quality-based trading for MTF)
+            if regime_analysis:
+                trading_quality = regime_analysis.get("trading_quality_score", 0)
+                if trading_quality < 30:
+                    logger.info(
+                        f"🚫 Low trading quality: {trading_quality}/100 - Market regime: {regime_analysis.get('regime')}"
+                    )
+                    return self._fallback_analysis(
+                        f"Trading quality too low ({trading_quality}/100) for {regime_analysis.get('regime')} regime",
+                        float(primary_latest["close"]),
+                    )
+
+            # Multi-timeframe confluence check
+            mtf_confluence = self._calculate_mtf_confluence(
+                primary_df, context_df, precision_df, regime_analysis
+            )
+
+            # Get dynamic threshold from settings (environment-aware)
+            dynamic_threshold = (
+                regime_analysis.get("dynamic_confluence_threshold", settings.get_confluence_threshold())
+                if regime_analysis
+                else settings.get_confluence_threshold()
+            )
+
+            if mtf_confluence < dynamic_threshold:
+                logger.info(
+                    f"⚠️ Low MTF confluence: {mtf_confluence}/{dynamic_threshold} "
+                    f"(Mode: {settings.get_environment_name()}) - Recommending HOLD"
+                )
+                return self._fallback_analysis(
+                    f"Insufficient multi-timeframe confluence ({mtf_confluence}/{dynamic_threshold})",
+                    float(primary_latest["close"]),
+                )
+
+            # Build multi-timeframe summary for AI
+            mtf_summary = self._build_mtf_summary(
+                symbol,
+                primary_df,
+                context_df,
+                precision_df,
+                primary_latest,
+                context_latest,
+                precision_latest,
+            )
+
+            # Generate enhanced prompt with MTF context
+            prompt = self._generate_mtf_prompt(
+                primary_latest, mtf_summary, user_trade_history, regime_analysis
+            )
+
+            try:
+                response = await self.model.generate_content_async(prompt)
+                response_text = (response.text or "").strip()
+                logger.info(f"🤖 Gemini MTF Response: {response.text}")
+                ai_analysis = self._parse_model_response(response_text)
+            except ValueError as parse_error:
+                logger.error(f"❌ JSON Parse Error: {parse_error}")
+                return self._fallback_analysis(
+                    "AI response parsing failed",
+                    float(primary_latest.get("close", 0.0)),
+                )
+            except Exception as gemini_error:
+                logger.error(f"❌ Gemini API Error: {gemini_error}")
+                return self._fallback_analysis(
+                    f"AI analysis failed: {str(gemini_error)[:100]}",
+                    float(primary_latest.get("close", 0.0)),
+                )
+
+            sanitized = self._sanitize_analysis(ai_analysis, primary_latest)
+            enriched = self._enforce_price_targets(sanitized)
+
+            technical_score = self._calculate_technical_score(primary_latest)
+            enriched["technical_score"] = technical_score
+            enriched["final_confidence"] = min(enriched["confidence"], technical_score)
+            enriched["mtf_confluence"] = mtf_confluence
+            enriched["timeframe_analysis"] = mtf_summary
+            enriched["regime_analysis"] = regime_analysis  # Include for risk validation
+
+            logger.info(f"🎯 Final MTF AI Analysis: {enriched}")
+            return enriched
+
+        except Exception as error:
+            logger.error(f"❌ MTF AI analysis error: {error}")
+            return self._fallback_analysis(f"Analysis error: {str(error)[:50]}")
+
+    def _calculate_mtf_confluence(
+        self, primary_df, context_df, precision_df, _regime_analysis
+    ) -> int:
+        """
+        Calculate multi-timeframe confluence score.
+        Checks alignment between 15m, 1h, and 5m timeframes.
+        
+        FIXED: More generous scoring to allow day trading opportunities.
+        Target: 55+ for quality setups (was 75+)
+        """
+        score = 0
+
+        try:
+            primary_latest = primary_df.iloc[-1]
+            context_latest = (
+                context_df.iloc[-1]
+                if context_df is not None and not context_df.empty
+                else None
+            )
+            precision_latest = (
+                precision_df.iloc[-1]
+                if precision_df is not None and not precision_df.empty
+                else None
+            )
+
+            # 1. Trend alignment across timeframes (40 points)
+            if context_latest is not None:
+                primary_trend = self._get_trend_direction(primary_latest)
+                context_trend = self._get_trend_direction(context_latest)
+
+                if primary_trend == context_trend and primary_trend != "neutral":
+                    score += 40  # Strong alignment
+                elif primary_trend == context_trend:
+                    score += 10  # Neutral alignment (Fix #4 - lowered from 25)
+                elif primary_trend != "neutral" or context_trend != "neutral":
+                    score += 15  # One timeframe has direction 
+                else:
+                    score += 10  # Both neutral
+            else:
+                score += 25  # No context data, give reasonable credit 
+
+            # 2. Momentum confirmation (30 points)
+            primary_momentum = self._get_momentum_state(primary_latest)
+            if precision_latest is not None:
+                precision_momentum = self._get_momentum_state(precision_latest)
+                if primary_momentum == precision_momentum:
+                    score += 30
+                elif primary_momentum != "neutral" or precision_momentum != "neutral":
+                    score += 20  # Partial momentum 
+                else:
+                    score += 10  # Both neutral
+            else:
+                score += 20  # No precision data
+
+            # 3. Volume confirmation (30 points) - More lenient for day trading
+            if not pd.isna(primary_latest.get("volume_sma", np.nan)):
+                volume_ratio = primary_latest["volume"] / primary_latest["volume_sma"]
+                if volume_ratio > 1.1:
+                    score += 30  # Strong volume
+                elif volume_ratio > 0.9: 
+                    score += 25  # Above-average volume
+                elif volume_ratio > 0.7:
+                    score += 15  # Acceptable volume
+                else:
+                    score += 10  # Low volume
+            else:
+                score += 15  # No volume data
+
+            final_score = min(100, score)
+            logger.debug(f"📊 MTF Confluence: {final_score}/100 (Target: 55+ for trades)")
+            return final_score
+
+        except Exception as e:
+            logger.error(f"❌ MTF confluence calculation error: {e}")
+            return 50
+
+    def _get_trend_direction(self, candle_data) -> str:
+        """Determine trend direction from candle data."""
+        try:
+            price = candle_data["close"]
+            sma_20 = candle_data.get("sma_20", np.nan)
+            sma_50 = candle_data.get("sma_50", np.nan)
+
+            if pd.isna(sma_20) or pd.isna(sma_50):
+                return "neutral"
+
+            if price > sma_20 and sma_20 > sma_50:
+                return "bullish"
+            elif price < sma_20 and sma_20 < sma_50:
+                return "bearish"
+            else:
+                return "neutral"
+        except Exception:
+            return "neutral"
+
+    def _get_momentum_state(self, candle_data) -> str:
+        """Determine momentum state from candle data."""
+        try:
+            macd = candle_data.get("macd", 0)
+            macd_signal = candle_data.get("macd_signal", 0)
+            rsi = candle_data.get("rsi", 50)
+
+            if pd.isna(macd) or pd.isna(macd_signal) or pd.isna(rsi):
+                return "neutral"
+
+            if macd > macd_signal and rsi > 50:
+                return "bullish"
+            elif macd < macd_signal and rsi < 50:
+                return "bearish"
+            else:
+                return "neutral"
+        except Exception:
+            return "neutral"
+
+    def _build_mtf_summary(
+        self,
+        symbol,
+        _primary_df,
+        context_df,
+        precision_df,
+        primary_latest,
+        context_latest,
+        precision_latest,
+    ) -> Dict:
+        """Build comprehensive multi-timeframe market summary."""
+        summary = {
+            "symbol": symbol,
+            "primary_timeframe": "15m",
+            "context_timeframe": "1h",
+            "precision_timeframe": "5m",
+        }
+
+        # Primary timeframe (15m) - main trading signals
+        summary["primary"] = {
+            "price": float(primary_latest["close"]),
+            "trend": self._get_trend_direction(primary_latest),
+            "momentum": self._get_momentum_state(primary_latest),
+            "rsi": float(primary_latest.get("rsi", 50)),
+            "volume_ratio": float(
+                primary_latest["volume"] / primary_latest.get("volume_sma", 1)
+            ),
+        }
+
+        # Context timeframe (1h) - overall trend
+        if context_df is not None and not context_df.empty:
+            summary["context"] = {
+                "trend": self._get_trend_direction(context_latest),
+                "trend_strength": float(context_latest.get("adx", 0)),
+                "momentum": self._get_momentum_state(context_latest),
+            }
+
+        # Precision timeframe (5m) - entry timing
+        if precision_df is not None and not precision_df.empty:
+            summary["precision"] = {
+                "momentum": self._get_momentum_state(precision_latest),
+                "recent_direction": (
+                    "up"
+                    if precision_latest["close"] > precision_df.iloc[-2]["close"]
+                    else "down"
+                ),
+            }
+
+        return summary
+
+    def _sanitize_for_json(self, obj):
+        """Convert numpy types and other non-JSON-serializable types to native Python types."""
+        if isinstance(obj, dict):
+            return {key: self._sanitize_for_json(value) for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [self._sanitize_for_json(item) for item in obj]
+        elif isinstance(obj, (np.integer, np.int64, np.int32)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float64, np.float32)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (bool, np.bool_)):
+            return bool(obj)
+        else:
+            return obj
+
+    def _generate_mtf_prompt(
+        self, primary_latest, mtf_summary, user_history, regime_analysis
+    ) -> str:
+        """Generate enhanced prompt with multi-timeframe context."""
+        # Sanitize regime_analysis to ensure JSON serialization works
+        regime_analysis_clean = self._sanitize_for_json(regime_analysis) if regime_analysis else None
+        
+        prompt = f"""You are an expert day trading analyst. Analyze this multi-timeframe market data and provide a trading recommendation.
+
+MULTI-TIMEFRAME ANALYSIS:
+- Primary (15m): {json.dumps(mtf_summary.get('primary', {}), indent=2)}
+- Context (1h): {json.dumps(mtf_summary.get('context', {}), indent=2)}
+- Precision (5m): {json.dumps(mtf_summary.get('precision', {}), indent=2)}
+
+CURRENT MARKET REGIME:
+{json.dumps(regime_analysis_clean, indent=2) if regime_analysis_clean else 'No regime data available'}
+
+TRADING STYLE: Day Trading
+- Desired R:R Ratio: At least 2:1
+- Holding period: 30 minutes to 8 hours
+- Risk-Reward: Minimum 1:1.5, target 1:2 or better
+- Quality over quantity: Only high-probability setups
+
+TECHNICAL INDICATORS (15m):
+- RSI: {float(primary_latest.get('rsi', 50)):.1f}
+- MACD: {float(primary_latest.get('macd', 0)):.4f}
+- ADX: {float(primary_latest.get('adx', 0)):.1f}
+- ATR: {float(primary_latest.get('atr', 0)):.4f}
+
+"""
+        # Fix #5: Add microstructure signals to prompt
+        if regime_analysis:
+            prompt += f"""
+ADVANCED MICROSTRUCTURE SIGNALS (Fix #5 Enhancement):
+- Momentum Persistence: {regime_analysis.get('momentum_persistence', 50):.0f}/100 
+  (How long momentum tends to last - high = strong trends)
+- Order Flow Imbalance: {regime_analysis.get('order_flow_imbalance', 0):+.0f}/100 
+  (Buying vs Selling pressure - positive = accumulation, negative = distribution)
+- Mean Reversion Score: {regime_analysis.get('mean_reversion_score', 0):.0f}/100 
+  (Price stretched from mean - high = excellent mean reversion opportunity)
+- Trading Quality Score: {regime_analysis.get('trading_quality_score', 0):.0f}/100
+  (Overall setup quality - must be >50 for trade approval)
+- Trading Edge: {regime_analysis.get('trading_edge', 'NEUTRAL')}
+  (TREND_FOLLOWING, MEAN_REVERSION, BREAKOUT, or NEUTRAL)
+- Optimal Hold Time: {regime_analysis.get('optimal_hold_time', '10-20')} minutes
+
+USE THESE SIGNALS TO REFINE YOUR ANALYSIS:
+- If Order Flow > +40 and Momentum Persistence > 60: Strong trend-following setup
+- If Mean Reversion > 70: Excellent scalping opportunity (price stretched)
+- If Trading Edge = "MEAN_REVERSION": Focus on counter-trend entries
+- If Trading Edge = "TREND_FOLLOWING": Go with the momentum
+- Always respect the Optimal Hold Time for exit planning
+
+"""
+        
+        if user_history:
+            prompt += f"""
+USER TRADING HISTORY:
+- Total trades: {user_history.get('total_trades', 0)}
+- Win rate: {user_history.get('win_rate', 0):.1f}%
+- Recent trend: {user_history.get('recent_trend', 'unknown')}
+"""
+
+        prompt += """
+Provide your analysis in JSON format:
+{
+  "signal": "buy" | "sell" | "hold",
+  "confidence": 0-100,
+  "reasoning": "Explain multi-timeframe alignment and why this is a high-quality setup",
+  "entry_price": <suggested entry>,
+  "stop_loss": <suggested stop loss price (e.g., 0.5% from entry)>,
+  "take_profit": <suggested take profit price (e.g., 1.0% from entry, ensuring at least 2:1 R:R)>,
+  "timeframe_alignment": "describe how 15m, 1h, and 5m align"
+}
+
+IMPORTANT: Only recommend buy/sell if you see strong multi-timeframe alignment and high probability. Default to "hold" if uncertain. Under NO circumstances should you issue a 'buy' signal if the regime is BEAR_TREND with ADX > 30. The same applies to 'sell' signals in a BULL_TREND.
+
+CRITICAL TRADING RULES:
+1. NEVER trade counter-trend in strong directional markets (ADX > 30)
+   - BEAR_TREND + ADX > 30 → Only SELL signals allowed (or hold)
+   - BULL_TREND + ADX > 30 → Only BUY signals allowed (or hold)
+
+2. NEVER attempt mean reversion (Trading Edge = MEAN_REVERSION) in strong trends
+   - If regime is BEAR_TREND or BULL_TREND with ADX > 30 and Trading Edge = MEAN_REVERSION → Issue HOLD
+   - Mean reversion only works in RANGE_BOUND markets or weak trends (ADX < 25)
+
+3. Natural R:R must be at least 2.0:1 from market structure
+   - Don't suggest tight stop losses or take profits
+   - If market doesn't naturally provide 2:1 R:R, recommend HOLD
+   - Professional traders skip trades with poor natural R:R
+
+4. Quality over quantity - only high-probability setups
+   - When in doubt, recommend HOLD
+   - Better to miss a trade than force a bad setup
+"""
+        return prompt

@@ -1,6 +1,6 @@
 """
 Advanced Market Regime Analyzer with Microstructure Analysis
-Industry-leading scalping strategy using momentum persistence, order flow, and volatility clustering.
+Advanced day trading strategy using momentum persistence, order flow, and volatility clustering.
 """
 
 import pandas as pd
@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 class AdvancedRegimeAnalyzer:
     """
-    Next-generation market regime analyzer optimized for scalping with:
+    Next-generation market regime analyzer optimized for day trading with:
     - Momentum Persistence Analysis
     - Order Flow Imbalance Detection
     - Volatility Clustering (GARCH-style)
@@ -22,15 +22,15 @@ class AdvancedRegimeAnalyzer:
     - Dynamic Confluence Thresholds
     """
     
-    def __init__(self, filter_mode: str = "scalping"):
+    def __init__(self, filter_mode: str = "day_trading"):
         self.regime_history = []
         self.atr_history_window = 200
         self.filter_mode = filter_mode.lower()
         
         # Validate filter mode
-        if self.filter_mode not in ["strict", "balanced", "permissive", "scalping"]:
-            logger.warning(f"⚠️  Invalid filter mode '{filter_mode}', defaulting to 'scalping'")
-            self.filter_mode = "scalping"
+        if self.filter_mode not in ["strict", "balanced", "permissive", "day_trading"]:
+            logger.warning(f"⚠️  Invalid filter mode '{filter_mode}', defaulting to 'day_trading'")
+            self.filter_mode = "day_trading"
         
         logger.info(f"🚀 Advanced Market Regime Analyzer initialized in {self.filter_mode.upper()} mode")
         
@@ -52,7 +52,7 @@ class AdvancedRegimeAnalyzer:
         - Order flow imbalance (-100 to +100)
         - Volatility clustering factor
         - Mean reversion opportunity score
-        - Dynamic scalping quality score (0-100)
+        - Dynamic trading quality score (0-100)
         """
         
         try:
@@ -103,27 +103,60 @@ class AdvancedRegimeAnalyzer:
             # 3. Volatility Clustering Factor (0-100)
             volatility_clustering = self._calculate_volatility_clustering(df)
             
-            # 4. Mean Reversion Opportunity Score (0-100)
-            mean_reversion_score = self._calculate_mean_reversion_opportunity(df)
+            # 4. Mean Reversion Opportunity Score (0-100) - with trend penalty
+            mean_reversion_score = self._calculate_mean_reversion_opportunity(df, adx=adx)
             
-            # 5. Dynamic Scalping Quality Score (0-100)
-            scalping_quality = self._calculate_scalping_quality(
+            # 5. ADX-ATR Coherence Check (detect choppiness)
+            adx_atr_coherence = self._check_adx_atr_coherence(adx, atr_percentage)
+            
+            # 6. Dynamic Trading Quality Score (0-100)
+            trading_quality = self._calculate_trading_quality(
                 regime, trend_strength, atr_percentage, momentum_persistence,
                 order_flow_imbalance, volatility_clustering, mean_reversion_score
             )
             
-            # 6. Adaptive Confluence Threshold
+            # Apply coherence penalty to trading quality
+            if adx_atr_coherence < 40: # Stricter threshold for hard filter
+                logger.error(
+                    f"🚨 HARD FILTER: ADX-ATR incoherence detected! "
+                    f"ADX={adx:.1f}, ATR%={atr_percentage:.2f}%, Coherence={adx_atr_coherence:.0f}/100. "
+                    f"This indicates a choppy, untradable market. Forcing HOLD."
+                )
+                trading_quality = 0 # Force quality to 0 to prevent trading
+                allow_trading = False
+            elif adx_atr_coherence < 50:
+                original_quality = trading_quality
+                trading_quality *= (adx_atr_coherence / 100)
+                logger.warning(
+                    f"🚨 Trading quality penalized for ADX-ATR incoherence: "
+                    f"{original_quality:.0f} → {trading_quality:.0f} "
+                    f"(coherence: {adx_atr_coherence:.0f}/100)"
+                )
+            
+            # 7. Adaptive Confluence Threshold
             dynamic_threshold = self._calculate_dynamic_confluence_threshold(
-                scalping_quality, volatility_clustering
+                trading_quality, volatility_clustering
             )
             
-            # === SCALPING PERMISSION (now based on quality score) ===
-            allow_scalping = scalping_quality >= 50  # Quality-based, not binary regime check
+            # === DETECT FALSE RANGES (Strong ADX but classified as RANGE_BOUND) ===
+            # If ADX > 40 and regime is RANGE_BOUND, it's likely a FALSE RANGE (actually trending)
+            # Apply penalty instead of complete block to allow strong AI signals to override
+            if regime == "RANGE_BOUND" and adx > 40:
+                logger.warning(
+                    f"⚠️  POTENTIAL FALSE RANGE: ADX={adx:.1f} > 40 suggests trending market despite RANGE classification. "
+                    f"Applying 15% quality penalty but allowing strong signals to proceed."
+                )
+                # Apply penalty instead of hard block - allows AI override for exceptional signals
+                trading_quality *= 0.85  # 15% penalty for false range risk
+            
+            # === TRADING PERMISSION (quality-based with lower threshold) ===
+            # Lowered from 50 to 40 for day trading to capture more valid opportunities
+            allow_trading = trading_quality >= 40  # More permissive for mainnet deployment
             
             # Calculate confidence
             confidence = self._calculate_advanced_confidence(
-                df, regime, trend_strength, volatility_percentile,
-                scalping_quality, momentum_persistence
+                regime, trend_strength, volatility_percentile,
+                trading_quality, momentum_persistence
             )
             
             result = {
@@ -133,7 +166,7 @@ class AdvancedRegimeAnalyzer:
                 "volatility_percentile": volatility_percentile,
                 "trend_strength": trend_strength,
                 "atr_percentage": atr_percentage,
-                "allow_scalping": allow_scalping,
+                "allow_trading": allow_trading,
                 "sma_alignment": sma_alignment,
                 "volume_trend": volume_trend,
                 "adx": adx,
@@ -146,11 +179,12 @@ class AdvancedRegimeAnalyzer:
                 "order_flow_imbalance": order_flow_imbalance,
                 "volatility_clustering": volatility_clustering,
                 "mean_reversion_score": mean_reversion_score,
-                "scalping_quality_score": scalping_quality,
+                "adx_atr_coherence": adx_atr_coherence,
+                "trading_quality_score": trading_quality,
                 "dynamic_confluence_threshold": dynamic_threshold,
                 
                 # Trading recommendations
-                "scalping_edge": self._determine_scalping_edge(
+                "trading_edge": self._determine_trading_edge(
                     order_flow_imbalance, mean_reversion_score, momentum_persistence
                 ),
                 "optimal_hold_time": self._estimate_optimal_hold_time(
@@ -164,15 +198,15 @@ class AdvancedRegimeAnalyzer:
                 self.regime_history.pop(0)
             
             # Enhanced logging
-            emoji = "✅" if allow_scalping else "🚫"
-            quality_emoji = "🔥" if scalping_quality > 70 else "⚡" if scalping_quality > 50 else "❄️"
+            emoji = "✅" if allow_trading else "🚫"
+            quality_emoji = "🔥" if trading_quality > 70 else "⚡" if trading_quality > 50 else "❄️"
             
             logger.info(
                 f"{emoji}{quality_emoji} [ADVANCED-{self.filter_mode.upper()}] {symbol} | {regime} | "
-                f"Quality={scalping_quality:.0f} | MomPersist={momentum_persistence:.0f} | "
+                f"Quality={trading_quality:.0f} | MomPersist={momentum_persistence:.0f} | "
                 f"OrderFlow={order_flow_imbalance:+.0f} | VolCluster={volatility_clustering:.0f} | "
                 f"MeanRev={mean_reversion_score:.0f} | Threshold={dynamic_threshold:.0f} | "
-                f"Edge={result['scalping_edge']} | HoldTime={result['optimal_hold_time']}min"
+                f"Edge={result['trading_edge']} | HoldTime={result['optimal_hold_time']}min"
             )
             
             return result
@@ -183,11 +217,11 @@ class AdvancedRegimeAnalyzer:
     
     def _calculate_momentum_persistence(self, df: pd.DataFrame, lookback: int = 10) -> float:
         """
-        Calculate how long momentum tends to persist (key for scalping exits).
+        Calculate how long momentum tends to persist (key for day trading exits).
         
         Analyzes recent price movements to predict how long the current momentum will last.
-        High persistence = trends continue, good for trend-following scalps
-        Low persistence = choppy reversals, better for mean reversion scalps
+        High persistence = trends continue, good for trend-following trades
+        Low persistence = choppy reversals, better for mean reversion trades
         
         Returns: 0-100 score
         """
@@ -293,12 +327,14 @@ class AdvancedRegimeAnalyzer:
         
         return clustering_score
     
-    def _calculate_mean_reversion_opportunity(self, df: pd.DataFrame) -> float:
+    def _calculate_mean_reversion_opportunity(self, df: pd.DataFrame, adx: float = None) -> float:
         """
-        Identify when price has stretched too far from mean (scalping gold!).
+        Identify when price has stretched too far from mean (day trading opportunity!).
         
         Uses Bollinger Bands + RSI + price vs SMA deviation to find extremes.
-        High score = excellent mean reversion scalping opportunity
+        High score = excellent mean reversion day trading opportunity
+        
+        Penalize mean reversion in strong trends (ADX > 40)
         
         Returns: 0-100 score
         """
@@ -352,15 +388,26 @@ class AdvancedRegimeAnalyzer:
                 elif price_deviation_pct > 0.5:
                     score += 10
         
+        # CRITICAL FIX: Penalize mean reversion in strong trends
+        # Mean reversion only works in TRUE RANGES, not trending markets
+        if adx is not None and adx > 40:
+            penalty_factor = min(0.3, (adx - 40) / 100)  # Up to 70% penalty
+            original_score = score
+            score *= (1 - penalty_factor)
+            logger.debug(
+                f"⚠️  Mean reversion penalty applied: ADX={adx:.1f} | "
+                f"Original={original_score:.0f} → Penalized={score:.0f}"
+            )
+        
         return min(100, score)
     
-    def _calculate_scalping_quality(
+    def _calculate_trading_quality(
         self, regime: str, trend_strength: float, atr_percentage: float,
         momentum_persistence: float, order_flow_imbalance: float,
         volatility_clustering: float, mean_reversion_score: float
-    ) -> float:
+) -> float:
         """
-        REVOLUTIONARY: Calculate overall scalping quality based on microstructure.
+        REVOLUTIONARY: Calculate overall trading quality based on microstructure.
         
         This replaces the binary allow/block with a nuanced 0-100 quality score.
         Different regimes can have high quality if microstructure is favorable!
@@ -378,7 +425,7 @@ class AdvancedRegimeAnalyzer:
                 quality += 10
                 
         elif regime == "RANGE_BOUND":
-            # Range can be EXCELLENT for scalping if microstructure is right!
+            # Range can be EXCELLENT for day trading with proper risk management!
             quality += 15  # Base points for range
             
             # Bonus if mean reversion opportunity is high
@@ -426,41 +473,44 @@ class AdvancedRegimeAnalyzer:
             quality += 8
         
         # === ATR Sweet Spot Bonus (+5 points) ===
-        if 0.1 < atr_percentage < 0.8:  # Optimal volatility for scalping
+        if 0.1 < atr_percentage < 0.8:  # Optimal volatility for day trading
             quality += 5
         
         return max(0, min(100, quality))
     
     def _calculate_dynamic_confluence_threshold(
-        self, scalping_quality: float, volatility_clustering: float
-    ) -> float:
+        self, trading_quality: float, volatility_clustering: float
+) -> float:
         """
         Adaptive confluence threshold based on market conditions.
         
+        More aggressive thresholds for day trading (35-60 range instead of 40-70).
         When quality is high, we can accept lower confluence (be more aggressive).
         When volatility is unpredictable, require higher confluence (be cautious).
         
-        Returns: Dynamic threshold (40-70)
+        Returns: Dynamic threshold (35-60)
         """
-        base_threshold = 60.0
+        base_threshold = 50.0
         
         # Adjust down for high-quality setups (can be more aggressive)
-        if scalping_quality > 80:
-            base_threshold -= 15
-        elif scalping_quality > 70:
-            base_threshold -= 10
-        elif scalping_quality > 60:
-            base_threshold -= 5
+        if trading_quality > 80:
+            base_threshold -= 15  # Can go as low as 35
+        elif trading_quality > 70:
+            base_threshold -= 10  # Can go as low as 40
+        elif trading_quality > 60:
+            base_threshold -= 5   # Can go as low as 45
         
         # Adjust up for unpredictable volatility (need more confirmation)
         if volatility_clustering < 30:
-            base_threshold += 10
+            base_threshold += 10  # Max 60 even in chaotic conditions
         elif volatility_clustering < 50:
-            base_threshold += 5
+            base_threshold += 5   # Max 55
         
-        return max(40, min(70, base_threshold))
+        final_threshold = max(35, min(60, base_threshold))
+        logger.debug(f"🎯 Dynamic confluence threshold: {final_threshold} (quality: {trading_quality:.0f}, vol_cluster: {volatility_clustering:.0f})")
+        return final_threshold
     
-    def _determine_scalping_edge(
+    def _determine_trading_edge(
         self, order_flow: float, mean_reversion: float, momentum: float
     ) -> str:
         """
@@ -490,7 +540,51 @@ class AdvancedRegimeAnalyzer:
         elif momentum_persistence > 50:
             return "10-20"  # Moderate momentum
         else:
-            return "5-15"  # Quick scalps
+            return "5-15"  # Quick trades
+    
+    def _check_adx_atr_coherence(self, adx: float, atr_percentage: float) -> float:
+        """
+        Check if ADX and ATR% are coherent (both agree on market state).
+        
+        PROBLEM: High ADX (60-70) + Low ATR% (0.30-0.50%) = CHOPPY WHIPSAW
+        - High ADX suggests strong trend
+        - Low ATR% suggests no meaningful movement
+        - This paradox = range-bound chop that kills day traders
+        
+        SOLUTION: Penalize when ADX and volatility disagree
+        
+        Returns: 0-100 coherence score (100 = perfect agreement, 0 = total conflict)
+        """
+        # Expected relationship: Strong trend (high ADX) should have decent volatility
+        # Weak trend (low ADX) can have any volatility (consolidation or ranging)
+        
+        if adx < 25:
+            # Low ADX = no strong trend, any volatility is fine
+            return 100.0
+        
+        if adx >= 25 and atr_percentage >= 0.50:
+            # High ADX + decent volatility = coherent trending market
+            return 100.0
+        
+        if adx >= 40 and atr_percentage < 0.40:
+            # Very high ADX + very low volatility = CHOPPY WHIPSAW (worst case)
+            logger.warning(
+                f"⚠️ ADX-ATR INCOHERENCE DETECTED: ADX={adx:.1f} but ATR%={atr_percentage:.2f}% "
+                f"This is choppy range-bound action, NOT a clean trend!"
+            )
+            return 20.0  # Severe penalty
+        
+        if adx >= 25 and atr_percentage < 0.50:
+            # Moderate ADX + low volatility = minor choppiness
+            penalty = ((adx - 25) / 50) * 100  # Scale penalty with ADX strength
+            coherence = max(40, 100 - penalty)
+            logger.info(
+                f"⚡ Moderate ADX-ATR incoherence: ADX={adx:.1f}, ATR%={atr_percentage:.2f}% "
+                f"Coherence={coherence:.0f}/100"
+            )
+            return coherence
+        
+        return 100.0
     
     # === HELPER METHODS (from original implementation) ===
     
@@ -520,8 +614,14 @@ class AdvancedRegimeAnalyzer:
         trend_strength: float, price_vs_sma20: float,
         sma_alignment: str, volume_trend: str
     ) -> str:
-        # Strong trend detection first
-        if trend_strength > 35:
+        """
+        IMPROVED: Adjusted ADX thresholds to reduce false RANGE_BOUND classifications.
+        - Raised trending threshold from 20 to 25 ADX
+        - Raised strong trend threshold from 35 to 40 ADX
+        - Better captures moderate trends (25-40 ADX) that were falling through as RANGE_BOUND
+        """
+        # Strong trend detection first (raised from 35 to 40)
+        if trend_strength > 40:
             return self._classify_trend_direction(sma_alignment, price_vs_sma20, volume_trend)
         
         # High volatility check
@@ -532,8 +632,9 @@ class AdvancedRegimeAnalyzer:
         if atr_percentage < self.volatility_threshold_low and volatility_percentile < 20:
             return "LOW_VOLATILITY"
         
-        # Moderate trend detection
-        if trend_strength > 20:
+        # Moderate trend detection (raised from 20 to 25)
+        # This catches ADX 25-40 which are valid trends
+        if trend_strength > 25:
             return self._classify_trend_direction(sma_alignment, price_vs_sma20, volume_trend)
         
         return "RANGE_BOUND"
@@ -552,30 +653,38 @@ class AdvancedRegimeAnalyzer:
         return "RANGE_BOUND"
     
     def _calculate_advanced_confidence(
-        self, df: pd.DataFrame, regime: str, trend_strength: float,
-        volatility_percentile: float, scalping_quality: float,
+        self, regime: str, trend_strength: float,
+        volatility_percentile: float, trading_quality: float,
         momentum_persistence: float
-    ) -> float:
+) -> float:
         confidence = 50.0
+
+        # Regime Factor
+        if regime in ["BULL_TREND", "BEAR_TREND"]:
+            confidence += 15  # Higher confidence in clear trends
+        elif regime == "RANGE_BOUND":
+            confidence -= 5  # Slightly lower confidence in ranges
+        elif regime in ["HIGH_VOLATILITY", "LOW_VOLATILITY"]:
+            confidence -= 10 # Lower confidence in tricky conditions
         
         # Trend strength factor
         if trend_strength > 40:
-            confidence += 25
-        elif trend_strength > 25:
             confidence += 15
+        elif trend_strength > 25:
+            confidence += 10
         elif trend_strength < 15:
             confidence -= 10
         
         # Volatility consistency factor
         if 30 < volatility_percentile < 70:
-            confidence += 15
+            confidence += 10
         elif volatility_percentile > 90 or volatility_percentile < 10:
             confidence -= 10
         
-        # Scalping quality boost
-        if scalping_quality > 75:
+        # Trading quality boost
+        if trading_quality > 75:
             confidence += 10
-        elif scalping_quality > 60:
+        elif trading_quality > 60:
             confidence += 5
         
         # Momentum persistence factor
@@ -591,7 +700,7 @@ class AdvancedRegimeAnalyzer:
             "volatility_percentile": 50,
             "trend_strength": 0,
             "atr_percentage": 0,
-            "allow_scalping": False,
+            "allow_trading": False,
             "sma_alignment": "NEUTRAL",
             "volume_trend": "STABLE",
             "adx": 0,
@@ -600,8 +709,8 @@ class AdvancedRegimeAnalyzer:
             "order_flow_imbalance": 0,
             "volatility_clustering": 50,
             "mean_reversion_score": 0,
-            "scalping_quality_score": 0,
-            "dynamic_confluence_threshold": 60,
-            "scalping_edge": "NEUTRAL",
+            "trading_quality_score": 0,
+            "dynamic_confluence_threshold": 55,
+            "trading_edge": "NEUTRAL",
             "optimal_hold_time": "10-20"
         }

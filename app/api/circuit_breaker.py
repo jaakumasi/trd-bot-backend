@@ -65,7 +65,7 @@ async def get_user_circuit_breaker_status(
     from ..services.mock_binance_service import MockBinanceService
     from ..config import settings
     
-    binance = MockBinanceService() if settings.use_mock_binance else BinanceService()
+    binance = MockBinanceService() if settings.use_mock_service() else BinanceService()
     await binance.initialize()
     balances = binance.get_account_balance()
     usdt_balance = balances.get("USDT", {}).get("free", 1000.0)

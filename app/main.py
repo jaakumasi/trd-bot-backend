@@ -9,6 +9,7 @@ from .database import engine, Base
 from .api import trading, portfolio, auth, circuit_breaker
 from .services.trading_bot import TradingBot
 from .services.websocket_manager import WebSocketManager
+from .services.service_constants import validate_constants
 from .logging_config import setup_logging
 # Import all models to ensure they're registered with SQLAlchemy
 from .models.user import User
@@ -48,6 +49,13 @@ trading_bot = None
 
 @app.on_event("startup")
 async def startup_event():
+    # Validate trading constants at startup
+    logger.info("🔍 Validating trading constants...")
+    if not validate_constants():
+        logger.error("❌ Trading constants validation failed! Check configuration.")
+        # Continue anyway but log critical warning
+        logger.warning("⚠️  Bot will start but may behave unexpectedly!")
+    
     # Create database tables
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -68,8 +76,10 @@ async def startup_event():
 
     logger.info("🤖 Trd Bot API Started Successfully!")
     logger.info("📊 Database: Connected to PostgreSQL db")
+    logger.info(f"🌐 Trading Mode: {settings.get_environment_name()}")
+    logger.info(f"📋 Trading Profile: {settings.trading_profile.upper()}")
     print(f"🔗 CORS Origins: {settings.cors_origins}")
-    print(f"🧪 Test Mode: {settings.binance_testnet}")
+    print(f"🎯 Trading Mode: {settings.get_environment_name()}")
 
 
 @app.on_event("shutdown")
@@ -92,7 +102,7 @@ async def health_check():
         "status": "healthy",
         "version": "1.0.0",
         "bot_active": trading_bot.is_running if trading_bot else False,
-        "test_mode": settings.binance_testnet,
+        "trading_mode": settings.get_environment_name(),
     }
 
 
@@ -148,7 +158,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: int):
                     {
                         "type": "status_update",
                         "bot_running": trading_bot.is_running if trading_bot else False,
-                        "test_mode": settings.binance_testnet,
+                        "trading_mode": settings.get_environment_name(),
                     },
                 )
 

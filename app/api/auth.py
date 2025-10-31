@@ -167,7 +167,7 @@ async def register(user_data: UserCreate, db: AsyncSession = Depends(get_db)):
     # Create default trading configuration
     trading_config = TradingConfig(
         user_id=user.id,
-        strategy_name="scalping",
+        strategy_name="day_trading",
         risk_percentage=1.0,
         trading_pair="BTCUSDT",
         is_active=False,
