@@ -488,6 +488,9 @@ class TradingBot:
 
             usdt_balance = self._fetch_usdt_balance(user_id)
 
+            # Add symbol to signal for asset-specific validation
+            ai_signal["symbol"] = symbol
+
             # 🛡️ Circuit Breaker Check - BEFORE trade validation
             try:
                 self.circuit_breaker.check_before_trade(user_id, usdt_balance)

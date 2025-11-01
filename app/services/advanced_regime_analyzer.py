@@ -150,8 +150,7 @@ class AdvancedRegimeAnalyzer:
                 trading_quality *= 0.85  # 15% penalty for false range risk
             
             # === TRADING PERMISSION (quality-based with lower threshold) ===
-            # Lowered from 50 to 40 for day trading to capture more valid opportunities
-            allow_trading = trading_quality >= 40  # More permissive for mainnet deployment
+            allow_trading = trading_quality >= 35  # More permissive for capturing valid trades
             
             # Calculate confidence
             confidence = self._calculate_advanced_confidence(
@@ -411,7 +410,6 @@ class AdvancedRegimeAnalyzer:
         
         This replaces the binary allow/block with a nuanced 0-100 quality score.
         Different regimes can have high quality if microstructure is favorable!
-        
         Returns: 0-100 quality score
         """
         quality = 0.0
@@ -433,11 +431,11 @@ class AdvancedRegimeAnalyzer:
                 quality += 15  # Range + mean reversion = gold
                 
         elif regime == "LOW_VOLATILITY":
-            # Low vol can work if momentum persists
-            quality += 10
+            quality += 25  # Low vol can be excellent for precision entries
             
+            # Strong bonus if momentum persists (trends can form in low vol)
             if momentum_persistence > 60:
-                quality += 15
+                quality += 20
                 
         elif regime == "HIGH_VOLATILITY":
             # High vol is risky but can work with strong order flow
@@ -448,17 +446,19 @@ class AdvancedRegimeAnalyzer:
         
         # === Microstructure Bonuses (up to +70 points) ===
         
-        # Momentum persistence (0-20 points)
+        # Momentum persistence (0-25 points)
         if momentum_persistence > 70:
-            quality += 20
+            quality += 25
         elif momentum_persistence > 50:
-            quality += 10
+            quality += 15
+        elif momentum_persistence > 40:
+            quality += 8   # for moderate momentum
         
-        # Order flow imbalance (0-20 points)
-        if abs(order_flow_imbalance) > 60:  # Strong directional flow
-            quality += 20
-        elif abs(order_flow_imbalance) > 40:
+        # This metric is unreliable - often negative during bullish price action
+        if abs(order_flow_imbalance) > 60:
             quality += 10
+        elif abs(order_flow_imbalance) > 40:
+            quality += 5
         
         # Volatility clustering (0-15 points)
         if volatility_clustering > 70:  # Predictable volatility
@@ -472,9 +472,8 @@ class AdvancedRegimeAnalyzer:
         elif mean_reversion_score > 50:
             quality += 8
         
-        # === ATR Sweet Spot Bonus (+5 points) ===
-        if 0.1 < atr_percentage < 0.8:  # Optimal volatility for day trading
-            quality += 5
+        if 0.08 < atr_percentage < 1.0:
+            quality += 10
         
         return max(0, min(100, quality))
     
@@ -484,29 +483,30 @@ class AdvancedRegimeAnalyzer:
         """
         Adaptive confluence threshold based on market conditions.
         
-        More aggressive thresholds for day trading (35-60 range instead of 40-70).
-        When quality is high, we can accept lower confluence (be more aggressive).
-        When volatility is unpredictable, require higher confluence (be cautious).
+        - When quality is high, we can be even more aggressive (30 threshold)
+        - Allows AI to make calls on slightly lower confluence if setup is solid
         
-        Returns: Dynamic threshold (35-60)
+        Returns: Dynamic threshold (30-55)
         """
-        base_threshold = 50.0
+        base_threshold = 45.0
         
         # Adjust down for high-quality setups (can be more aggressive)
         if trading_quality > 80:
-            base_threshold -= 15  # Can go as low as 35
+            base_threshold -= 15  # Can go as low as 30
         elif trading_quality > 70:
-            base_threshold -= 10  # Can go as low as 40
+            base_threshold -= 12  # Can go as low as 33
         elif trading_quality > 60:
-            base_threshold -= 5   # Can go as low as 45
+            base_threshold -= 8   # Can go as low as 37
+        elif trading_quality > 50:
+            base_threshold -= 5   # Can go as low as 40
         
         # Adjust up for unpredictable volatility (need more confirmation)
         if volatility_clustering < 30:
-            base_threshold += 10  # Max 60 even in chaotic conditions
+            base_threshold += 10  # Max 55 even in chaotic conditions
         elif volatility_clustering < 50:
-            base_threshold += 5   # Max 55
+            base_threshold += 5   # Max 50
         
-        final_threshold = max(35, min(60, base_threshold))
+        final_threshold = max(30, min(55, base_threshold))
         logger.debug(f"🎯 Dynamic confluence threshold: {final_threshold} (quality: {trading_quality:.0f}, vol_cluster: {volatility_clustering:.0f})")
         return final_threshold
     

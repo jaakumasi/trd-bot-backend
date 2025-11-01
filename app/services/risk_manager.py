@@ -10,8 +10,13 @@ from .service_constants import (
     MAX_BALANCE_TRADE_RATIO,
     MAX_OPEN_POSITIONS,
     MIN_ACCOUNT_BALANCE,
-    MIN_SIGNAL_CONFIDENCE,
+    MIN_CONFIDENCE_FLOOR,
     MIN_TRADE_VALUE,
+    MIN_SETUP_QUALITY,
+    MIN_RISK_REWARD_RATIO,
+    # Adaptive functions
+    is_volume_expanding,
+    assess_setup_quality,
 )
 
 logger = logging.getLogger(__name__)
@@ -171,89 +176,21 @@ class RiskManager:
             )
             return 0.0
 
-    def get_adaptive_confidence_threshold(
-        self, user_trade_history: Optional[Dict] = None
-    ) -> float:
-        """
-        Calculate adaptive confidence threshold to reduce overfitting.
-        
-        Cap maximum threshold to prevent over-conservatism.
-        
-        Adjusts MIN_SIGNAL_CONFIDENCE based on recent win rate:
-        - High win rate (>60%) -> Lower threshold (more aggressive)
-        - Normal win rate (40-60%) -> Standard threshold
-        - Low win rate (<40%) -> Slightly higher threshold
-        
-        Also adds randomization to prevent point-estimate overfitting.
-        
-        Args:
-            user_trade_history: Optional dictionary with 'win_rate' and 'recent_trend'
-        
-        Returns:
-            Adaptive confidence threshold (50-70 range, capped)
-        """
-        base_threshold = MIN_SIGNAL_CONFIDENCE
-        
-        # If no history, use base threshold
-        if not user_trade_history:
-            capped = min(base_threshold, 70.0)
-            logger.info(
-                f"� No trade history - using base threshold: {capped:.1f} "
-                f"(base: {base_threshold}, capped at 70%)"
-            )
-            return capped
-        
-        win_rate = user_trade_history.get('win_rate', 50.0)
-        recent_trend = user_trade_history.get('recent_trend', 'neutral')
-        
-        # Adaptive adjustment based on performance (but capped at 70%)
-        if win_rate > 60 and recent_trend == 'winning':
-            adjusted = base_threshold - 10
-            logger.info(
-                f"📈 High performance detected (WR: {win_rate:.1f}%, trend: {recent_trend}) "
-                f"- reducing threshold to {adjusted}"
-            )
-        elif win_rate < 40 or recent_trend == 'losing':
-            adjusted = min(base_threshold + 5, 70.0)
-            logger.info(
-                f"📉 Low performance detected (WR: {win_rate:.1f}%, trend: {recent_trend}) "
-                f"- increasing threshold to {adjusted} (capped at 70%)"
-            )
-        else:
-            adjusted = base_threshold
-            logger.info(
-                f"➡️ Normal performance (WR: {win_rate:.1f}%) - using base threshold {adjusted}"
-            )
-        
-        # Cap at 70% maximum to prevent killing good trades
-        final_threshold = min(adjusted, 70.0)
-        
-        # Clamp to reasonable range (50-70%)
-        final_threshold = max(50, min(70, final_threshold))
-        
-        logger.info(f"✅ Final adaptive threshold: {final_threshold:.1f}% (capped at 70%)")
-        
-        logger.info(
-            f"✅ Adaptive confidence threshold: {final_threshold:.1f} "
-            f"(adjusted: {adjusted}, randomized with ±8%)"
-        )
-        
-        return final_threshold
-
     def validate_entry_timing(
         self, signal: Dict, market_df, regime_analysis: Optional[Dict]
     ) -> Tuple[bool, str]:
         """
-        PRIORITY 1: Validate entry timing with momentum confirmation.
+        Validate entry timing with momentum confirmation.
+        Uses ADAPTIVE validation based on market structure and context.
         
-        Prevents taking trades at the worst possible moment (extended moves, no confirmation).
-        Professional traders wait for confirmation before entering, not chase moves.
+        Prevents taking trades at the worst possible moment.
+        Professional traders wait for confirmation, not chase moves.
         
         Entry Requirements:
-        1. Price not overextended (within 1.5 ATR of SMA20)
-        2. Volume confirmation (>1.5x average on recent candles)
+        1. Price not severely overextended (structural check)
+        2. Volume expanding relative to recent context (regime-aware)
         3. Momentum confirmation (2-3 candles in trade direction)
-        4. No entries within 30 mins of regime change (avoid whipsaws)
+        4. No entries within 30 mins of regime change (whipsaw protection)
         
         Returns:
             (is_valid, reason) tuple
@@ -275,26 +212,33 @@ class RiskManager:
             volume = latest.get('volume', 0)
             volume_sma = latest.get('volume_sma', volume)
             
-            # CHECK 1: Price not overextended from SMA20
-            distance_from_sma = abs(entry_price - sma_20)
-            max_distance = atr * 1.5
+            regime = regime_analysis.get("regime", "DEFAULT") if regime_analysis else "DEFAULT"
             
-            if distance_from_sma > max_distance:
+            # CHECK 1: Price overextension - REMOVED RIGID MULTIPLIER
+            # Instead check if price is ABSURDLY far from structure (> 5x ATR)
+            # Enter on pullbacks to structure instead of chasing extended moves
+            distance_from_sma = abs(entry_price - sma_20)
+            max_reasonable_distance = atr * 5.0  # Only block truly irrational entries
+            
+            if distance_from_sma > max_reasonable_distance:
                 extension_pct = (distance_from_sma / entry_price) * 100
                 return False, (
-                    f"🚫 Price overextended {extension_pct:.2f}% from SMA20 "
-                    f"(max allowed: {(max_distance/entry_price)*100:.2f}%). "
-                    f"Chasing extended moves = high probability of reversal. Wait for pullback."
+                    f"🚫 Price absurdly overextended: {extension_pct:.2f}% from SMA20 "
+                    f"(>{(max_reasonable_distance/entry_price)*100:.2f}%). "
+                    f"This is not a pullback - it's a chase. Wait for structure."
                 )
             
-            # CHECK 2: Volume confirmation (>1.5x average)
-            if volume > 0 and volume_sma > 0:
-                volume_ratio = volume / volume_sma
-                if volume_ratio < 1.5:
-                    return False, (
-                        f"🚫 Insufficient volume confirmation (ratio: {volume_ratio:.2f}x, need 1.5x+). "
-                        f"Low volume moves are unreliable. Wait for volume expansion."
-                    )
+            # CHECK 2: Volume confirmation - USE NEW ADAPTIVE FUNCTION
+            recent_volumes = market_df.tail(20)['volume'] if len(market_df) >= 20 else market_df['volume']
+            volume_valid, volume_reason, volume_ratio = is_volume_expanding(
+                volume, volume_sma, regime, recent_volumes
+            )
+            
+            if not volume_valid:
+                return False, f"🚫 {volume_reason}"
+            
+            # Log volume strength for monitoring
+            logger.debug(f"📊 Volume confirmation: {volume_ratio:.2f}x average - {volume_reason}")
             
             # CHECK 3: Momentum confirmation (2-3 recent candles in direction)
             if len(recent) >= 3:
@@ -315,8 +259,7 @@ class RiskManager:
                             f"Wait for 2-3 consecutive down candles before SELL entry."
                         )
             
-            # CHECK 4: Regime stability check (stored in instance variable)
-            # This prevents entries right after regime changes (whipsaw protection)
+            # CHECK 4: Regime stability (avoid whipsaws)
             if regime_analysis and hasattr(self, 'last_regime_change_time'):
                 from datetime import datetime, timezone, timedelta
                 time_since_regime_change = datetime.now(timezone.utc) - self.last_regime_change_time
@@ -326,11 +269,14 @@ class RiskManager:
                         f"Wait 30 minutes after regime change to avoid whipsaws."
                     )
             
-            return True, f"✅ Entry timing validated: confirmation requirements met"
+            return True, (
+                f"✅ Entry timing validated: Volume {volume_ratio:.2f}x ({volume_reason}), "
+                f"Extension {(distance_from_sma/entry_price)*100:.2f}% (reasonable for {regime})"
+            )
             
         except Exception as e:
-            logger.warning(f"⚠️ Entry timing validation error: {e}. Allowing trade to proceed.")
-            return True, f"Entry timing check skipped due to error: {e}"
+            logger.warning(f"⚠️ Entry timing validation error: {e}. Allowing trade.")
+            return True, f"Entry timing check skipped: {e}"
     
     def update_regime_tracking(self, current_regime: str) -> None:
         """
@@ -345,7 +291,7 @@ class RiskManager:
         self, signal: Dict, market_df, regime_analysis: Optional[Dict]
     ) -> Tuple[bool, str]:
         """
-        PRIORITY 4: Require confluence of multiple factors before allowing trade.
+        Require confluence of multiple factors before allowing trade.
         
         Professional traders wait for multiple confirmations, not just one indicator.
         This prevents low-probability trades where only 1-2 factors align.
@@ -488,7 +434,7 @@ class RiskManager:
         trading_edge = regime_analysis.get("trading_edge", "")
         confidence = regime_analysis.get("confidence", 0)
         
-        # PRIORITY 3: Block ALL mean reversion trades (too risky with tight stops)
+        # Block ALL mean reversion trades (too risky with tight stops)
         # Don't trade mean reversion with sub-1% stops.
         # Either trade trends or wait for better setups
         if trading_edge == "MEAN_REVERSION":
@@ -616,11 +562,28 @@ class RiskManager:
             today_count = self.daily_trade_count.get(user_id, 0)
             self._assert_daily_limit(user_id, today_count, config)
 
-            # Calculate adaptive confidence threshold (anti-overfitting)
-            adaptive_threshold = self.get_adaptive_confidence_threshold(user_trade_history)
-            
+            # Get regime analysis for adaptive thresholds
+            regime_analysis = signal.get("raw", {}).get("regime_analysis")
+
+            # Check minimum confidence floor
             confidence = self._extract_confidence(signal)
-            self._assert_confidence(confidence, adaptive_threshold)
+            self._assert_confidence(confidence, MIN_CONFIDENCE_FLOOR)
+            
+            # Assess overall setup quality (composite score)
+            if market_df is not None and not market_df.empty and regime_analysis:
+                win_rate = user_trade_history.get('win_rate') if user_trade_history else None
+                quality_score, quality_explanation = assess_setup_quality(
+                    signal, regime_analysis, market_df, win_rate
+                )
+                
+                logger.info(f"📊 [User {user_id}] {quality_explanation}")
+                
+                if quality_score < MIN_SETUP_QUALITY:
+                    raise RiskValidationError(
+                        f"Setup quality too low: {quality_score}/100 (minimum {MIN_SETUP_QUALITY}). "
+                        f"Wait for higher-quality setups."
+                    )
+                logger.info(f"✅ [User {user_id}] Setup quality: {quality_score}/100 - PASSED")
 
             balance = self._to_float(account_balance)
             self._assert_sufficient_balance(balance)
@@ -630,7 +593,7 @@ class RiskManager:
             side = signal.get("signal", "buy").lower()
             risk_percentage = self._resolve_risk_percentage(config)
             
-            # VALIDATION #1: Check entry timing (PRIORITY 1)
+            # VALIDATION #1: Check entry timing
             # Ensure we have momentum confirmation and aren't chasing extended moves
             is_timing_valid, timing_reason = self.validate_entry_timing(
                 signal, market_df, signal.get("raw", {}).get("regime_analysis")
@@ -652,7 +615,7 @@ class RiskManager:
                     raise RiskValidationError(regime_reason)
                 logger.info(f"[User {user_id}] {regime_reason}")
             
-            # VALIDATION #3: Check confluence of multiple factors (PRIORITY 4)
+            # VALIDATION #3: Check confluence of multiple factors
             # Require 3/4 confirmations: MTF alignment, volume, momentum, S/R proximity
             is_confluence_valid, confluence_reason = self.validate_confluence(
                 signal, market_df, regime_analysis
@@ -901,7 +864,6 @@ class RiskManager:
                         f"⚠️ Mean reversion setup detected - will apply wider stops if allowed through"
                     )
 
-            # PRIORITY 2: Intelligent ATR-Based Stop Widening
             # Minimum 2x ATR for stops, 5x ATR for targets (ensures 2.5:1 R:R minimum)
             # Professional stops account for market noise, not arbitrary percentages
             
@@ -1024,7 +986,7 @@ class RiskManager:
             dynamic_sl_pct = min(dynamic_sl_pct, ABSOLUTE_MAX_STOP_LOSS)
             dynamic_tp_pct = min(dynamic_tp_pct, ABSOLUTE_MAX_TAKE_PROFIT)
 
-            # Ensure minimum risk:reward ratio of 3.0:1 (PRIORITY 2)
+            # Ensure minimum risk:reward ratio of 3.0:1
             # With 40% win rate, need wider R:R for profitability
             # 3:1 R:R means each win covers 3 losses (sustainable edge)
             min_risk_reward = 3.0
@@ -1161,9 +1123,9 @@ class RiskManager:
         
         Args:
             confidence: Signal confidence value
-            adaptive_threshold: Optional adaptive threshold (if None, uses MIN_SIGNAL_CONFIDENCE)
+            adaptive_threshold: Optional adaptive threshold (if None, uses MIN_CONFIDENCE_FLOOR)
         """
-        threshold = adaptive_threshold if adaptive_threshold is not None else MIN_SIGNAL_CONFIDENCE
+        threshold = adaptive_threshold if adaptive_threshold is not None else MIN_CONFIDENCE_FLOOR
         if confidence < threshold:
             raise RiskValidationError(
                 f"Signal confidence too low: {confidence:.1f}% < {threshold:.1f}%"

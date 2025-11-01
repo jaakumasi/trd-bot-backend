@@ -6,16 +6,6 @@ import json
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from ..config import settings
-from .service_constants import (
-    AI_BUY_STOP_LOSS_RATIO,
-    AI_BUY_TAKE_PROFIT_RATIO,
-    AI_SELL_STOP_LOSS_RATIO,
-    AI_SELL_TAKE_PROFIT_RATIO,
-    AI_HOLD_STOP_LOSS_RATIO,
-    AI_HOLD_TAKE_PROFIT_RATIO,
-    MIN_ATR_PERCENTAGE_FOR_ENTRY,
-    OPTIMAL_ATR_PERCENTAGE_RANGE,
-)
 from .trade_outcome_tracker import TradeOutcomeTracker
 import logging
 
@@ -261,25 +251,7 @@ class AIAnalyzer:
                 atr = latest['atr']
                 price = latest['close']
                 atr_percentage = (atr / price) * 100 if price > 0 else 0
-                
-                if atr_percentage < MIN_ATR_PERCENTAGE_FOR_ENTRY:
-                    logger.info(
-                        f"🚫 ATR% too low: {atr_percentage:.2f}% < {MIN_ATR_PERCENTAGE_FOR_ENTRY:.2f}% "
-                        f"(minimum threshold). Insufficient volatility for profitable day trading."
-                    )
-                    return self._fallback_analysis(
-                        f"Market too quiet (ATR%: {atr_percentage:.2f}%). "
-                        f"Need at least {MIN_ATR_PERCENTAGE_FOR_ENTRY:.2f}% for viable entries/exits.",
-                        float(latest["close"]),
-                    )
-                
-                # Log if we're in optimal volatility range
-                optimal_low, optimal_high = OPTIMAL_ATR_PERCENTAGE_RANGE
-                if optimal_low <= atr_percentage <= optimal_high:
-                    logger.info(
-                        f"✅ ATR% in optimal range: {atr_percentage:.2f}% "
-                        f"({optimal_low:.2f}%-{optimal_high:.2f}%) - good trading conditions"
-                    )
+                logger.debug(f"📊 Current ATR: {atr_percentage:.3f}% - regime analyzer will validate tradability")
 
             # Step 1: Check trading quality
             if regime_analysis:
@@ -1121,7 +1093,9 @@ class AIAnalyzer:
             Return ONLY valid JSON without markdown code blocks or any other formatting.
 
             Example format with ALL required fields:
-            {{"signal": "buy", "confidence": 75, "reasoning": "Strong bullish momentum", "entry_price": {latest['close']:.2f}, "stop_loss": {latest['close'] * AI_BUY_STOP_LOSS_RATIO:.2f}, "take_profit": {latest['close'] * AI_BUY_TAKE_PROFIT_RATIO:.2f}}}
+            {{"signal": "buy", "confidence": 75, "reasoning": "Strong bullish momentum with structure support", "entry_price": {latest['close']:.2f}, "stop_loss": {latest['close'] * 0.995:.2f}, "take_profit": {latest['close'] * 1.01:.2f}}}
+            
+            IMPORTANT: Always provide stop_loss and take_profit based on nearby support/resistance levels, NOT fixed percentages.
             """
 
     @staticmethod
@@ -1237,41 +1211,51 @@ class AIAnalyzer:
         analysis.setdefault("reasoning", "No reasoning provided")
         return analysis
 
-    def _enforce_price_targets(self, analysis: Dict) -> Dict:
-        entry_price = float(analysis["entry_price"])
-        signal = analysis["signal"]
-
-        if signal == "buy":
-            analysis["stop_loss"] = entry_price * AI_BUY_STOP_LOSS_RATIO
-            analysis["take_profit"] = entry_price * AI_BUY_TAKE_PROFIT_RATIO
-        elif signal == "sell":
-            analysis["stop_loss"] = entry_price * AI_SELL_STOP_LOSS_RATIO
-            analysis["take_profit"] = entry_price * AI_SELL_TAKE_PROFIT_RATIO
-        else:
-            analysis["stop_loss"] = entry_price * AI_HOLD_STOP_LOSS_RATIO
-            analysis["take_profit"] = entry_price * AI_HOLD_TAKE_PROFIT_RATIO
-
+    def _enforce_price_targets(self, analysis: Dict) -> Optional[Dict]:
+        """
+        Validate AI provided stop_loss and take_profit.
+        Returns None if missing - DO NOT use bad fallback values.
+        """
+        entry_price = float(analysis.get("entry_price", 0))
+        stop_loss = analysis.get("stop_loss")
+        take_profit = analysis.get("take_profit")
+        
+        if not entry_price or entry_price <= 0:
+            logger.error("❌ AI did not provide valid entry_price - SKIPPING TRADE")
+            return None
+        
+        if not stop_loss or stop_loss <= 0:
+            logger.error("❌ AI did not provide valid stop_loss - SKIPPING TRADE")
+            return None
+        
+        if not take_profit or take_profit <= 0:
+            logger.error("❌ AI did not provide valid take_profit - SKIPPING TRADE")
+            return None
+        
         logger.debug(
-            "🎯 Enforced TP/SL ratios | signal=%s | entry=%.2f | SL=%.2f | TP=%.2f",
-            signal,
+            "✅ AI provided complete targets | entry=%.2f | SL=%.2f | TP=%.2f",
             entry_price,
-            analysis["stop_loss"],
-            analysis["take_profit"],
+            stop_loss,
+            take_profit,
         )
         return analysis
 
     def _fallback_analysis(self, reason: str, price: float | None = None) -> Dict:
+        """
+        Return safe fallback that will be skipped by validation.
+        DO NOT provide stop_loss/take_profit - let validation reject it.
+        """
         fallback_price = (
             price if price and price > 0 else self._resolve_fallback_price()
         )
+        logger.warning(f"🚫 Fallback analysis triggered: {reason} - trade will be skipped")
         return {
             "signal": "hold",
             "confidence": 0,
-            "reasoning": reason,
+            "reasoning": f"FALLBACK: {reason}",
             "technical_score": 0,
             "entry_price": fallback_price,
-            "stop_loss": fallback_price * AI_HOLD_STOP_LOSS_RATIO,
-            "take_profit": fallback_price * AI_HOLD_TAKE_PROFIT_RATIO,
+            # NO stop_loss/take_profit - will fail validation and be skipped
         }
 
     def _resolve_fallback_price(self) -> float:
@@ -1725,17 +1709,15 @@ CRITICAL TRADING RULES:
    - BEAR_TREND + ADX > 30 → Only SELL signals allowed (or hold)
    - BULL_TREND + ADX > 30 → Only BUY signals allowed (or hold)
 
-2. NEVER attempt mean reversion (Trading Edge = MEAN_REVERSION) in strong trends
-   - If regime is BEAR_TREND or BULL_TREND with ADX > 30 and Trading Edge = MEAN_REVERSION → Issue HOLD
-   - Mean reversion only works in RANGE_BOUND markets or weak trends (ADX < 25)
+2. Natural R:R should target at least 2.0:1 from market structure
+   - Use support/resistance levels for natural stops
+   - If market structure suggests poor R:R, recommend HOLD
+   - Look for trades where stops can be 1-1.5% and targets 2-3%
 
-3. Natural R:R must be at least 2.0:1 from market structure
-   - Don't suggest tight stop losses or take profits
-   - If market doesn't naturally provide 2:1 R:R, recommend HOLD
-   - Professional traders skip trades with poor natural R:R
-
-4. Quality over quantity - only high-probability setups
-   - When in doubt, recommend HOLD
-   - Better to miss a trade than force a bad setup
+3. Trust your analysis - if timeframes align and quality is good, take the trade
+   - Trading Quality Score > 50 is good, > 70 is excellent
+   - Strong multi-timeframe alignment (bullish on 15m, 1h, 5m) = high confidence
+   - Don't be paralyzed by minor conflicting signals
+   - In day trading, slight order flow negativity can be normal during pullbacks
 """
         return prompt
